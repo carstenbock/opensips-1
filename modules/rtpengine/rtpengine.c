@@ -2881,6 +2881,12 @@ static bencode_item_t *rtpe_function_call(bencode_buffer_t *bencbuf, struct sip_
 		if (spvar && (socket_val.rs.len > 0)) {
 			LM_DBG("Sending command [%d] to RTPEngine socket: [%.*s] set id: [%d]\n", op, (int)(socket_val.rs.len), (char *)(socket_val.rs.s), set->id_set);
 			node = lookup_rtpe_node(set, &socket_val.rs);
+			/* The pinned node can disappear between two offers of the same
+			 * call (autoscaler removing an RTPEngine). Re-anchoring an offer
+			 * on a live node is always better than failing it; answers and
+			 * deletes still have to reach the node holding the session. */
+			if (node == NULL && op == OP_OFFER)
+				node = select_rtpe_node(ng_flags.call_id, set, ignore_list);
 			if (node == NULL) {
 				RTPE_STOP_READ();
 				goto error;
@@ -5020,6 +5026,16 @@ static int rtpengine_api_offer(struct rtp_relay_session *sess,
 	RTPE_START_READ();
 	if (!server->node.s) {
 		node = NULL;
+		/* media_pvar is process-global and still carries the node picked for
+		 * the previous call handled by this process. rtpengine_offer_answer_body()
+		 * treats a non-empty value as a pinned socket, so this session would
+		 * inherit it -- and once the autoscaler replaces an RTPEngine, every
+		 * new offer pins a node that no longer exists and fails. Reset it so
+		 * a session without its own node really gets a fresh selection. */
+		memset(&val, 0, sizeof val);
+		val.flags = PV_VAL_NULL;
+		if (pv_set_value(msg, &media_pvar, 0, &val) < 0)
+			LM_ERR("could not reset the rtpengine node variable!\n");
 		rset = rtpengine_get_set(server->set);
 		if (!rset) {
 			LM_ERR("no rtpengine set availble!\n");
