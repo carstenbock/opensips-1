@@ -108,6 +108,108 @@ static inline int calc_temp_gruu_len(str* aor,str* instance,str *callid)
 }
 
 /*! \brief
+ * Is this a Contact parameter build_contact() emits on its own?
+ *
+ * Echoing one of these a second time out of the stored attribute would produce a
+ * Contact carrying two q values or two expires, which is a worse defect than the
+ * omission the echo exists to fix.  gruu_emitted tells whether the GRUU block ran
+ * for this contact, because that is what decides whether +sip.instance and the
+ * gruu parameters have already been written.
+ */
+static inline int attr_param_is_builtin(str *name, int gruu_emitted)
+{
+	if (name->len == 1 && (name->s[0] == 'q' || name->s[0] == 'Q'))
+		return 1;
+	if (name->len == 7 && strncasecmp(name->s, "expires", 7) == 0)
+		return 1;
+	if (rcv_param.len && name->len == rcv_param.len
+	        && strncasecmp(name->s, rcv_param.s, rcv_param.len) == 0)
+		return 1;
+	if (gruu_emitted) {
+		if (name->len == 13 && strncasecmp(name->s, "+sip.instance", 13) == 0)
+			return 1;
+		if (name->len == 8 && strncasecmp(name->s, "pub-gruu", 8) == 0)
+			return 1;
+		if (name->len == 9 && strncasecmp(name->s, "temp-gruu", 9) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+/*! \brief
+ * Echo the feature parameters registered against a contact.
+ *
+ * RFC 3840 clause 6: "when a registrar returns a 200 OK response to a REGISTER
+ * request, each Contact header field value MUST include all of the feature
+ * parameters associated with that URI".  Without this the registrar answers a UE
+ * that offered +g.3gpp.smsip or +g.3gpp.icsi-ref with a bare Contact, and a UE
+ * that waits for its capabilities to be confirmed concludes the network does not
+ * support them -- for SMS over IP that means falling back to the CS domain.
+ *
+ * The parameters as registered are kept verbatim in c->attr, which the script
+ * populates from the request's Contact via the attr_avp module parameter.  Nothing
+ * is echoed when that is empty, so a deployment that does not store them keeps the
+ * previous behaviour.
+ *
+ * Writes into dst when dst is non-NULL and returns the byte count it would write
+ * either way, so calc_buf_len() and build_contact() cannot disagree about the
+ * size: they share one pkg_malloc'd buffer written with unchecked memcpy, and a
+ * disagreement is a heap overflow rather than a formatting bug.
+ */
+static inline int copy_echoed_attrs(char *dst, ucontact_t *c, int gruu_emitted)
+{
+	char *out = dst;
+	int total = 0, i = 0, start, in_quote, j;
+	str param, name;
+
+	if (!c->attr.s || c->attr.len <= 0)
+		return 0;
+
+	while (i < c->attr.len) {
+		while (i < c->attr.len && (c->attr.s[i] == ';'
+		        || c->attr.s[i] == ' ' || c->attr.s[i] == '\t'))
+			i++;
+
+		/* A value may be a quoted string, and a quoted string may contain the
+		 * separator -- +sip.instance carries a URN in quotes. */
+		start = i;
+		in_quote = 0;
+		while (i < c->attr.len && (in_quote || c->attr.s[i] != ';')) {
+			if (c->attr.s[i] == '"')
+				in_quote = !in_quote;
+			i++;
+		}
+
+		param.s = c->attr.s + start;
+		param.len = i - start;
+		while (param.len > 0 && (param.s[param.len - 1] == ' '
+		        || param.s[param.len - 1] == '\t'))
+			param.len--;
+		if (param.len == 0)
+			continue;
+
+		name = param;
+		for (j = 0; j < param.len; j++) {
+			if (param.s[j] == '=') {
+				name.len = j;
+				break;
+			}
+		}
+		if (attr_param_is_builtin(&name, gruu_emitted))
+			continue;
+
+		total += 1 /* ; */ + param.len;
+		if (out) {
+			*out++ = ';';
+			memcpy(out, param.s, param.len);
+			out += param.len;
+		}
+	}
+
+	return total;
+}
+
+/*! \brief
  * Calculate the length of buffer needed to
  * print contacts
  */
@@ -167,6 +269,7 @@ static inline unsigned int calc_buf_len(ucontact_t* c,int build_gruu,
 					+ 1 /* quote */
 					;
 			}
+			len += copy_echoed_attrs(NULL, c, build_gruu && c->instance.s);
 		}
 		c = c->next;
 	}
@@ -345,6 +448,9 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 				p += c->instance.len-2;
 				*p++ = '\"';
 			}
+
+			/* Must mirror the accounting in calc_buf_len() exactly. */
+			p += copy_echoed_attrs(p, c, build_gruu && c->instance.s);
 		}
 
 		c = c->next;
