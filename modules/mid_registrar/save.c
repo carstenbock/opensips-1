@@ -809,7 +809,7 @@ static inline unsigned int calc_buf_len(ucontact_t* c,int build_gruu,
 
 int build_contact(ucontact_t* c,struct sip_msg *_m)
 {
-	char *p, *cp, *tmpgr;
+	char *p, *cp;
 	int fl, len,grlen;
 	int build_gruu = 0;
 	const struct socket_info *sock;
@@ -927,16 +927,15 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 				memcpy(p,TEMP_GRUU_HEADER,TEMP_GRUU_HEADER_SIZE);
 				p += TEMP_GRUU_HEADER_SIZE;
 
-				tmpgr = build_temp_gruu(c->aor,&c->instance,&c->callid,&grlen);
-				if (!tmpgr) {
+				grlen = build_temp_gruu(c->aor,&c->instance,&c->callid,
+						(int)c->expires,p);
+				if (grlen < 0) {
 					LM_ERR("failed to build temporary GRUU\n");
 					contact.data_len = 0;
 					rerrno = R_INTERNAL;
 					return -1;
 				}
-				base64encode((unsigned char *)p,
-						(unsigned char *)tmpgr,grlen);
-				p += calc_temp_gruu_len(c->aor,&c->instance,&c->callid);
+				p += grlen;
 				*p++ = '@';
 				memcpy(p, ghost.s, ghost.len);
 				p += ghost.len;

@@ -1,10 +1,14 @@
 /*
  * Temporary GRUU construction (RFC 5627).
  *
- * The plaintext is the historical "<time> <aor> <instance> <callid>"
- * string. It is sealed with ChaCha20-Poly1305 under a key derived from
+ * Encrypted format: the historical "<time> <aor> <instance> <callid>"
+ * string sealed with ChaCha20-Poly1305 under a key derived from
  * gruu_secret, so any process that holds the same secret can recover
  * the AoR without usrloc state.
+ *
+ * Token format (gruu_cachedb_url set): 22 base64url characters that
+ * decrypt to a binding id, resolved through one cachedb entry per AoR,
+ * instance and Call-ID (RFC 5627 Appendix A.2).
  *
  * Copyright (C) 2026 OpenSIPS Solutions
  *
@@ -37,10 +41,14 @@
 extern int gruu_legacy_xor;
 extern int gruu_legacy_host;
 extern str gruu_domain;
+extern str gruu_cachedb_url;
 
 struct socket_info;
 
 int reg_gruu_init(void);
+
+/* Opens the per-process gruu_cachedb_url connection. Call from child_init. */
+int reg_gruu_child_init(void);
 
 /* Host of a GRUU. *user is the public-GRUU user part (ignored for a
  * temporary GRUU). *host is empty when *user already contains the domain.
@@ -48,15 +56,17 @@ int reg_gruu_init(void);
 int reg_gruu_target(const str *aor, const struct socket_info *sock,
 		int temporary, str *user, str *host);
 
-/* Base64 length of a temporary GRUU user-part, excluding the "tgruu." prefix.
+/* Upper bound of a temporary GRUU user part, excluding the "tgruu." prefix.
  * Returns 0 when the contact cannot carry a temporary GRUU. */
 int calc_temp_gruu_len(str *aor, str *instance, str *callid);
 
-/* Static buffer holding nonce || ciphertext || tag. *len is the byte count
- * to pass to base64encode(). NULL on failure. */
-char *build_temp_gruu(str *aor, str *instance, str *callid, int *len);
+/* Writes the user part after "tgruu." to out, at most calc_temp_gruu_len()
+ * bytes. expires is the absolute contact expiry (0 = permanent). Returns
+ * the number of bytes written, or -1 on failure. */
+int build_temp_gruu(str *aor, str *instance, str *callid, int expires,
+		char *out);
 
-/* user is the base64 blob after "tgruu.". On success the three strings
+/* user is the user part after "tgruu.". On success the three strings
  * point into a static buffer. Returns 0 on success. */
 int reg_temp_gruu_decode(const str *user, str *aor, str *instance,
 		str *call_id);

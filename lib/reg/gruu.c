@@ -24,17 +24,22 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "../../cachedb/cachedb.h"
+#include "../../cachedb/cachedb_cap.h"
 #include "../../dprint.h"
+#include "../../mem/mem.h"
 #include "../../sha256.h"
 #include "../../socket_info.h"
 #include "../../ut.h"
 
 #include "aead.h"
+#include "aes128.h"
 #include "gruu.h"
 #include "regtime.h"
 
 /* Set by each registrar module. Length is filled in by reg_init_globals()
- * for gruu_secret and by reg_gruu_init() for gruu_domain. */
+ * for gruu_secret and by reg_gruu_init() for gruu_domain and
+ * gruu_cachedb_url. */
 extern int disable_gruu;
 extern int reg_use_domain;
 extern str gruu_secret;
@@ -42,15 +47,35 @@ extern str gruu_secret;
 #define GRUU_PLAIN_MAX 1024
 #define GRUU_B64_MAX   2048
 
-/* HKDF-SHA256 (RFC 5869) parameters. Both values are fixed so every
- * process that shares gruu_secret derives the same key. */
+/* HKDF-SHA256 (RFC 5869) parameters. The values are fixed so every
+ * process that shares gruu_secret derives the same keys. */
 static const char gruu_hkdf_salt[] = "opensips-gruu-v1";
 static const char gruu_hkdf_info[] = "temp-gruu";
+static const char gruu_hkdf_info_token[] = "temp-gruu-token";
+static const char gruu_hkdf_info_bid[] = "temp-gruu-binding";
 /* Bound to the ciphertext so a blob from another context cannot be swapped in. */
 static const uint8_t gruu_aad[] = "tgruu.v1";
 
 static uint8_t gruu_key[AEAD_KEY_LEN];
 static int gruu_ready;
+
+/* Token mode (RFC 5627 Appendix A.2): a binding id names one cachedb
+ * entry per AoR, instance and Call-ID, and each temporary GRUU is
+ * AES-128(binding id || 8 random bytes), base64url without padding. */
+#define GRUU_BID_LEN        8
+#define GRUU_TOKEN_B64_LEN  22
+#define GRUU_BID_B64_LEN    11
+#define GRUU_BIND_MARGIN    3600
+#define GRUU_CDB_PREFIX     "tgruu:"
+
+static const str gruu_cdb_prefix = str_init(GRUU_CDB_PREFIX);
+
+static aes128_ctx gruu_tok_ctx;
+static uint8_t gruu_bid_key[32];
+static int gruu_token_mode;
+static cachedb_funcs gruu_cdbf;
+static cachedb_con *gruu_cdbc;
+static int gruu_cdb_bound;
 
 static uint8_t gruu_raw[AEAD_NONCE_LEN + GRUU_PLAIN_MAX + AEAD_TAG_LEN];
 static uint8_t gruu_bin[GRUU_B64_MAX];
@@ -82,20 +107,35 @@ static int temp_gruu_plain_len(const str *aor, const str *instance,
 	return tlen + aor->len + (instance->len - 2) + callid->len + 3;
 }
 
-static void gruu_derive_key(void)
+/* HKDF-Expand with a single output block, T(1) = HMAC(PRK, info || 0x01). */
+static void gruu_hkdf_expand(const uint8_t prk[32], const char *info,
+		size_t info_len, uint8_t out[32])
 {
-	uint8_t prk[32];
-	uint8_t msg[sizeof gruu_hkdf_info];
+	uint8_t msg[64];
+
+	memcpy(msg, info, info_len);
+	msg[info_len] = 0x01;
+	sha256_hmac(prk, 32, msg, info_len + 1, out, 0);
+	memset(msg, 0, sizeof msg);
+}
+
+static void gruu_derive_keys(void)
+{
+	uint8_t prk[32], okm[32];
 
 	sha256_hmac((const unsigned char *)gruu_hkdf_salt,
 			sizeof gruu_hkdf_salt - 1,
 			(const unsigned char *)gruu_secret.s, (size_t)gruu_secret.len,
 			prk, 0);
-	memcpy(msg, gruu_hkdf_info, sizeof gruu_hkdf_info - 1);
-	msg[sizeof gruu_hkdf_info - 1] = 0x01;
-	sha256_hmac(prk, sizeof prk, msg, sizeof gruu_hkdf_info, gruu_key, 0);
+	gruu_hkdf_expand(prk, gruu_hkdf_info, sizeof gruu_hkdf_info - 1,
+			gruu_key);
+	gruu_hkdf_expand(prk, gruu_hkdf_info_token,
+			sizeof gruu_hkdf_info_token - 1, okm);
+	aes128_setkey(&gruu_tok_ctx, okm);
+	gruu_hkdf_expand(prk, gruu_hkdf_info_bid,
+			sizeof gruu_hkdf_info_bid - 1, gruu_bid_key);
 	memset(prk, 0, sizeof prk);
-	memset(msg, 0, sizeof msg);
+	memset(okm, 0, sizeof okm);
 }
 
 static int gruu_random(uint8_t *buf, size_t len)
@@ -125,17 +165,29 @@ int reg_gruu_init(void)
 		LM_ERR("ChaCha20-Poly1305 self-test failed\n");
 		return -1;
 	}
+	if (aes128_selftest() != 0) {
+		LM_ERR("AES-128 self-test failed\n");
+		return -1;
+	}
 
 	gruu_ready = 0;
 	if (gruu_secret.s && gruu_secret.len > 0) {
 		if (gruu_secret.len < 16)
 			LM_WARN("gruu_secret is shorter than 16 bytes\n");
-		gruu_derive_key();
+		gruu_derive_keys();
 		gruu_ready = 1;
 	}
 
 	if (!disable_gruu && !gruu_ready) {
 		LM_ERR("GRUU is enabled (disable_gruu=0) but gruu_secret is not set\n");
+		return -1;
+	}
+
+	if (gruu_cachedb_url.s)
+		gruu_cachedb_url.len = strlen(gruu_cachedb_url.s);
+	gruu_token_mode = gruu_cachedb_url.s && gruu_cachedb_url.len > 0;
+	if (gruu_token_mode && !gruu_ready) {
+		LM_ERR("gruu_cachedb_url is set but gruu_secret is not\n");
 		return -1;
 	}
 
@@ -152,6 +204,40 @@ int reg_gruu_init(void)
 		return -1;
 	}
 	return 0;
+}
+
+int reg_gruu_child_init(void)
+{
+	if (!gruu_token_mode)
+		return 0;
+
+	if (cachedb_bind_mod(&gruu_cachedb_url, &gruu_cdbf) < 0) {
+		LM_ERR("cannot bind cachedb functions for gruu_cachedb_url %s\n",
+				db_url_escape(&gruu_cachedb_url));
+		return -1;
+	}
+	if (!CACHEDB_CAPABILITY(&gruu_cdbf, CACHEDB_CAP_GET|CACHEDB_CAP_SET)) {
+		LM_ERR("gruu_cachedb_url backend lacks get/set support\n");
+		return -1;
+	}
+	gruu_cdb_bound = 1;
+
+	/* A backend that is down at startup must not stop the registrar:
+	 * temporary GRUUs fall back to the encrypted format until it is back. */
+	gruu_cdbc = gruu_cdbf.init(&gruu_cachedb_url);
+	if (!gruu_cdbc)
+		LM_ERR("cannot connect to gruu_cachedb_url %s, will retry\n",
+				db_url_escape(&gruu_cachedb_url));
+	return 0;
+}
+
+static cachedb_con *gruu_cdb(void)
+{
+	if (!gruu_cdb_bound)
+		return NULL;
+	if (!gruu_cdbc)
+		gruu_cdbc = gruu_cdbf.init(&gruu_cachedb_url);
+	return gruu_cdbc;
 }
 
 static char gruu_sock_host[256];
@@ -247,6 +333,8 @@ int reg_gruu_target(const str *aor, const struct socket_info *sock,
 	return gruu_socket_host(sock, host);
 }
 
+/* The encrypted format is always longer than a token, so its length is
+ * the upper bound for both, including the token-to-encrypted fallback. */
 int calc_temp_gruu_len(str *aor, str *instance, str *callid)
 {
 	int plain = temp_gruu_plain_len(aor, instance, callid, NULL);
@@ -256,28 +344,127 @@ int calc_temp_gruu_len(str *aor, str *instance, str *callid)
 	return b64_len(plain + AEAD_NONCE_LEN + AEAD_TAG_LEN);
 }
 
-char *build_temp_gruu(str *aor, str *instance, str *callid, int *len)
+/* "<aor>\n<instance>\n<callid>" into gruu_plain. A line feed cannot occur
+ * in any of the three fields. */
+static int gruu_binding_value(const str *aor, const str *instance,
+		const str *callid)
+{
+	int off = 0;
+
+	memcpy(gruu_plain + off, aor->s, aor->len);
+	off += aor->len;
+	gruu_plain[off++] = '\n';
+	memcpy(gruu_plain + off, instance->s + 1, instance->len - 2);
+	off += instance->len - 2;
+	gruu_plain[off++] = '\n';
+	memcpy(gruu_plain + off, callid->s, callid->len);
+	off += callid->len;
+	return off;
+}
+
+/* SPEC-DEVIATION: RFC 5627 §5.3 -- the binding id is a keyed hash of AoR,
+ * instance and Call-ID. If the last contact expires and the UA registers
+ * again with the same Call-ID, the earlier temporary GRUUs become valid
+ * again. usrloc has no removal hook that reaches the cachedb entry from
+ * every cluster node. */
+static void gruu_binding_id(const char *val, int val_len,
+		uint8_t bid[GRUU_BID_LEN])
+{
+	uint8_t mac[32];
+
+	sha256_hmac(gruu_bid_key, sizeof gruu_bid_key,
+			(const unsigned char *)val, (size_t)val_len, mac, 0);
+	memcpy(bid, mac, GRUU_BID_LEN);
+	memset(mac, 0, sizeof mac);
+}
+
+/* base64url without padding. out must hold calc_base64_encode_len(len). */
+static int gruu_b64url(uint8_t *out, const uint8_t *in, int len)
+{
+	int n = calc_base64_encode_len(len);
+
+	base64urlencode(out, (unsigned char *)in, len);
+	while (n > 0 && out[n - 1] == '=')
+		n--;
+	return n;
+}
+
+static int gruu_cdb_key(char *buf, const uint8_t bid[GRUU_BID_LEN], str *key)
+{
+	uint8_t enc[calc_base64_encode_len(GRUU_BID_LEN)];
+	int n;
+
+	n = gruu_b64url(enc, bid, GRUU_BID_LEN);
+	if (n != GRUU_BID_B64_LEN)
+		return -1;
+	memcpy(buf, gruu_cdb_prefix.s, gruu_cdb_prefix.len);
+	memcpy(buf + gruu_cdb_prefix.len, enc, n);
+	key->s = buf;
+	key->len = gruu_cdb_prefix.len + n;
+	return 0;
+}
+
+static int build_token_gruu(str *aor, str *instance, str *callid,
+		int expires, char *out)
+{
+	uint8_t blk[AES128_BLOCK_LEN], tok[AES128_BLOCK_LEN];
+	uint8_t enc[calc_base64_encode_len(AES128_BLOCK_LEN)];
+	char kbuf[sizeof GRUU_CDB_PREFIX + GRUU_BID_B64_LEN];
+	cachedb_con *con;
+	str key, val;
+	int ttl, n;
+
+	con = gruu_cdb();
+	if (!con)
+		return -1;
+
+	val.s = gruu_plain;
+	val.len = gruu_binding_value(aor, instance, callid);
+	gruu_binding_id(val.s, val.len, blk);
+	if (gruu_cdb_key(kbuf, blk, &key) < 0)
+		return -1;
+
+	/* Every REGISTER rewrites the entry, so its lifetime follows the
+	 * binding and all temporary GRUUs issued for it stay valid. */
+	ttl = 0;
+	if (expires) {
+		ttl = expires - (int)get_act_time();
+		if (ttl < 0)
+			ttl = 0;
+		ttl += GRUU_BIND_MARGIN;
+	}
+	if (gruu_cdbf.set(con, &key, &val, ttl) < 0) {
+		LM_ERR("failed to store GRUU binding %.*s\n", key.len, key.s);
+		return -1;
+	}
+
+	if (gruu_random(blk + GRUU_BID_LEN, AES128_BLOCK_LEN - GRUU_BID_LEN) != 0) {
+		LM_ERR("failed to read /dev/urandom for a temporary GRUU\n");
+		return -1;
+	}
+	aes128_encrypt(&gruu_tok_ctx, blk, tok);
+	n = gruu_b64url(enc, tok, AES128_BLOCK_LEN);
+	if (n != GRUU_TOKEN_B64_LEN)
+		return -1;
+	memcpy(out, enc, n);
+	return n;
+}
+
+static int build_aead_gruu(str *aor, str *instance, str *callid, char *out)
 {
 	int time_len = 0, plain_len, off;
 	char *time_str;
 	uint8_t *pt;
 
-	if (!len)
-		return NULL;
-	if (!gruu_ready) {
-		LM_ERR("temporary GRUU key is not initialized\n");
-		return NULL;
-	}
-
 	plain_len = temp_gruu_plain_len(aor, instance, callid, &time_len);
 	if (plain_len < 0)
-		return NULL;
+		return -1;
 
 	/* int2str() keeps its result in a static buffer, so copy it before
 	 * anything else can call int2str() again. */
 	time_str = int2str((unsigned long)get_act_time(), &time_len);
 	if (!time_str || time_len <= 0)
-		return NULL;
+		return -1;
 
 	pt = gruu_raw + AEAD_NONCE_LEN;
 	off = 0;
@@ -293,20 +480,47 @@ char *build_temp_gruu(str *aor, str *instance, str *callid, int *len)
 	memcpy(pt + off, callid->s, callid->len);
 	off += callid->len;
 	if (off != plain_len)
-		return NULL;
+		return -1;
 
 	if (gruu_random(gruu_raw, AEAD_NONCE_LEN) != 0) {
 		LM_ERR("failed to read /dev/urandom for a temporary GRUU\n");
-		return NULL;
+		return -1;
 	}
 	if (aead_chacha20_poly1305_encrypt(gruu_key, gruu_raw,
 			gruu_aad, sizeof gruu_aad - 1,
 			pt, (size_t)plain_len,
 			pt, gruu_raw + AEAD_NONCE_LEN + plain_len) != 0)
-		return NULL;
+		return -1;
 
-	*len = AEAD_NONCE_LEN + plain_len + AEAD_TAG_LEN;
-	return (char *)gruu_raw;
+	off = AEAD_NONCE_LEN + plain_len + AEAD_TAG_LEN;
+	base64encode((unsigned char *)out, gruu_raw, off);
+	return b64_len(off);
+}
+
+int build_temp_gruu(str *aor, str *instance, str *callid, int expires,
+		char *out)
+{
+	int n;
+
+	if (!out)
+		return -1;
+	if (!gruu_ready) {
+		LM_ERR("temporary GRUU key is not initialized\n");
+		return -1;
+	}
+	/* Also bounds the token path, whose output calc_temp_gruu_len()
+	 * reserves through the encrypted length. */
+	if (temp_gruu_plain_len(aor, instance, callid, NULL) < 0)
+		return -1;
+
+	if (gruu_token_mode) {
+		n = build_token_gruu(aor, instance, callid, expires, out);
+		if (n > 0)
+			return n;
+		LM_WARN("cannot issue a temporary GRUU token for [%.*s], "
+				"using the encrypted format\n", aor->len, aor->s);
+	}
+	return build_aead_gruu(aor, instance, callid, out);
 }
 
 static int parse_temp_gruu_plain(char *buf, int len, str *aor, str *instance,
@@ -361,6 +575,93 @@ static int legacy_xor_decode(uint8_t *bin, int bin_len, str *aor,
 	return parse_temp_gruu_plain(gruu_plain, bin_len, aor, instance, call_id);
 }
 
+static int gruu_is_token(const str *user)
+{
+	int i;
+	char c;
+
+	if (user->len != GRUU_TOKEN_B64_LEN)
+		return 0;
+	for (i = 0; i < user->len; i++) {
+		c = user->s[i];
+		if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+				|| (c >= '0' && c <= '9') || c == '-' || c == '_'))
+			return 0;
+	}
+	return 1;
+}
+
+static int parse_binding_value(char *buf, int len, str *aor, str *instance,
+		str *call_id)
+{
+	char *end = buf + len, *nl;
+
+	aor->s = buf;
+	nl = memchr(buf, '\n', len);
+	if (!nl)
+		return -1;
+	aor->len = nl - buf;
+
+	instance->s = nl + 1;
+	nl = memchr(instance->s, '\n', end - instance->s);
+	if (!nl)
+		return -1;
+	instance->len = nl - instance->s;
+
+	call_id->s = nl + 1;
+	call_id->len = end - call_id->s;
+
+	if (aor->len <= 0 || instance->len <= 0 || call_id->len <= 0)
+		return -1;
+	return 0;
+}
+
+static int decode_token_gruu(const str *user, str *aor, str *instance,
+		str *call_id)
+{
+	uint8_t enc[calc_base64_encode_len(AES128_BLOCK_LEN)];
+	uint8_t tok[AES128_BLOCK_LEN], blk[AES128_BLOCK_LEN];
+	char kbuf[sizeof GRUU_CDB_PREFIX + GRUU_BID_B64_LEN];
+	cachedb_con *con;
+	str key, val = STR_NULL;
+	int rc;
+
+	/* base64urldecode() needs the padding to stop inside the buffer. */
+	memcpy(enc, user->s, GRUU_TOKEN_B64_LEN);
+	memset(enc + GRUU_TOKEN_B64_LEN, '=', sizeof enc - GRUU_TOKEN_B64_LEN);
+	if (base64urldecode(tok, enc, sizeof enc) != AES128_BLOCK_LEN)
+		return -1;
+	aes128_decrypt(&gruu_tok_ctx, tok, blk);
+	if (gruu_cdb_key(kbuf, blk, &key) < 0)
+		return -1;
+
+	con = gruu_cdb();
+	if (!con) {
+		LM_ERR("no gruu_cachedb_url connection, cannot resolve a "
+				"temporary GRUU token\n");
+		return -1;
+	}
+	rc = gruu_cdbf.get(con, &key, &val);
+	if (rc == -2) {
+		LM_DBG("no GRUU binding %.*s\n", key.len, key.s);
+		return -1;
+	}
+	if (rc < 0) {
+		LM_ERR("failed to fetch GRUU binding %.*s\n", key.len, key.s);
+		return -1;
+	}
+	if (!val.s || val.len <= 0 || val.len > GRUU_PLAIN_MAX) {
+		if (val.s)
+			pkg_free(val.s);
+		return -1;
+	}
+	memcpy(gruu_plain, val.s, val.len);
+	rc = val.len;
+	pkg_free(val.s);
+
+	return parse_binding_value(gruu_plain, rc, aor, instance, call_id);
+}
+
 int reg_temp_gruu_decode(const str *user, str *aor, str *instance,
 		str *call_id)
 {
@@ -370,6 +671,18 @@ int reg_temp_gruu_decode(const str *user, str *aor, str *instance,
 		return -1;
 	if (!aor || !instance || !call_id)
 		return -1;
+
+	/* An encrypted blob is at least 38 characters, so a 22-character
+	 * base64url user part can only be a token. */
+	if (gruu_token_mode && gruu_is_token(user)) {
+		if (decode_token_gruu(user, aor, instance, call_id) != 0)
+			return -1;
+		LM_DBG("resolved temporary GRUU token aor [%.*s] instance [%.*s] "
+				"callid [%.*s]\n",
+				aor->len, aor->s, instance->len, instance->s,
+				call_id->len, call_id->s);
+		return 0;
+	}
 
 	memcpy(gruu_bin, user->s, user->len);
 	bin_len = base64decode(gruu_bin, gruu_bin, user->len);

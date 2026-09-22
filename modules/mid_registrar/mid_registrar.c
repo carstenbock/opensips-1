@@ -102,6 +102,7 @@ str rcv_param = str_init(RCV_NAME);
 int case_sensitive  = 1; /*!< If set to 0, username in aor will be case insensitive */
 str gruu_secret = {0,0};
 str gruu_domain = {0,0};
+str gruu_cachedb_url = {0,0};
 int disable_gruu = 1;
 int gruu_legacy_xor = 0;
 int gruu_legacy_host = 0;
@@ -109,6 +110,7 @@ str realm_prefix = str_init("");
 int reg_use_domain = 0;
 
 static int mod_init(void);
+static int child_init(int rank);
 static int cfg_validate(void);
 
 static int domain_fixup(void** param);
@@ -173,6 +175,7 @@ static const param_export_t mod_params[] = {
 	{ "gruu_domain",          STR_PARAM, &gruu_domain.s },
 	{ "gruu_legacy_xor",      INT_PARAM, &gruu_legacy_xor },
 	{ "gruu_legacy_host",     INT_PARAM, &gruu_legacy_host },
+	{ "gruu_cachedb_url",     STR_PARAM, &gruu_cachedb_url.s },
 	{ "disable_gruu",         INT_PARAM, &disable_gruu },
 	{ "outgoing_expires",     INT_PARAM, &outgoing_expires },
 	{ "contact_id_insertion", STR_PARAM, &mp_ctid_insertion },
@@ -222,7 +225,7 @@ struct module_exports exports= {
 	mod_init,    /* module initialization function */
 	NULL,        /* reply processing function */
 	NULL,
-	NULL,        /* per-child init function */
+	child_init,  /* per-child init function */
 	cfg_validate /* reload confirm function */
 };
 
@@ -445,6 +448,16 @@ static int mod_init(void)
 	if (register_script_cb(mid_reg_post_script,
 	                       POST_SCRIPT_CB|REQ_TYPE_CB, NULL) < 0) {
 		LM_ERR("failed to register post script cb\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int child_init(int rank)
+{
+	if (reg_gruu_child_init() != 0) {
+		LM_ERR("failed to initialize GRUU token storage\n");
 		return -1;
 	}
 

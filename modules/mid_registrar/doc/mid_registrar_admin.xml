@@ -827,6 +827,44 @@ modparam("mid_registrar", "gruu_legacy_host", 1)
 </programlisting>
 		</example>
 	</section>
+	<section id="param_gruu_cachedb_url" xreflabel="gruu_cachedb_url">
+		<title><varname>gruu_cachedb_url</varname> (string)</title>
+		<para>
+		CacheDB URL that switches temporary GRUUs to the short token format
+		of RFC 5627 Appendix A.2. The user part becomes
+		<emphasis>tgruu.</emphasis> followed by 22 base64url characters: the
+		AES-128 encryption of an 8-byte binding id and 8 random bytes. The
+		binding id is a keyed hash of the AoR, the SIP instance and the
+		Call-ID, and names one cachedb entry
+		(<emphasis>tgruu:&lt;binding id&gt;</emphasis>) that holds those three
+		values. Every REGISTER rewrites the entry with the contact lifetime
+		plus one hour, so all temporary GRUUs issued for a binding stay valid
+		while it is registered. Lookups are still checked against usrloc.
+		</para>
+		<para>
+		<xref linkend="param_gruu_secret"/> is still required: it keys the
+		token cipher and the binding id, and the encrypted format remains the
+		fallback when the backend cannot store a binding. Encrypted temporary
+		GRUUs issued earlier keep working. Every registrar that can receive a
+		request for a temporary GRUU must use the same backend and secret.
+		The backend is contacted while the usrloc record is locked, and a
+		backend that loses its data invalidates all tokens.
+		</para>
+		<para>
+		After the last contact of a binding expires, a new registration with
+		the same Call-ID makes earlier tokens of that binding valid again,
+		because nothing removes the cachedb entry at expiry.
+		</para>
+		<para>
+		Default value is <emphasis>NULL</emphasis> (encrypted format).
+		</para>
+		<example>
+		<title>Setting the <emphasis>gruu_cachedb_url</emphasis> module parameter</title>
+		<programlisting format="linespecific">
+modparam("mid_registrar", "gruu_cachedb_url", "redis:gruu://127.0.0.1:6379/4")
+</programlisting>
+		</example>
+	</section>
 
 	&pn_modparams;
 

@@ -89,6 +89,13 @@
 				the contact expires, because decoding recovers the same
 				instance and Call-ID.
 			</para>
+			<para>
+				With <xref linkend="param_gruu_cachedb_url"/> set, the user
+				part is instead a 22-character base64url token (RFC 5627
+				Appendix A.2) that resolves through one cachedb entry per AOR,
+				SIP instance and Call-ID. Encrypted temporary GRUUs are still
+				decoded.
+			</para>
 			</listitem>
 		</itemizedlist>
 		<para>
