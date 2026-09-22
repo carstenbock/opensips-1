@@ -702,6 +702,7 @@ int save_aux(struct sip_msg* _m, str* forced_binding, void* _d,
 	if (!is_cflag_set(REG_SAVE_NOREPLY_FLAG) && (send_reply(_m,sctx.flags)<0))
 		goto return_minus_one;
 
+	reg_ci_detach_gruu();
 	if (forced_c) free_contacts(&forced_c);
 
 	return 1;
@@ -711,17 +712,19 @@ error:
 	if ( !is_cflag_set(REG_SAVE_NOREPLY_FLAG) )
 		send_reply(_m,sctx.flags);
 
+	reg_ci_detach_gruu();
 	if (forced_c) free_contacts(&forced_c);
 
 	return -2;
 
 return_minus_one:
+	reg_ci_detach_gruu();
 	if (forced_c) free_contacts(&forced_c);
 
 	return -1;
 }
 
-#define MAX_FORCED_BINDING_LEN 512
+#define MAX_FORCED_BINDING_LEN 2048
 int save(struct sip_msg* _m, void* _d, void* _f, str* _s, str* _owtag)
 {
 	struct sip_msg* msg = _m;
@@ -827,7 +830,34 @@ int save(struct sip_msg* _m, void* _d, void* _f, str* _s, str* _owtag)
 						reply_c = _c;
 						forced_binding.len = request_c->uri.len + 11 +
 									reply_c->expires->body.len;
+						/* RFC 5628: the registrar adds these on the 200 OK.
+						 * They are not on the request Contact. Keep them so
+						 * the reg-event NOTIFY can carry the GRUU. */
+						{
+							param_t *gp;
+							for (gp = reply_c->params; gp; gp = gp->next) {
+								str gbody;
+								if (gp->body.len <= 0 || gp->name.len <= 0)
+									continue;
+								if (!((gp->name.len == 8 &&
+									strncasecmp(gp->name.s, "pub-gruu", 8) == 0) ||
+									(gp->name.len == 9 &&
+									strncasecmp(gp->name.s, "temp-gruu", 9) == 0)))
+									continue;
+								gbody = gp->body;
+								if (gbody.len >= 2 && gbody.s[0] == '"'
+										&& gbody.s[gbody.len - 1] == '"') {
+									gbody.s++;
+									gbody.len -= 2;
+								}
+								/* ;name="value" */
+								forced_binding.len += 1 + gp->name.len + 2
+										+ gbody.len + 1;
+							}
+						}
 						if (forced_binding.len <= MAX_FORCED_BINDING_LEN) {
+							char *bp;
+							param_t *gp;
 							forced_binding.s = forced_binding_buf;
 							forced_binding_buf[0] = '<';
 							memcpy(&forced_binding_buf[1],
@@ -838,6 +868,32 @@ int save(struct sip_msg* _m, void* _d, void* _f, str* _s, str* _owtag)
 							memcpy(&forced_binding_buf[request_c->uri.len + 11],
 								reply_c->expires->body.s,
 								reply_c->expires->body.len);
+							bp = forced_binding_buf + request_c->uri.len + 11
+									+ reply_c->expires->body.len;
+							for (gp = reply_c->params; gp; gp = gp->next) {
+								str gbody;
+								if (gp->body.len <= 0 || gp->name.len <= 0)
+									continue;
+								if (!((gp->name.len == 8 &&
+									strncasecmp(gp->name.s, "pub-gruu", 8) == 0) ||
+									(gp->name.len == 9 &&
+									strncasecmp(gp->name.s, "temp-gruu", 9) == 0)))
+									continue;
+								gbody = gp->body;
+								if (gbody.len >= 2 && gbody.s[0] == '"'
+										&& gbody.s[gbody.len - 1] == '"') {
+									gbody.s++;
+									gbody.len -= 2;
+								}
+								*bp++ = ';';
+								memcpy(bp, gp->name.s, gp->name.len);
+								bp += gp->name.len;
+								*bp++ = '=';
+								*bp++ = '"';
+								memcpy(bp, gbody.s, gbody.len);
+								bp += gbody.len;
+								*bp++ = '"';
+							}
 							LM_DBG("forcing binding [%.*s]\n",
 								forced_binding.len,
 								forced_binding.s);

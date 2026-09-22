@@ -85,6 +85,11 @@ static str r_full = str_init("full");
 static str r_reginfo_s = str_init(
 		"<reginfo xmlns=\"urn:ietf:params:xml:ns:reginfo\" version=\"%s\" "
 		"state=\"%.*s\">\n"); // before 74 but calculated 76
+/* RFC 5628 §5. The gr namespace is declared only when a contact carries a GRUU. */
+static str r_reginfo_s_gr = str_init(
+		"<reginfo xmlns=\"urn:ietf:params:xml:ns:reginfo\" "
+		"xmlns:gr=\"urn:ietf:params:xml:ns:gruuinfo\" version=\"%s\" "
+		"state=\"%.*s\">\n");
 static str r_reginfo_e = str_init("</reginfo>\n");
 
 static str r_active = str_init("active");
@@ -105,52 +110,132 @@ static str contact_s =
 static str contact_s_q =
 		str_init("\t\t<contact id=\"%p\" state=\"%.*s\" "
 						"event=\"%.*s\" expires=\"%d\" q=\"%.3f\" callid=\"%.*s\">\n");
-static str contact_s_params_with_body = str_init(
-		"\t\t<unknown-param name=\"%.*s\">\"%.*s\"</unknown-param>\n");
-/**NOTIFY XML needs < to be replaced by &lt; and > to be replaced by &gt;*/
-/*For params that need to be fixed we pass in str removing first and last character and replace them with &lt; and &gt;**/
-static str contact_s_params_with_body_fix = str_init(
-		"\t\t<unknown-param name=\"%.*s\">\"&lt;%.*s&gt;\"</unknown-param>\n");
-static str contact_s_params_no_body = str_init(
-		"\t\t<unknown-param name=\"%.*s\"></unknown-param>\n"); // 1, but 47
 static str contact_e = str_init("\t\t</contact>\n");		// 13, but 14
 
 static str uri_s = str_init("\t\t\t<uri>");
 static str uri_e = str_init("</uri>\n");
 
-/*We currently only support certain unknown params to be sent in NOTIFY bodies
- This prevents having compatability issues with UEs including non-standard params in contact header
- Supported params:
- */
-static str param_q = str_init("q");
-static str param_video = str_init("video");
-static str param_expires = str_init("expires");
-static str param_sip_instance = str_init("+sip.instance");
-static str param_3gpp_smsip = str_init("+g.3gpp.smsip");
-static str param_3gpp_icsi_ref = str_init("+g.3gpp.icsi-ref");
+static str unknown_param_open = str_init("\t\t\t<unknown-param name=\"");
+static str unknown_param_mid = str_init("\">");
+static str unknown_param_close = str_init("</unknown-param>\n");
+static str unknown_param_empty_end = str_init("\"></unknown-param>\n");
 
-static int inline supported_param(str *param_name)
+static str gr_pub_open = str_init("\t\t\t<gr:pub-gruu uri=\"");
+static str gr_temp_open = str_init("\t\t\t<gr:temp-gruu uri=\"");
+static str gr_close = str_init("\"/>\n");
+
+/* RFC 3840 media feature tags. Prefixed tags (+g.3gpp.*, +sip.instance, ...)
+ * are recognised by the leading '+', so they are not listed here. */
+static str media_feature_tags[] = {
+	str_init("actor"),
+	str_init("application"),
+	str_init("audio"),
+	str_init("automata"),
+	str_init("class"),
+	str_init("control"),
+	str_init("data"),
+	str_init("description"),
+	str_init("duplex"),
+	str_init("events"),
+	str_init("extensions"),
+	str_init("isfocus"),
+	str_init("language"),
+	str_init("methods"),
+	str_init("mobility"),
+	str_init("priority"),
+	str_init("schemes"),
+	str_init("sip.byeless"),
+	str_init("sip.ice"),
+	str_init("sip.rendering"),
+	str_init("text"),
+	str_init("type"),
+	str_init("video"),
+	{NULL, 0},
+};
+
+static int param_name_eq(const str *name, const char *lit, int len)
 {
+	return name->len == len && strncasecmp(name->s, lit, len) == 0;
+}
 
-	if(strncasecmp(param_name->s, param_q.s, param_name->len) == 0) {
+/* q and expires are attributes of <contact>. pub-gruu and temp-gruu are
+ * RFC 5628 elements. Everything else that is an RFC 3840 feature tag is an
+ * <unknown-param> (TS 24.229 §5.4.1.2.2F, RFC 3680). */
+static int is_feature_tag(const str *name)
+{
+	str *tag;
+
+	if(name->len <= 0 || name->s == NULL)
 		return 0;
-	} else if(strncasecmp(param_name->s, param_video.s, param_name->len) == 0) {
+	if(param_name_eq(name, "q", 1) || param_name_eq(name, "expires", 7)
+			|| param_name_eq(name, "pub-gruu", 8)
+			|| param_name_eq(name, "temp-gruu", 9))
 		return 0;
-	} else if(strncasecmp(param_name->s, param_expires.s, param_name->len)
-			  == 0) {
-		return 0;
-	} else if(strncasecmp(param_name->s, param_sip_instance.s, param_name->len)
-			  == 0) {
-		return 0;
-	} else if(strncasecmp(param_name->s, param_3gpp_smsip.s, param_name->len)
-			  == 0) {
-		return 0;
-	} else if(strncasecmp(param_name->s, param_3gpp_icsi_ref.s, param_name->len)
-			  == 0) {
-		return 0;
-	} else {
-		return -1;
+	if(name->s[0] == '+')
+		return 1;
+	for(tag = media_feature_tags; tag->s != NULL; tag++) {
+		if(name->len == tag->len && strncasecmp(name->s, tag->s, tag->len) == 0)
+			return 1;
 	}
+	return 0;
+}
+
+static int is_gruu_param(const str *name)
+{
+	return param_name_eq(name, "pub-gruu", 8) || param_name_eq(name, "temp-gruu", 9);
+}
+
+/* SIP quoting is not part of the parameter value. */
+static str param_value(const param_t *param)
+{
+	str v = param->body;
+
+	if(v.len >= 2 && v.s[0] == '"' && v.s[v.len - 1] == '"') {
+		v.s++;
+		v.len -= 2;
+	}
+	return v;
+}
+
+static void append_xml_escaped(str_buffer *buffer, const str *v, int attr)
+{
+	static str amp = str_init("&amp;");
+	static str lt = str_init("&lt;");
+	static str gt = str_init("&gt;");
+	static str quot = str_init("&quot;");
+	str one;
+	int i;
+	char c;
+
+	for(i = 0; i < v->len; i++) {
+		c = v->s[i];
+		if(c == '&')
+			str_buffer_append_str(buffer, &amp);
+		else if(c == '<')
+			str_buffer_append_str(buffer, &lt);
+		else if(c == '>')
+			str_buffer_append_str(buffer, &gt);
+		else if(attr && c == '"')
+			str_buffer_append_str(buffer, &quot);
+		else {
+			one.s = v->s + i;
+			one.len = 1;
+			str_buffer_append_str(buffer, &one);
+		}
+	}
+}
+
+static int record_has_gruu(ucontact_t *c)
+{
+	param_t *param;
+
+	for(; c; c = c->next) {
+		for(param = c->params; param; param = param->next) {
+			if(is_gruu_param(&param->name) && param->body.len > 0)
+				return 1;
+		}
+	}
+	return 0;
 }
 
 static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int expires, str state, str event)
@@ -175,38 +260,33 @@ static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int exp
 
 	param = ptr->params;
 	while(param) {
-		if(supported_param(&param->name) != 0) {
-			param = param->next;
-			continue;
-		}
+		str value;
 
-		if(param->body.len > 0) {
-			LM_DBG("This contact has params name: [%.*s] body [%.*s]\n",
-				param->name.len, param->name.s, param->body.len, param->body.s);
-
-			if(param->body.s[0] == '<'
-					&& param->body.s[param->body.len - 1] == '>') {
-				str tmp = STR_NULL;
-				LM_DBG("This param body starts with '<' and ends with '>' we "
-					   "will clean these for the NOTIFY XML with &lt; and "
-					   "&gt;\n");
-
-				tmp.len = param->body.len - 2;
-				tmp.s = param->body.s + 1;
-
-				str_buffer_append_str_fmt(buffer, &contact_s_params_with_body_fix,
-					param->name.len, param->name.s, tmp.len, tmp.s);
-			} else {
-				str_buffer_append_str_fmt(buffer, &contact_s_params_with_body,
-						param->name.len, param->name.s, 
-						param->body.len, param->body.s);
+		if(is_gruu_param(&param->name)) {
+			/* RFC 5628 §5: child elements, not unknown-param. */
+			value = param_value(param);
+			if(value.len > 0) {
+				str_buffer_append_str(buffer,
+						param_name_eq(&param->name, "pub-gruu", 8)
+								? &gr_pub_open : &gr_temp_open);
+				append_xml_escaped(buffer, &value, 1);
+				str_buffer_append_str(buffer, &gr_close);
 			}
-		} else {
-			LM_DBG("This contact has params name: [%.*s] \n",
-					STR_FMT(&param->name));
-
-			str_buffer_append_str_fmt(
-					buffer, &contact_s_params_no_body, STR_FMT(&param->name));
+		} else if(is_feature_tag(&param->name)) {
+			/* RFC 3680: the element content is the parameter value. '<' and
+			 * '>' are escaped; SIP quotes are not added around it. */
+			value = param_value(param);
+			LM_DBG("Feature tag [%.*s] body [%.*s]\n",
+					param->name.len, param->name.s, value.len, value.s);
+			str_buffer_append_str(buffer, &unknown_param_open);
+			append_xml_escaped(buffer, &param->name, 1);
+			if(value.len > 0) {
+				str_buffer_append_str(buffer, &unknown_param_mid);
+				append_xml_escaped(buffer, &value, 0);
+				str_buffer_append_str(buffer, &unknown_param_close);
+			} else {
+				str_buffer_append_str(buffer, &unknown_param_empty_end);
+			}
 		}
 
 		param = param->next;
@@ -232,8 +312,9 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 		return x;
 	}
 	str_buffer_append_str(buffer, &xml_start);
-	str_buffer_append_str_fmt(
-			buffer, &r_reginfo_s, VERSION_HOLDER, STR_FMT(&r_full));
+	str_buffer_append_str_fmt(buffer,
+			record_has_gruu(record->contacts) ? &r_reginfo_s_gr : &r_reginfo_s,
+			VERSION_HOLDER, STR_FMT(&r_full));
 
 	ptr = record->contacts;
 	LM_DBG("Records %p\n", ptr);

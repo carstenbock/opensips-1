@@ -37,6 +37,10 @@ ucontact_info_t *pack_ci(struct sip_msg* _m, contact_t* _c, unsigned int _e,
 		unsigned int _f, unsigned int _nat_flag, unsigned int _reg_flags,
 		 str *ownership_tag, struct ct_match *cmatch);
 
+/* Drop pub-gruu / temp-gruu nodes that pack_ci chained onto the request
+ * Contact. insert_ucontact() has already copied them into usrloc. */
+void reg_ci_detach_gruu(void);
+
 void print_ci(ucontact_info_t *ci);
 
 #endif /* __LIB_REG_CI__ */

@@ -21,12 +21,118 @@
  */
 
 
+#include <string.h>
+
 #include "../../trim.h"
+#include "../../ut.h"
+#include "../../mem/mem.h"
 #include "../../parser/parse_methods.h"
 #include "../../parser/parse_allow.h"
 #include "../../timer.h"
 
 #include "common.h"
+
+/* pub-gruu / temp-gruu copied off the reply Contact and linked after the
+ * request Contact's parameter list for the duration of one save(). */
+static param_t *gruu_extra = NULL;
+static param_t **gruu_link = NULL;
+
+static int ci_param_name_eq(const param_t *p, const char *lit, int len)
+{
+	return p->name.len == len && p->name.s
+			&& strncasecmp(p->name.s, lit, len) == 0;
+}
+
+static int ci_list_has(param_t *list, const char *lit, int len)
+{
+	for(; list; list = list->next) {
+		if(ci_param_name_eq(list, lit, len))
+			return 1;
+	}
+	return 0;
+}
+
+void reg_ci_detach_gruu(void)
+{
+	param_t *p, *next;
+
+	if(gruu_link)
+		*gruu_link = NULL;
+	gruu_link = NULL;
+	for(p = gruu_extra; p; p = next) {
+		next = p->next;
+		pkg_free(p->name.s);
+		if(p->body.s)
+			pkg_free(p->body.s);
+		pkg_free(p);
+	}
+	gruu_extra = NULL;
+}
+
+static param_t *clone_gruu_param(const param_t *src)
+{
+	param_t *n;
+
+	n = pkg_malloc(sizeof(*n));
+	if(n == NULL)
+		return NULL;
+	memset(n, 0, sizeof(*n));
+	n->type = src->type;
+	if(pkg_str_dup(&n->name, (str *)&src->name) < 0) {
+		pkg_free(n);
+		return NULL;
+	}
+	if(src->body.s && src->body.len && pkg_str_dup(&n->body, (str *)&src->body) < 0) {
+		pkg_free(n->name.s);
+		pkg_free(n);
+		return NULL;
+	}
+	return n;
+}
+
+/* Keep the request Contact's feature tags and append any GRUU the registrar
+ * put on the reply. The nodes are clones: the reply Contact is freed when
+ * save() returns, and the request list must not keep pointers into it. */
+static void chain_reply_gruu(param_t **dst, param_t *src)
+{
+	param_t *copy, *last = NULL, *p, *tail;
+
+	reg_ci_detach_gruu();
+	if(src == NULL)
+		return;
+
+	for(p = src; p; p = p->next) {
+		if(!ci_param_name_eq(p, "pub-gruu", 8) && !ci_param_name_eq(p, "temp-gruu", 9))
+			continue;
+		if(p->body.len <= 0)
+			continue;
+		if(ci_list_has(*dst, p->name.s, p->name.len))
+			continue;
+		copy = clone_gruu_param(p);
+		if(copy == NULL) {
+			LM_ERR("failed to copy GRUU contact parameter\n");
+			return;
+		}
+		if(gruu_extra == NULL)
+			gruu_extra = copy;
+		else
+			last->next = copy;
+		last = copy;
+	}
+	if(gruu_extra == NULL)
+		return;
+
+	if(*dst == NULL) {
+		*dst = gruu_extra;
+		gruu_link = dst;
+		return;
+	}
+	tail = *dst;
+	while(tail->next)
+		tail = tail->next;
+	gruu_link = &tail->next;
+	tail->next = gruu_extra;
+}
 
 
 /*! \brief
@@ -53,6 +159,10 @@ ucontact_info_t *pack_ci(struct sip_msg* _m, contact_t* _c, unsigned int _e,
 	ci.contact_id = 0;
 
 	if (_m) {
+		/* A previous save() may still have GRUU nodes linked onto its
+		 * request Contact. Drop them before this message's parameter list
+		 * is read. */
+		reg_ci_detach_gruu();
 		memset(&ci, 0, sizeof ci);
 
 		/* Get callid of the message */
@@ -199,6 +309,11 @@ ucontact_info_t *pack_ci(struct sip_msg* _m, contact_t* _c, unsigned int _e,
 				ci.received = received;
 			}
 		}
+
+		/* GRUU is added by the registrar on the reply Contact. The request
+		 * Contact still carries the feature tags. Keep both. */
+		if (_c)
+			chain_reply_gruu(&ci.params, _c->params);
 
 		/* additional information (script pvar) */
 		if (attr_avp_name != -1) {
