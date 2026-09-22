@@ -127,8 +127,10 @@ str realm_prefix = str_init("");
 
 str sock_hdr_name = {0,0};
 str gruu_secret = {0,0};
+str gruu_domain = {0,0};
 int disable_gruu = 1;
 int gruu_legacy_xor = 0;
+int gruu_legacy_host = 0;
 
 #define RCV_NAME "received"
 str rcv_param = str_init(RCV_NAME);
@@ -216,7 +218,9 @@ static const param_export_t params[] = {
 	{"mcontact_avp",       STR_PARAM, &mct_avp_param         },
 	{"attr_avp",           STR_PARAM, &attr_avp_param        },
 	{"gruu_secret",        STR_PARAM, &gruu_secret.s         },
+	{"gruu_domain",        STR_PARAM, &gruu_domain.s         },
 	{"gruu_legacy_xor",    INT_PARAM, &gruu_legacy_xor       },
+	{"gruu_legacy_host",   INT_PARAM, &gruu_legacy_host      },
 	{"disable_gruu",       INT_PARAM, &disable_gruu          },
 
 	/* common registrar modparams */

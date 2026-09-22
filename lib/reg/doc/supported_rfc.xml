@@ -92,6 +92,15 @@
 			</listitem>
 		</itemizedlist>
 		<para>
+		Both GRUUs are addressed at <xref linkend="param_gruu_domain"/> when
+		that parameter is set. Otherwise a public GRUU whose address of record
+		already contains a domain keeps that URI, and a temporary GRUU uses
+		the same domain instead of the registrar socket, so the URI can be
+		routed back to the home domain. With no domain available the host
+		stays the registrar socket, which is also what
+		<xref linkend="param_gruu_legacy_host"/> restores.
+		</para>
+		<para>
 		A call to &reg_lookup_f; will try to detect if the R-URI contains a
 		GRUU.  If it does, it will route the request just for the Contact
 		that the specific AOR belongs to, without appending any other branches.

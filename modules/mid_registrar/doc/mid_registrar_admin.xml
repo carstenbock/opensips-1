@@ -781,6 +781,52 @@ modparam("mid_registrar", "gruu_legacy_xor", 1)
 </programlisting>
 		</example>
 	</section>
+	<section id="param_gruu_domain" xreflabel="gruu_domain">
+		<title><varname>gruu_domain</varname> (string)</title>
+		<para>
+		Host placed in both the public and the temporary GRUU. The user part
+		of a public GRUU stays the user of the address of record, so an AoR
+		that already contains a domain is not written as
+		<emphasis>user@domain@gruu_domain</emphasis>. A temporary GRUU keeps
+		its <emphasis>tgruu.</emphasis> user part and uses this host.
+		</para>
+		<para>
+		When unset and the stored AoR contains a domain, that domain is the
+		host. The public GRUU is then unchanged. The temporary GRUU uses the
+		AoR domain instead of the registrar socket. When unset and the AoR
+		has no domain, the host stays the registrar socket. Enabling GRUU in
+		that configuration fails at startup: set this parameter, store a
+		domain in the AoR, or set <xref linkend="param_gruu_legacy_host"/>.
+		</para>
+		<para>
+		Default value is empty (no override). Ignored when
+		<xref linkend="param_gruu_legacy_host"/> is 1.
+		</para>
+		<example>
+		<title>Setting the <emphasis>gruu_domain</emphasis> module parameter</title>
+		<programlisting format="linespecific">
+modparam("mid_registrar", "gruu_domain", "example.com")
+</programlisting>
+		</example>
+	</section>
+	<section id="param_gruu_legacy_host" xreflabel="gruu_legacy_host">
+		<title><varname>gruu_legacy_host</varname> (integer)</title>
+		<para>
+		Keep the historical GRUU host. A temporary GRUU is addressed at the
+		registrar socket (<emphasis>ip:port</emphasis>). A public GRUU uses
+		that socket only when the AoR has no domain; otherwise the public
+		GRUU is the AoR with the <emphasis>;gr</emphasis> parameter.
+		</para>
+		<para>
+		Default value is <emphasis>0</emphasis>.
+		</para>
+		<example>
+		<title>Setting the <emphasis>gruu_legacy_host</emphasis> module parameter</title>
+		<programlisting format="linespecific">
+modparam("mid_registrar", "gruu_legacy_host", 1)
+</programlisting>
+		</example>
+	</section>
 
 	&pn_modparams;
 

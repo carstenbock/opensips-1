@@ -224,17 +224,26 @@ static inline unsigned int calc_buf_len(ucontact_t* c,int build_gruu,
 					;
 			}
 			if (build_gruu && c->instance.s) {
+				str guser, ghost;
+
 				sock = (c->sock)?(c->sock):(_m->rcv.bind_address);
+				if (reg_gruu_target(c->aor, sock, 0, &guser, &ghost) < 0) {
+					guser.len = c->aor ? c->aor->len : 0;
+					ghost.len = 0;
+				}
 				/* pub gruu */
 				len += PUB_GRUU_SIZE
 					+ 1 /* quote */
 					+ SIP_PROTO_SIZE
-					+ c->aor->len
-					+ (reg_use_domain ?0:(1 /* @ */ + sock->name.len + 1 /* : */ + sock->port_no_str.len))
+					+ guser.len
+					+ (ghost.len ? 1 + ghost.len : 0)
 					+ GR_PARAM_SIZE
 					+ (c->instance.len - 2)
 					+ 1 /* quote */
 					;
+				if (reg_gruu_target(c->aor, sock, 1, &guser, &ghost) < 0
+						|| ghost.len <= 0)
+					ghost.len = sock ? sock->name.len + 1 + sock->port_no_str.len : 0;
 				/* temp gruu */
 				len += TEMP_GRUU_SIZE
 					+ 1 /* quote */
@@ -242,9 +251,7 @@ static inline unsigned int calc_buf_len(ucontact_t* c,int build_gruu,
 					+ TEMP_GRUU_HEADER_SIZE
 					+ calc_temp_gruu_len(c->aor,&c->instance,&c->callid)
 					+ 1 /* @ */
-					+ sock->name.len
-					+ 1 /* : */
-					+ sock->port_no_str.len
+					+ ghost.len
 					+ GR_NO_VAL_SIZE
 					+ 1 /* quote */
 					;
@@ -341,22 +348,28 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 			}
 
 			if (build_gruu && c->instance.s) {
+				str guser, ghost;
+
 				sock = (c->sock)?(c->sock):(_m->rcv.bind_address);
-				/* build pub GRUU */
+				if (reg_gruu_target(c->aor, sock, 0, &guser, &ghost) < 0) {
+					LM_ERR("failed to select GRUU host\n");
+					contact.data_len = 0;
+					rerrno = R_INTERNAL;
+					return -1;
+				}
+				/* build pub GRUU. Copy the host before the next
+				 * reg_gruu_target() call, which reuses a static buffer. */
 				memcpy(p,PUB_GRUU,PUB_GRUU_SIZE);
 				p += PUB_GRUU_SIZE;
 				*p++ = '\"';
 				memcpy(p,SIP_PROTO,SIP_PROTO_SIZE);
 				p += SIP_PROTO_SIZE;
-				memcpy(p,c->aor->s,c->aor->len);
-				p += c->aor->len;
-				if (!reg_use_domain) {
+				memcpy(p, guser.s, guser.len);
+				p += guser.len;
+				if (ghost.len) {
 					*p++ = '@';
-					memcpy(p,sock->name.s,sock->name.len);
-					p += sock->name.len;
-					*p++ = ':';
-					memcpy(p,sock->port_no_str.s,sock->port_no_str.len);
-					p += sock->port_no_str.len;
+					memcpy(p, ghost.s, ghost.len);
+					p += ghost.len;
 				}
 				memcpy(p,GR_PARAM,GR_PARAM_SIZE);
 				p += GR_PARAM_SIZE;
@@ -364,6 +377,13 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 				p += c->instance.len-2;
 				*p++ = '\"';
 
+				if (reg_gruu_target(c->aor, sock, 1, &guser, &ghost) < 0
+						|| ghost.len <= 0) {
+					LM_ERR("failed to select temporary GRUU host\n");
+					contact.data_len = 0;
+					rerrno = R_INTERNAL;
+					return -1;
+				}
 				/* build temp GRUU */
 				memcpy(p,TEMP_GRUU,TEMP_GRUU_SIZE);
 				p += TEMP_GRUU_SIZE;
@@ -384,11 +404,8 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 						(unsigned char *)tmpgr,grlen);
 				p += calc_temp_gruu_len(c->aor,&c->instance,&c->callid);
 				*p++ = '@';
-				memcpy(p,sock->name.s,sock->name.len);
-				p += sock->name.len;
-				*p++ = ':';
-				memcpy(p,sock->port_no_str.s,sock->port_no_str.len);
-				p += sock->port_no_str.len;
+				memcpy(p, ghost.s, ghost.len);
+				p += ghost.len;
 				memcpy(p,GR_NO_VAL,GR_NO_VAL_SIZE);
 				p += GR_NO_VAL_SIZE;
 				*p++ = '\"';

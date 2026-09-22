@@ -26,14 +26,17 @@
 
 #include "../../dprint.h"
 #include "../../sha256.h"
+#include "../../socket_info.h"
 #include "../../ut.h"
 
 #include "aead.h"
 #include "gruu.h"
 #include "regtime.h"
 
-/* Set by each registrar module. Length is filled in by reg_init_globals(). */
+/* Set by each registrar module. Length is filled in by reg_init_globals()
+ * for gruu_secret and by reg_gruu_init() for gruu_domain. */
 extern int disable_gruu;
+extern int reg_use_domain;
 extern str gruu_secret;
 
 #define GRUU_PLAIN_MAX 1024
@@ -135,7 +138,113 @@ int reg_gruu_init(void)
 		LM_ERR("GRUU is enabled (disable_gruu=0) but gruu_secret is not set\n");
 		return -1;
 	}
+
+	if (gruu_domain.s)
+		gruu_domain.len = strlen(gruu_domain.s);
+	/* A temporary GRUU addressed at the registrar socket is not routable
+	 * through an I-CSCF. Require an explicit domain, usrloc use_domain,
+	 * or the legacy socket host. */
+	if (!disable_gruu && !gruu_legacy_host
+			&& !(gruu_domain.s && gruu_domain.len) && !reg_use_domain) {
+		LM_ERR("GRUU is enabled but neither gruu_domain nor usrloc use_domain "
+				"is set. Set gruu_domain, or gruu_legacy_host=1 to keep "
+				"the registrar socket as the GRUU host\n");
+		return -1;
+	}
 	return 0;
+}
+
+static char gruu_sock_host[256];
+
+static int gruu_split_aor(const str *aor, str *user, str *host)
+{
+	char *at;
+
+	if (!aor || !aor->s || aor->len <= 0)
+		return -1;
+	at = memchr(aor->s, '@', aor->len);
+	if (!at) {
+		*user = *aor;
+		host->s = NULL;
+		host->len = 0;
+		return 0;
+	}
+	user->s = aor->s;
+	user->len = at - aor->s;
+	host->s = at + 1;
+	host->len = aor->len - user->len - 1;
+	if (user->len <= 0 || host->len <= 0)
+		return -1;
+	return 0;
+}
+
+static int gruu_socket_host(const struct socket_info *sock, str *host)
+{
+	int n;
+
+	if (!sock || !sock->name.s || sock->name.len <= 0
+			|| !sock->port_no_str.s || sock->port_no_str.len <= 0)
+		return -1;
+	n = sock->name.len + 1 + sock->port_no_str.len;
+	if (n >= (int)sizeof gruu_sock_host)
+		return -1;
+	memcpy(gruu_sock_host, sock->name.s, sock->name.len);
+	gruu_sock_host[sock->name.len] = ':';
+	memcpy(gruu_sock_host + sock->name.len + 1,
+			sock->port_no_str.s, sock->port_no_str.len);
+	host->s = gruu_sock_host;
+	host->len = n;
+	return 0;
+}
+
+int reg_gruu_target(const str *aor, const struct socket_info *sock,
+		int temporary, str *user, str *host)
+{
+	str aor_user, aor_host;
+
+	if (!user || !host)
+		return -1;
+	if (gruu_split_aor(aor, &aor_user, &aor_host) < 0)
+		return -1;
+
+	/* Restore the historical host: the registrar socket, except a public
+	 * GRUU whose AoR already contains a domain. */
+	if (gruu_legacy_host) {
+		if (!temporary && aor_host.len) {
+			user->s = aor->s;
+			user->len = aor->len;
+			host->s = NULL;
+			host->len = 0;
+			return 0;
+		}
+		*user = aor_user;
+		return gruu_socket_host(sock, host);
+	}
+
+	/* An explicit domain replaces the socket and the AoR domain for both
+	 * GRUUs. The user part stays the AoR user, so a domain already stored
+	 * in the AoR is not written twice. */
+	if (gruu_domain.s && gruu_domain.len > 0) {
+		*user = aor_user;
+		*host = gruu_domain;
+		return 0;
+	}
+
+	if (aor_host.len) {
+		if (!temporary) {
+			user->s = aor->s;
+			user->len = aor->len;
+			host->s = NULL;
+			host->len = 0;
+			return 0;
+		}
+		*user = aor_user;
+		*host = aor_host;
+		return 0;
+	}
+
+	*user = aor_user;
+	return gruu_socket_host(sock, host);
 }
 
 int calc_temp_gruu_len(str *aor, str *instance, str *callid)

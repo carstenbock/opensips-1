@@ -101,8 +101,10 @@ str rcv_param = str_init(RCV_NAME);
 
 int case_sensitive  = 1; /*!< If set to 0, username in aor will be case insensitive */
 str gruu_secret = {0,0};
+str gruu_domain = {0,0};
 int disable_gruu = 1;
 int gruu_legacy_xor = 0;
+int gruu_legacy_host = 0;
 str realm_prefix = str_init("");
 int reg_use_domain = 0;
 
@@ -168,7 +170,9 @@ static const param_export_t mod_params[] = {
 	{ "received_param",       STR_PARAM, &rcv_param.s },
 	{ "retry_after",          INT_PARAM, &retry_after },
 	{ "gruu_secret",          STR_PARAM, &gruu_secret.s },
+	{ "gruu_domain",          STR_PARAM, &gruu_domain.s },
 	{ "gruu_legacy_xor",      INT_PARAM, &gruu_legacy_xor },
+	{ "gruu_legacy_host",     INT_PARAM, &gruu_legacy_host },
 	{ "disable_gruu",         INT_PARAM, &disable_gruu },
 	{ "outgoing_expires",     INT_PARAM, &outgoing_expires },
 	{ "contact_id_insertion", STR_PARAM, &mp_ctid_insertion },

@@ -35,8 +35,18 @@
 
 /* Defined by registrar and mid_registrar. */
 extern int gruu_legacy_xor;
+extern int gruu_legacy_host;
+extern str gruu_domain;
+
+struct socket_info;
 
 int reg_gruu_init(void);
+
+/* Host of a GRUU. *user is the public-GRUU user part (ignored for a
+ * temporary GRUU). *host is empty when *user already contains the domain.
+ * Returns 0 on success. */
+int reg_gruu_target(const str *aor, const struct socket_info *sock,
+		int temporary, str *user, str *host);
 
 /* Base64 length of a temporary GRUU user-part, excluding the "tgruu." prefix.
  * Returns 0 when the contact cannot carry a temporary GRUU. */
