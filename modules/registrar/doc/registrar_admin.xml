@@ -424,13 +424,23 @@ branch_route [parallel_fork] {
 	<section id="param_gruu_secret" xreflabel="gruu_secret">
 		<title><varname>gruu_secret</varname> (string)</title>
 		<para>
-		The string that will be used in XORing when generating
-		temporary GRUUs.
+		Shared secret used to seal temporary GRUUs (RFC 5627). The registrar
+		derives an encryption key from this value with HKDF-SHA256 and encrypts
+		the address of record with ChaCha20-Poly1305. Every process that must
+		decode a temporary GRUU, including every member of a registrar cluster,
+		has to be configured with the same secret.
 		</para>
 		<para>
-		<emphasis>
-			If not set, 'OpenSIPS' is the default secret.
-		</emphasis>
+		There is no default. When <xref linkend="param_disable_gruu"/> is
+		<emphasis>0</emphasis>, startup fails if this parameter is unset.
+		Older versions XORed the temporary GRUU with a compiled-in string
+		<emphasis>0p3nS1pS</emphasis>. The registrar manual of those versions
+		incorrectly described that default as <emphasis>OpenSIPS</emphasis>.
+		To keep decoding temporary GRUUs minted by that XOR scheme, set this
+		parameter to the secret that was in use (including
+		<emphasis>0p3nS1pS</emphasis> when none was configured) and enable
+		<xref linkend="param_gruu_legacy_xor"/>. New temporary GRUUs are never
+		built with the XOR scheme.
 		</para>
 		<example>
 		<title>Set <varname>gruu_secret</varname> parameter</title>
@@ -439,6 +449,25 @@ branch_route [parallel_fork] {
 modparam("registrar", "gruu_secret", "top_secret")
 ...
 		</programlisting>
+		</example>
+	</section>
+	<section id="param_gruu_legacy_xor" xreflabel="gruu_legacy_xor">
+		<title><varname>gruu_legacy_xor</varname> (integer)</title>
+		<para>
+		Accept temporary GRUUs that were sealed with the historical repeating-key
+		XOR, using <xref linkend="param_gruu_secret"/> as that key. The check
+		runs only after authenticated decryption has failed, so it cannot be
+		used to forge a GRUU under the current scheme. Leave this off once
+		every outstanding XOR temporary GRUU has expired.
+		</para>
+		<para>
+		Default value is <emphasis>0</emphasis>.
+		</para>
+		<example>
+		<title>Set <varname>gruu_legacy_xor</varname> parameter</title>
+		<programlisting format="linespecific">
+modparam("registrar", "gruu_legacy_xor", 1)
+</programlisting>
 		</example>
 	</section>
 	<section id="param_disable_gruu" xreflabel="disable_gruu">

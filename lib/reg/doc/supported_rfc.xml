@@ -76,11 +76,18 @@
 			</listitem>
 			<listitem>
 			<para>
-				<emphasis>temporary</emphasis> - hides the underlying AOR
-				Each new Register request leads to the construction of a
-				new temporary GRUU, while Register requests with a different
-				Call-ID lead to the invalidation of all the previous generated
-				temporary GRUUs.
+				<emphasis>temporary</emphasis> - hides the underlying AOR.
+				The user part is an authenticated encryption (ChaCha20-Poly1305,
+				RFC 8439) of the AOR, the SIP instance and the Call-ID, under a
+				key derived from <xref linkend="param_gruu_secret"/>. Any
+				registrar process configured with that secret can decode it;
+				the value is not stored in usrloc. Each new Register request
+				leads to the construction of a new temporary GRUU, while
+				Register requests with a different Call-ID lead to the
+				invalidation of all the previous generated temporary GRUUs.
+				Previous temporary GRUUs for the same Call-ID stay valid until
+				the contact expires, because decoding recovers the same
+				instance and Call-ID.
 			</para>
 			</listitem>
 		</itemizedlist>

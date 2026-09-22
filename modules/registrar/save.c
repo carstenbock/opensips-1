@@ -104,9 +104,8 @@ static inline int star(udomain_t* _d, struct save_ctx *_sctx,
 		      * contacts
 		      */
 		rerrno = R_UL_DEL_R;
-		if (!ul.get_urecord(_d, &_sctx->aor, &r)) {
+		if (!ul.get_urecord(_d, &_sctx->aor, &r))
 			build_contact(r->contacts,_m);
-		}
 		ul.unlock_udomain(_d, &_sctx->aor);
 		return -1;
 	}
@@ -142,7 +141,12 @@ static inline int no_contacts(udomain_t* _d, struct save_ctx *_sctx,
 		if (_sctx->flags & REG_SAVE_REQ_CT_ONLY_FLAG)
 			filter_contacts(r, _m);
 
-		build_contact(r->contacts,_m);
+		if (build_contact(r->contacts,_m) < 0) {
+			if (_sctx->flags & REG_SAVE_REQ_CT_ONLY_FLAG)
+				restore_contacts(r);
+			ul.unlock_udomain(_d, &_sctx->aor);
+			return -1;
+		}
 
 		if (_sctx->flags & REG_SAVE_REQ_CT_ONLY_FLAG)
 			restore_contacts(r);
@@ -318,7 +322,8 @@ static inline int insert_contacts(struct sip_msg* _m, contact_t* _c,
 			if (_sctx->flags & REG_SAVE_REQ_CT_ONLY_FLAG)
 				filter_contacts(r, _m);
 
-			build_contact(r->contacts,_m);
+			if (build_contact(r->contacts,_m) < 0)
+				goto error;
 
 			if (_sctx->flags & REG_SAVE_REQ_CT_ONLY_FLAG)
 				restore_contacts(r);
@@ -592,7 +597,13 @@ static inline int add_contacts(struct sip_msg* _m, contact_t* _c,
 		if (_sctx->flags & REG_SAVE_REQ_CT_ONLY_FLAG)
 			filter_contacts(r, _m);
 
-		build_contact(r->contacts,_m);
+		if (build_contact(r->contacts,_m) < 0) {
+			if (_sctx->flags & REG_SAVE_REQ_CT_ONLY_FLAG)
+				restore_contacts(r);
+			ul.release_urecord(r, 0);
+			ul.unlock_udomain(_d, &_sctx->aor);
+			return -3;
+		}
 
 		if (_sctx->flags & REG_SAVE_REQ_CT_ONLY_FLAG)
 			restore_contacts(r);

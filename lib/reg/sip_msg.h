@@ -36,7 +36,6 @@
 		((_msg)->REQ_METHOD) & ((_c)->methods))
 
 extern int disable_gruu;
-extern char tgruu_dec[];
 extern str gruu_secret;
 
 /*! \brief

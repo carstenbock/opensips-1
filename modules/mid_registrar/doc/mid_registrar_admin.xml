@@ -742,16 +742,42 @@ modparam("mid_registrar", "disable_gruu", 0)
 	<section id="param_gruu_secret" xreflabel="gruu_secret">
 		<title><varname>gruu_secret</varname> (string)</title>
 		<para>
-		The string that will be used in XORing when generating
-		temporary GRUUs.
+		Shared secret used to seal temporary GRUUs (RFC 5627). The mid-registrar
+		derives an encryption key from this value with HKDF-SHA256 and encrypts
+		the address of record with ChaCha20-Poly1305. Every process that must
+		decode a temporary GRUU has to be configured with the same secret.
 		</para>
 		<para>
-		Default value is <emphasis role='bold'>"0p3nS1pS"</emphasis>
+		There is no default. When <xref linkend="param_disable_gruu"/> is
+		<emphasis>0</emphasis>, startup fails if this parameter is unset.
+		Older versions XORed the temporary GRUU with a compiled-in string
+		<emphasis>0p3nS1pS</emphasis>. To keep decoding those GRUUs, set this
+		parameter to the secret that was in use and enable
+		<xref linkend="param_gruu_legacy_xor"/>. New temporary GRUUs are never
+		built with the XOR scheme.
 		</para>
 		<example>
 		<title>Setting the <emphasis>gruu_secret</emphasis> module parameter</title>
 		<programlisting format="linespecific">
 modparam("mid_registrar", "gruu_secret", "my_secret")
+</programlisting>
+		</example>
+	</section>
+	<section id="param_gruu_legacy_xor" xreflabel="gruu_legacy_xor">
+		<title><varname>gruu_legacy_xor</varname> (integer)</title>
+		<para>
+		Accept temporary GRUUs that were sealed with the historical repeating-key
+		XOR, using <xref linkend="param_gruu_secret"/> as that key. The check
+		runs only after authenticated decryption has failed. Leave this off once
+		every outstanding XOR temporary GRUU has expired.
+		</para>
+		<para>
+		Default value is <emphasis>0</emphasis>.
+		</para>
+		<example>
+		<title>Setting the <emphasis>gruu_legacy_xor</emphasis> module parameter</title>
+		<programlisting format="linespecific">
+modparam("mid_registrar", "gruu_legacy_xor", 1)
 </programlisting>
 		</example>
 	</section>

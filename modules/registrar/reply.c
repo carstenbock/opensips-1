@@ -40,6 +40,7 @@
 #include "../../parser/parse_supported.h"
 #include "../../data_lump_rpl.h"
 #include "../../lib/reg/common.h"
+#include "../../lib/reg/gruu.h"
 
 #include "../usrloc/usrloc.h"
 
@@ -73,9 +74,6 @@
 #define SIP_INSTANCE ";+sip.instance="
 #define SIP_INSTANCE_SIZE (sizeof(SIP_INSTANCE) - 1)
 
-#define TEMP_GRUU_HEADER "tgruu."
-#define TEMP_GRUU_HEADER_SIZE (sizeof(TEMP_GRUU_HEADER) - 1)
-
 #define GR_PARAM ";gr="
 #define GR_PARAM_SIZE (sizeof(GR_PARAM) - 1)
 
@@ -84,8 +82,6 @@
 
 #define CONTACT_SEP ", "
 #define CONTACT_SEP_LEN (sizeof(CONTACT_SEP) - 1)
-
-str default_gruu_secret=str_init("0p3nS1pS");
 
 /*! \brief
  * Buffer for Contact header field
@@ -96,16 +92,6 @@ static struct {
 	int data_len;
 } contact = {0, 0, 0};
 
-
-static inline int calc_temp_gruu_len(str* aor,str* instance,str *callid)
-{
-	int time_len,temp_gr_len;
-
-	int2str((unsigned long)get_act_time(),&time_len);
-	temp_gr_len = time_len + aor->len + instance->len - 2 + callid->len + 3; /* <instance> and blank spaces */
-	temp_gr_len = (temp_gr_len/3 + (temp_gr_len%3?1:0))*4; /* base64 encoding */
-	return temp_gr_len;
-}
 
 /*! \brief
  * Is this a Contact parameter build_contact() emits on its own?
@@ -278,45 +264,6 @@ static inline unsigned int calc_buf_len(ucontact_t* c,int build_gruu,
 	return len;
 }
 
-#define MAX_TEMP_GRUU_SIZE	255
-static char temp_gruu_buf[MAX_TEMP_GRUU_SIZE];
-
-/* Returns memory from a statically allocated buffer */
-char * build_temp_gruu(str *aor,str *instance,str *callid,int *len)
-{
-	int time_len,i;
-	char *p;
-	char *time_str = int2str((unsigned long)get_act_time(),&time_len);
-	str *magic;
-
-	*len = time_len + aor->len + instance->len + callid->len + 3 - 2; /* +3 blank spaces, -2 discarded chars of instance in memcpy below */
-	p = temp_gruu_buf;
-
-	memcpy(p,time_str,time_len);
-	p+=time_len;
-	*p++=' ';
-
-	memcpy(p,aor->s,aor->len);
-	p+=aor->len;
-	*p++=' ';
-
-	memcpy(p,instance->s+1,instance->len-2);
-	p+=instance->len-2;
-	*p++=' ';
-
-	memcpy(p,callid->s,callid->len);
-
-	LM_DBG("build temp gruu [%.*s]\n",*len,temp_gruu_buf);
-	if (gruu_secret.s != NULL)
-		magic = &gruu_secret;
-	else
-		magic = &default_gruu_secret;
-
-	for (i=0;i<*len;i++)
-		temp_gruu_buf[i] ^= magic->s[i%magic->len];
-	return temp_gruu_buf;
-}
-
 /*! \brief
  * Allocate a memory buffer and print Contact
  * header fields into it
@@ -427,6 +374,12 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 				p += TEMP_GRUU_HEADER_SIZE;
 
 				tmpgr = build_temp_gruu(c->aor,&c->instance,&c->callid,&grlen);
+				if (!tmpgr) {
+					LM_ERR("failed to build temporary GRUU\n");
+					contact.data_len = 0;
+					rerrno = R_INTERNAL;
+					return -1;
+				}
 				base64encode((unsigned char *)p,
 						(unsigned char *)tmpgr,grlen);
 				p += calc_temp_gruu_len(c->aor,&c->instance,&c->callid);

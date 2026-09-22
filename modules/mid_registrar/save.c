@@ -908,6 +908,12 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 				p += TEMP_GRUU_HEADER_SIZE;
 
 				tmpgr = build_temp_gruu(c->aor,&c->instance,&c->callid,&grlen);
+				if (!tmpgr) {
+					LM_ERR("failed to build temporary GRUU\n");
+					contact.data_len = 0;
+					rerrno = R_INTERNAL;
+					return -1;
+				}
 				base64encode((unsigned char *)p,
 						(unsigned char *)tmpgr,grlen);
 				p += calc_temp_gruu_len(c->aor,&c->instance,&c->callid);
@@ -2640,7 +2646,11 @@ quick_reply:
 		if (sctx.flags & REG_SAVE_REQ_CT_ONLY_FLAG)
 			filter_contacts(r, NULL, msg);
 
-		build_contact(r->contacts, msg);
+		if (build_contact(r->contacts, msg) < 0) {
+			if (sctx.flags & REG_SAVE_REQ_CT_ONLY_FLAG)
+				restore_contacts(r);
+			goto out_error;
+		}
 
 		if (sctx.flags & REG_SAVE_REQ_CT_ONLY_FLAG)
 			restore_contacts(r);

@@ -30,24 +30,18 @@
 
 #include "../../mod_fix.h"
 
+#include "../../lib/reg/gruu.h"
+
 #define PUB_GRUU ";pub-gruu="
 #define PUB_GRUU_SIZE (sizeof(PUB_GRUU) - 1)
 
 #define TEMP_GRUU ";temp-gruu="
 #define TEMP_GRUU_SIZE (sizeof(TEMP_GRUU) - 1)
 
-#define TEMP_GRUU_HEADER "tgruu."
-#define TEMP_GRUU_HEADER_SIZE (sizeof(TEMP_GRUU_HEADER) - 1)
-
 #define GR_PARAM ";gr="
 #define GR_PARAM_SIZE (sizeof(GR_PARAM) - 1)
 
 #define GR_NO_VAL ";gr"
 #define GR_NO_VAL_SIZE (sizeof(GR_NO_VAL) - 1)
-
-extern str default_gruu_secret;
-
-int calc_temp_gruu_len(str* aor,str* instance,str *callid);
-char * build_temp_gruu(str *aor,str *instance,str *callid,int *len);
 
 #endif /* _MID_REG_GRUU_ */

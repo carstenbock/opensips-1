@@ -33,13 +33,15 @@
 #include "../../data_lump.h"
 #include "../../rw_locking.h"
 
+#include "../../lib/reg/common.h"
+#include "../../lib/reg/gruu.h"
+
 #include "mid_registrar.h"
 #include "save.h"
 #include "lookup.h"
 #include "encode.h"
 #include "ulcb.h"
 
-#include "../../lib/reg/common.h"
 #include "../../parser/contact/contact.h"
 #include "../../parser/contact/parse_contact.h"
 #include "../../parser/msg_parser.h"
@@ -100,6 +102,7 @@ str rcv_param = str_init(RCV_NAME);
 int case_sensitive  = 1; /*!< If set to 0, username in aor will be case insensitive */
 str gruu_secret = {0,0};
 int disable_gruu = 1;
+int gruu_legacy_xor = 0;
 str realm_prefix = str_init("");
 int reg_use_domain = 0;
 
@@ -165,6 +168,7 @@ static const param_export_t mod_params[] = {
 	{ "received_param",       STR_PARAM, &rcv_param.s },
 	{ "retry_after",          INT_PARAM, &retry_after },
 	{ "gruu_secret",          STR_PARAM, &gruu_secret.s },
+	{ "gruu_legacy_xor",      INT_PARAM, &gruu_legacy_xor },
 	{ "disable_gruu",         INT_PARAM, &disable_gruu },
 	{ "outgoing_expires",     INT_PARAM, &outgoing_expires },
 	{ "contact_id_insertion", STR_PARAM, &mp_ctid_insertion },
@@ -388,6 +392,11 @@ static int mod_init(void)
 
 	if (reg_init_globals() != 0) {
 		LM_ERR("failed to initialize reg globals\n");
+		return -1;
+	}
+
+	if (reg_gruu_init() != 0) {
+		LM_ERR("failed to initialize GRUU support\n");
 		return -1;
 	}
 

@@ -66,6 +66,7 @@
 #include "../../lib/reg/config.h"
 #include "../../lib/reg/pn.h"
 #include "../../lib/reg/common.h"
+#include "../../lib/reg/gruu.h"
 
 #include "../usrloc/ul_mod.h"
 #include "../signaling/signaling.h"
@@ -127,6 +128,7 @@ str realm_prefix = str_init("");
 str sock_hdr_name = {0,0};
 str gruu_secret = {0,0};
 int disable_gruu = 1;
+int gruu_legacy_xor = 0;
 
 #define RCV_NAME "received"
 str rcv_param = str_init(RCV_NAME);
@@ -214,6 +216,7 @@ static const param_export_t params[] = {
 	{"mcontact_avp",       STR_PARAM, &mct_avp_param         },
 	{"attr_avp",           STR_PARAM, &attr_avp_param        },
 	{"gruu_secret",        STR_PARAM, &gruu_secret.s         },
+	{"gruu_legacy_xor",    INT_PARAM, &gruu_legacy_xor       },
 	{"disable_gruu",       INT_PARAM, &disable_gruu          },
 
 	/* common registrar modparams */
@@ -364,6 +367,11 @@ static int mod_init(void)
 
 	if (reg_init_globals() != 0) {
 		LM_ERR("failed to init globals\n");
+		return -1;
+	}
+
+	if (reg_gruu_init() != 0) {
+		LM_ERR("failed to initialize GRUU support\n");
 		return -1;
 	}
 
