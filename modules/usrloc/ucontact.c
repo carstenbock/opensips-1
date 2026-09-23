@@ -310,6 +310,46 @@ skip_fields:
 /*! \brief
  * Update ucontact structure in memory
  */
+static void ul_free_params(param_t *p)
+{
+	param_t *next;
+
+	for (; p; p = next) {
+		next = p->next;
+		if (p->name.s) shm_free(p->name.s);
+		if (p->body.s) shm_free(p->body.s);
+		shm_free(p);
+	}
+}
+
+/* Returns NULL on out-of-memory. Only called with a non-empty list. */
+static param_t *ul_dup_params(const param_t *src)
+{
+	param_t *head = NULL, **tail = &head, *p;
+
+	for (; src; src = src->next) {
+		p = shm_malloc(sizeof *p);
+		if (!p)
+			goto error;
+		memset(p, 0, sizeof *p);
+		*tail = p;
+		tail = &p->next;
+		p->type = src->type;
+		p->len = src->len;
+		if (src->name.s && src->name.len > 0 &&
+				shm_str_dup(&p->name, &src->name) < 0)
+			goto error;
+		if (src->body.s && src->body.len > 0 &&
+				shm_str_dup(&p->body, &src->body) < 0)
+			goto error;
+	}
+	return head;
+
+error:
+	ul_free_params(head);
+	return NULL;
+}
+
 int mem_update_ucontact(ucontact_t* _c, ucontact_info_t* _ci)
 {
 	/* "user_agent" must be null-terminated (see e5cb9805b) */
@@ -332,6 +372,7 @@ int mem_update_ucontact(ucontact_t* _c, ucontact_info_t* _ci)
 
 	char* ptr;
 	int_str_t shtag, *shtagp;
+	param_t *new_params;
 
 	/* RFC 3261 states 'All registrations from a UAC SHOULD use
 	 * the same Call-ID header field value for registrations sent
@@ -366,6 +407,17 @@ int mem_update_ucontact(ucontact_t* _c, ucontact_info_t* _ci)
 		if (_c->attr.s) shm_free(_c->attr.s);
 		_c->attr.s = NULL;
 		_c->attr.len = 0;
+	}
+
+	/* A refresh re-states the Contact parameters, and a registrar that
+	 * stores GRUUs mints new ones on every refresh. A caller that has no
+	 * parameter list (cluster sync, MI) keeps the stored one. */
+	if (_ci->params) {
+		new_params = ul_dup_params(_ci->params);
+		if (!new_params)
+			goto out_oom;
+		ul_free_params(_c->params);
+		_c->params = new_params;
 	}
 
 	get_act_time();
@@ -825,8 +877,10 @@ int db_update_ucontact(ucontact_t* _c)
 	static db_ps_t my_ps = NULL;
 	db_key_t keys1[1];
 	db_val_t vals1[1];
-	db_key_t keys2[15];
-	db_val_t vals2[15];
+	db_key_t keys2[16];
+	db_val_t vals2[16];
+	str_buffer *buffer = NULL;
+	str params = STR_NULL;
 
 	if (_c->flags & FL_MEM) {
 		return 0;
@@ -930,21 +984,68 @@ int db_update_ucontact(ucontact_t* _c)
 	vals2[14].nul = 0;
 	vals2[14].val.str_val = _c->callid;
 
+	/* params change on refresh (mem_update_ucontact) */
+	keys2[15] = &params_col;
+	vals2[15].type = DB_STR;
+	if (_c->params == 0) {
+		vals2[15].nul = 1;
+	} else {
+		buffer = new_str_buffer();
+		if(!buffer) {
+			LM_ERR("Error allocating str_buffer\n");
+			goto out_err;
+		}
+
+		{
+			param_t *param = _c->params;
+			while(param) {
+				if(param->name.len > 0) {
+					if(param->body.len > 0) {
+						str_buffer_append_str_fmt(buffer, &param_fmt,
+								param->name.len, param->name.s, "=", param->body.len, param->body.s,
+								param->next ? ";" : "");
+					} else {
+						str_buffer_append_str_fmt(buffer, &param_fmt,
+								param->name.len, param->name.s, "", 0, NULL,
+								param->next ? ";" : "");
+					}
+				}
+
+				param = param->next;
+			}
+		}
+
+		if(str_buffer_has_error(buffer)) {
+			LM_ERR("str_buffer had memory allocating errors while building\n");
+			free_str_buffer(buffer);
+			goto out_err;
+		} else if(!str_buffer_to_str(buffer, &params)) {
+			LM_ERR("str_buffer unable to get result\n");
+			free_str_buffer(buffer);
+			goto out_err;
+		}
+
+		free_str_buffer(buffer);
+		vals2[15].val.str_val = params;
+	}
+
 	if (ul_dbf.use_table(ul_dbh, _c->domain) < 0) {
 		LM_ERR("sql use_table failed\n");
 		goto out_err;
 	}
 
 	CON_SET_CURR_PS(ul_dbh, &my_ps);
-	if (ul_dbf.update(ul_dbh, keys1, 0, vals1, keys2, vals2, 1, 15)<0) {
+	if (ul_dbf.update(ul_dbh, keys1, 0, vals1, keys2, vals2, 1, 16)<0) {
 		LM_ERR("updating database failed\n");
 		goto out_err;
 	}
 
 	store_free_buffer(&vals2[12].val.str_val);
+	pkg_free(params.s);
 	return 0;
 out_err:
 	store_free_buffer(&vals2[12].val.str_val);
+	pkg_free(params.s);
 	return -1;
 }
 

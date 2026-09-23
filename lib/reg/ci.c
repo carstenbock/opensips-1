@@ -31,6 +31,7 @@
 #include "../../timer.h"
 
 #include "common.h"
+#include "gruu.h"
 
 /* pub-gruu / temp-gruu copied off the reply Contact and linked after the
  * request Contact's parameter list for the duration of one save(). */
@@ -134,6 +135,144 @@ static void chain_reply_gruu(param_t **dst, param_t *src)
 	tail->next = gruu_extra;
 }
 
+
+static param_t *new_gruu_param(const char *name, int name_len, str *body)
+{
+	param_t *n;
+	str s;
+
+	n = pkg_malloc(sizeof(*n));
+	if(n == NULL)
+		return NULL;
+	memset(n, 0, sizeof(*n));
+	s.s = (char *)name;
+	s.len = name_len;
+	if(pkg_str_dup(&n->name, &s) < 0) {
+		pkg_free(n);
+		return NULL;
+	}
+	n->body = *body;
+	return n;
+}
+
+/* Same layout as the reply Contact (registrar reply.c). The value keeps its
+ * SIP quotes: usrloc joins stored parameters with ';', and the ';gr' inside
+ * an unquoted GRUU would split into a parameter of its own on reload. */
+int reg_ci_attach_gruu(ucontact_info_t *ci, str *aor)
+{
+	static const char sip_proto[] = "sip:";
+	static const char gr_param[] = ";gr=";
+	static const char gr_no_val[] = ";gr";
+	str guser, ghost, pub = STR_NULL, tmp = STR_NULL;
+	param_t *pub_p = NULL, *tmp_p = NULL, *tail;
+	char *p;
+	int glen;
+
+	if(ci == NULL || ci->instance.len < 3 || ci->callid == NULL)
+		return 0;
+	if(ci_list_has(ci->params, "pub-gruu", 8)
+			|| ci_list_has(ci->params, "temp-gruu", 9))
+		return 0;
+
+	if(reg_gruu_target(aor, ci->sock, 0, &guser, &ghost) < 0) {
+		LM_ERR("failed to select GRUU host\n");
+		return -1;
+	}
+	pub.s = pkg_malloc(2 + sizeof(sip_proto) - 1 + guser.len
+			+ (ghost.len ? 1 + ghost.len : 0) + sizeof(gr_param) - 1
+			+ ci->instance.len - 2);
+	if(pub.s == NULL)
+		goto oom;
+	p = pub.s;
+	*p++ = '"';
+	memcpy(p, sip_proto, sizeof(sip_proto) - 1);
+	p += sizeof(sip_proto) - 1;
+	memcpy(p, guser.s, guser.len);
+	p += guser.len;
+	if(ghost.len) {
+		*p++ = '@';
+		memcpy(p, ghost.s, ghost.len);
+		p += ghost.len;
+	}
+	memcpy(p, gr_param, sizeof(gr_param) - 1);
+	p += sizeof(gr_param) - 1;
+	memcpy(p, ci->instance.s + 1, ci->instance.len - 2);
+	p += ci->instance.len - 2;
+	*p++ = '"';
+	pub.len = p - pub.s;
+
+	glen = calc_temp_gruu_len(aor, &ci->instance, ci->callid);
+	if(glen > 0) {
+		if(reg_gruu_target(aor, ci->sock, 1, &guser, &ghost) < 0
+				|| ghost.len <= 0) {
+			LM_ERR("failed to select temporary GRUU host\n");
+			goto error;
+		}
+		tmp.s = pkg_malloc(2 + sizeof(sip_proto) - 1 + TEMP_GRUU_HEADER_SIZE
+				+ glen + 1 + ghost.len + sizeof(gr_no_val) - 1);
+		if(tmp.s == NULL)
+			goto oom;
+		p = tmp.s;
+		*p++ = '"';
+		memcpy(p, sip_proto, sizeof(sip_proto) - 1);
+		p += sizeof(sip_proto) - 1;
+		memcpy(p, TEMP_GRUU_HEADER, TEMP_GRUU_HEADER_SIZE);
+		p += TEMP_GRUU_HEADER_SIZE;
+		glen = build_temp_gruu(aor, &ci->instance, ci->callid,
+				(int)ci->expires, p);
+		if(glen < 0) {
+			LM_ERR("failed to build temporary GRUU\n");
+			goto error;
+		}
+		p += glen;
+		*p++ = '@';
+		memcpy(p, ghost.s, ghost.len);
+		p += ghost.len;
+		memcpy(p, gr_no_val, sizeof(gr_no_val) - 1);
+		p += sizeof(gr_no_val) - 1;
+		*p++ = '"';
+		tmp.len = p - tmp.s;
+	}
+
+	if((pub_p = new_gruu_param("pub-gruu", 8, &pub)) == NULL)
+		goto oom;
+	pub.s = NULL;
+	if(tmp.s) {
+		if((tmp_p = new_gruu_param("temp-gruu", 9, &tmp)) == NULL)
+			goto oom;
+		tmp.s = NULL;
+		pub_p->next = tmp_p;
+	}
+
+	/* pack_ci() detached any earlier chain, so this one starts empty. */
+	reg_ci_detach_gruu();
+	gruu_extra = pub_p;
+	if(ci->params == NULL) {
+		ci->params = gruu_extra;
+		gruu_link = &ci->params;
+	} else {
+		tail = ci->params;
+		while(tail->next)
+			tail = tail->next;
+		gruu_link = &tail->next;
+		tail->next = gruu_extra;
+	}
+	return 0;
+
+oom:
+	LM_ERR("no more pkg memory\n");
+error:
+	if(pub.s)
+		pkg_free(pub.s);
+	if(tmp.s)
+		pkg_free(tmp.s);
+	if(pub_p) {
+		pkg_free(pub_p->name.s);
+		pkg_free(pub_p->body.s);
+		pkg_free(pub_p);
+	}
+	return -1;
+}
 
 /*! \brief
  * Fills the common part (for all contacts) of the info structure

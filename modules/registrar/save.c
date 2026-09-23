@@ -157,6 +157,16 @@ static inline int no_contacts(udomain_t* _d, struct save_ctx *_sctx,
 
 /*! \brief
  */
+/* After pack_ci(), before the usrloc write. A failure only costs the stored
+ * GRUUs; the binding itself is still saved. */
+static inline void store_gruu(ucontact_info_t *ci, struct save_ctx *_sctx)
+{
+	if ((_sctx->flags & REG_SAVE_STORE_GRUU_FLAG) &&
+			reg_ci_attach_gruu(ci, &_sctx->aor) < 0)
+		LM_ERR("failed to store the GRUUs of AoR <%.*s>\n",
+			_sctx->aor.len, _sctx->aor.s);
+}
+
 static int set_sock_hdr(struct sip_msg *msg, ucontact_info_t *ci,
                         unsigned int reg_flags)
 {
@@ -279,6 +289,7 @@ static inline int insert_contacts(struct sip_msg* _m, contact_t* _c,
 		}
 
 		set_sock_hdr(_m, ci, _sctx->flags);
+		store_gruu(ci, _sctx);
 
 		if ( r->contacts==0 ||
 		ul.get_ucontact(r, &_c->uri, ci->callid, ci->cseq+1, &_sctx->cmatch,
@@ -454,6 +465,7 @@ static inline int update_contacts(struct sip_msg* _m, urecord_t* _r,
 				LM_ERR("failed to extract contact info\n");
 				goto error;
 			}
+			store_gruu(ci, _sctx);
 
 			if (ul.insert_ucontact( _r, &_c->uri, ci, &_sctx->cmatch,
 				    0, &c) < 0) {
@@ -522,6 +534,7 @@ static inline int update_contacts(struct sip_msg* _m, urecord_t* _r,
 					LM_ERR("failed to pack contact specific info\n");
 					goto error;
 				}
+				store_gruu(ci, _sctx);
 
 				if (ul.update_ucontact(_r, c, ci, &_sctx->cmatch, 0) < 0) {
 					rerrno = R_UL_UPD_C;
@@ -678,6 +691,13 @@ int save_aux(struct sip_msg* _m, str* forced_binding, void* _d,
 
 	if (_owtag)
 		sctx.ownership_tag = *_owtag;
+
+	/* Not cleared for a tel: URI: with use_domain off, tel:+1 and sip:+1@d
+	 * are one record, and a tel: save without GRUUs would replace the ones
+	 * the sip: save stored. Leaving tel: identities without a GRUU is up to
+	 * whoever renders them (pua_reginfo). */
+	if (disable_gruu)
+		sctx.flags &= ~REG_SAVE_STORE_GRUU_FLAG;
 
 	if (extract_aor(uri, &sctx.aor, 0, 0, reg_use_domain) < 0) {
 		LM_ERR("failed to extract Address Of Record\n");

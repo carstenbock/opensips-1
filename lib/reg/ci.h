@@ -41,6 +41,11 @@ ucontact_info_t *pack_ci(struct sip_msg* _m, contact_t* _c, unsigned int _e,
  * Contact. insert_ucontact() has already copied them into usrloc. */
 void reg_ci_detach_gruu(void);
 
+/* Mints the pub-gruu and temp-gruu of this binding under aor and links them
+ * after ci->params until reg_ci_detach_gruu(). No-op for a contact without
+ * +sip.instance. Returns 0 on success. */
+int reg_ci_attach_gruu(ucontact_info_t *ci, str *aor);
+
 void print_ci(ucontact_info_t *ci);
 
 #endif /* __LIB_REG_CI__ */

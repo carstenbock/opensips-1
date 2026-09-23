@@ -238,9 +238,71 @@ static int record_has_gruu(ucontact_t *c)
 	return 0;
 }
 
-static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int expires, str state, str event)
+/* GRUUs of the other identities in the implicit set, per contact instance.
+ * A GRUU names one AoR (RFC 5628 §5), so the registered record's own GRUUs
+ * must not be repeated under the other <registration> elements. They live in
+ * the other identities' records, which reginfo_update() reads one lock at a
+ * time before it builds the document. Reading them from inside a usrloc
+ * callback would take a second record lock under the first. */
+struct id_gruu {
+	str identity;
+	str instance;
+	str pub;
+	str temp;
+	struct id_gruu *next;
+};
+static struct id_gruu *id_gruus = NULL;
+
+static void free_id_gruus(void)
+{
+	struct id_gruu *g;
+
+	while(id_gruus) {
+		g = id_gruus;
+		id_gruus = g->next;
+		pkg_free(g);
+	}
+}
+
+/* usrloc key of a SIP or SIPS identity. tel: identities have no GRUU and
+ * return -1. key points into a static buffer. */
+static int identity_ul_key(const str *identity, str *key)
+{
+	static char buf[MAX_URI_SIZE];
+	struct sip_uri puri;
+
+	if(parse_uri(identity->s, identity->len, &puri) < 0)
+		return -1;
+	if(puri.type != SIP_URI_T && puri.type != SIPS_URI_T)
+		return -1;
+	if(!ul.use_domain) {
+		*key = puri.user;
+		return 0;
+	}
+	if(puri.user.len + 1 + puri.host.len > MAX_URI_SIZE)
+		return -1;
+	memcpy(buf, puri.user.s, puri.user.len);
+	buf[puri.user.len] = '@';
+	memcpy(buf + puri.user.len + 1, puri.host.s, puri.host.len);
+	key->s = buf;
+	key->len = puri.user.len + 1 + puri.host.len;
+	return 0;
+}
+
+static void append_gruu(str_buffer *buffer, str *open, str *value)
+{
+	str_buffer_append_str(buffer, open);
+	append_xml_escaped(buffer, value, 1);
+	str_buffer_append_str(buffer, &gr_close);
+}
+
+/* own_gruu: the stored pub-gruu / temp-gruu belong to this identity.
+ * Otherwise the GRUUs come from id_gruus, and a tel: identity gets none. */
+static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int expires, str state, str event,
+		const str *identity, int own_gruu)
 {
 	param_t *param;	
+	struct id_gruu *g;
 	if(ptr->q != -1) {
 		float q = (float)ptr->q / 1000;
 
@@ -265,13 +327,10 @@ static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int exp
 		if(is_gruu_param(&param->name)) {
 			/* RFC 5628 §5: child elements, not unknown-param. */
 			value = param_value(param);
-			if(value.len > 0) {
-				str_buffer_append_str(buffer,
+			if(own_gruu && value.len > 0)
+				append_gruu(buffer,
 						param_name_eq(&param->name, "pub-gruu", 8)
-								? &gr_pub_open : &gr_temp_open);
-				append_xml_escaped(buffer, &value, 1);
-				str_buffer_append_str(buffer, &gr_close);
-			}
+								? &gr_pub_open : &gr_temp_open, &value);
 		} else if(is_feature_tag(&param->name)) {
 			/* RFC 3680: the element content is the parameter value. '<' and
 			 * '>' are escaped; SIP quotes are not added around it. */
@@ -292,6 +351,18 @@ static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int exp
 		param = param->next;
 	}
 
+	if(!own_gruu && ptr->instance.len > 0) {
+		for(g = id_gruus; g; g = g->next) {
+			if(!str_match(&g->identity, identity)
+					|| !str_match(&g->instance, &ptr->instance))
+				continue;
+			if(g->pub.len > 0)
+				append_gruu(buffer, &gr_pub_open, &g->pub);
+			if(g->temp.len > 0)
+				append_gruu(buffer, &gr_temp_open, &g->temp);
+		}
+	}
+
 	str_buffer_append_str(buffer, &contact_e);
 }
 
@@ -305,6 +376,8 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 	time_t cur_time = time(0);
 	int expires = 0;
 	int i = 0;
+	int own_gruu;
+	str key;
 
 	buffer = new_str_buffer();
 	if(!buffer) {
@@ -313,7 +386,8 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 	}
 	str_buffer_append_str(buffer, &xml_start);
 	str_buffer_append_str_fmt(buffer,
-			record_has_gruu(record->contacts) ? &r_reginfo_s_gr : &r_reginfo_s,
+			(record_has_gruu(record->contacts) || id_gruus)
+					? &r_reginfo_s_gr : &r_reginfo_s,
 			VERSION_HOLDER, STR_FMT(&r_full));
 
 	ptr = record->contacts;
@@ -344,6 +418,9 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 	}
 
 	for (i = 0; i < aor_count; i++) {
+		own_gruu = identity_ul_key(&aor[i], &key) == 0
+				&& str_casematch(&key, &record->aor);
+
 		/* Registration Node */
 		LM_DBG("Registration Node for AOR %.*s [%.*s]\n", aor[i].len, aor[i].s, STR_FMT(&state));
 		str_buffer_append_str_fmt(buffer, &registration_s,
@@ -392,7 +469,8 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 				}
 			}
 
-			process_xml_for_contact(buffer, ptr, expires, state, event);
+			process_xml_for_contact(buffer, ptr, expires, state, event,
+					&aor[i], own_gruu);
 			ptr = ptr->next;
 		}
 
@@ -672,8 +750,108 @@ error:
 	return;
 }
 
+static int add_id_gruu(const str *identity, ucontact_t *c)
+{
+	struct id_gruu *g;
+	param_t *param;
+	str pub = STR_NULL, temp = STR_NULL;
+	char *p;
+
+	for(param = c->params; param; param = param->next) {
+		if(param_name_eq(&param->name, "pub-gruu", 8))
+			pub = param_value(param);
+		else if(param_name_eq(&param->name, "temp-gruu", 9))
+			temp = param_value(param);
+	}
+	if(pub.len <= 0 && temp.len <= 0)
+		return 0;
+
+	g = pkg_malloc(sizeof *g + identity->len + c->instance.len
+			+ pub.len + temp.len);
+	if(!g) {
+		LM_ERR("no more pkg memory\n");
+		return -1;
+	}
+	p = (char *)(g + 1);
+	g->identity.s = p;
+	g->identity.len = identity->len;
+	memcpy(p, identity->s, identity->len);
+	p += identity->len;
+	g->instance.s = p;
+	g->instance.len = c->instance.len;
+	memcpy(p, c->instance.s, c->instance.len);
+	p += c->instance.len;
+	g->pub.s = p;
+	g->pub.len = pub.len > 0 ? pub.len : 0;
+	if(g->pub.len)
+		memcpy(p, pub.s, pub.len);
+	p += g->pub.len;
+	g->temp.s = p;
+	g->temp.len = temp.len > 0 ? temp.len : 0;
+	if(g->temp.len)
+		memcpy(p, temp.s, temp.len);
+	g->next = id_gruus;
+	id_gruus = g;
+	return 0;
+}
+
+/* Fills id_gruus for the identities of aor other than aor itself. Each
+ * record is locked on its own, never nested. */
+static void collect_id_gruus(str *aor)
+{
+	urecord_t *record = NULL;
+	ucontact_t *c;
+	int_str_t *key_value;
+	csv_record *list, *it;
+	str ids = STR_NULL, id, key, key_copy;
+
+	if(ul_identities_key.len <= 0)
+		return;
+
+	ul.lock_udomain(ul_domain, aor);
+	ul.get_urecord(ul_domain, aor, &record);
+	if(record) {
+		key_value = ul.get_urecord_key(record, &ul_identities_key);
+		if(key_value && key_value->is_str && key_value->s.len > 0
+				&& pkg_str_dup(&ids, &key_value->s) < 0)
+			LM_ERR("no more pkg memory\n");
+	}
+	ul.unlock_udomain(ul_domain, aor);
+	if(!ids.s)
+		return;
+
+	list = parse_csv_record(&ids);
+	for(it = list; it; it = it->next) {
+		id = it->s;
+		trim(&id);
+		if(id.len >= 2 && id.s[0] == '<') {
+			id.s++;
+			id.len -= 2;
+		}
+		if(identity_ul_key(&id, &key) < 0 || str_casematch(&key, aor))
+			continue;
+		if(pkg_str_dup(&key_copy, &key) < 0) {
+			LM_ERR("no more pkg memory\n");
+			break;
+		}
+		record = NULL;
+		ul.lock_udomain(ul_domain, &key_copy);
+		ul.get_urecord(ul_domain, &key_copy, &record);
+		for(c = record ? record->contacts : NULL; c; c = c->next) {
+			if(c->instance.len > 0 && add_id_gruu(&id, c) < 0)
+				break;
+		}
+		ul.unlock_udomain(ul_domain, &key_copy);
+		pkg_free(key_copy.s);
+	}
+	free_csv_record(list);
+	pkg_free(ids.s);
+}
+
 int w_reginfo_update(struct sip_msg *msg, str * aor) {
 	urecord_t *record = NULL;
+
+	collect_id_gruus(aor);
 
 	/* Let's lock that domain for this AOR: */
 	ul.lock_udomain(ul_domain, aor);
@@ -686,6 +864,7 @@ int w_reginfo_update(struct sip_msg *msg, str * aor) {
 			aor->len, aor->s);
 		/* Let's lock that domain for this AOR: */
 		ul.unlock_udomain(ul_domain, aor);
+		free_id_gruus();
 		return -1;
 	}
 	if (record->contacts) {
@@ -699,5 +878,6 @@ int w_reginfo_update(struct sip_msg *msg, str * aor) {
 
 	/* Let's lock that domain for this AOR: */
 	ul.unlock_udomain(ul_domain, aor);
+	free_id_gruus();
 	return 1;
 }

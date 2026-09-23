@@ -34,6 +34,7 @@ static str save_flag_names[] = {
 	str_init("path-received"),         /* REG_SAVE_PATH_RECEIVED_FLAG */
 	str_init("force-registration"),    /* REG_SAVE_FORCE_REG_FLAG */
 	str_init("only-request-contacts"), /* REG_SAVE_REQ_CT_ONLY_FLAG */
+	str_init("store-gruu"),            /* REG_SAVE_STORE_GRUU_FLAG */
 	STR_NULL
 };
 

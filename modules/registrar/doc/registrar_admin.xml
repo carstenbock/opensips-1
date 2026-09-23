@@ -642,6 +642,24 @@ modparam("registrar", "disable_gruu", 0)
 					<xref linkend="param_max_expires"/> module parameter.
 					</para>
 				</listitem>
+				<listitem>
+					<para><emphasis>'store-gruu'</emphasis> - mint the
+					public and the temporary GRUU of every saved contact that
+					carries <emphasis>+sip.instance</emphasis>, under the AOR it
+					is saved to, and store them as the
+					<emphasis>pub-gruu</emphasis> and
+					<emphasis>temp-gruu</emphasis> contact parameters. Every
+					refresh replaces them. Unlike the GRUUs of the reply,
+					which only cover the AOR of the REGISTER, this also works
+					with <emphasis>no-reply</emphasis>, so each identity of an
+					implicit registration set saved with its own AOR gets its
+					own GRUUs, for the reg-event document built by
+					<emphasis>pua_reginfo</emphasis>. A short-token temporary
+					GRUU (<xref linkend="param_gruu_cachedb_url"/>) is written to
+					the cache as well. Ignored while
+					<xref linkend="param_disable_gruu"/> is set.
+					</para>
+				</listitem>
 			</itemizedlist>
 			<para>This parameter is a string composed of a set of flags.</para>
 		</listitem>
@@ -1135,6 +1153,56 @@ if (is_method("REGISTER")) {
 		<programlisting format="linespecific">
 ...
 add_sock_hdr("Sock-Info");
+...
+</programlisting>
+		</example>
+	</section>
+
+	<section id="func_gruu_resolve" xreflabel="gruu_resolve()">
+		<title>
+		<function moreinfo="none">gruu_resolve(uri, aor_var)</function>
+		</title>
+		<para>
+		Returns the AOR a public or temporary GRUU belongs to, in the same
+		form <xref linkend="func_lookup"/> uses for the usrloc record. A
+		temporary GRUU is opaque, so this is how a script finds the served
+		user of a request addressed to one before it calls
+		<function>lookup()</function>.
+		</para>
+		<para>Meaning of the parameters is as follows:</para>
+		<itemizedlist>
+		<listitem>
+			<para>
+			<emphasis>uri (string)</emphasis> - the URI to resolve, usually
+			the Request-URI.
+			</para>
+		</listitem>
+		<listitem>
+			<para>
+			<emphasis>aor_var (var)</emphasis> - variable that receives the
+			AOR.
+			</para>
+		</listitem>
+		</itemizedlist>
+		<para>Return codes:</para>
+		<itemizedlist>
+			<listitem><para><emphasis>1</emphasis> - the URI is a GRUU and
+			aor_var holds its AOR.</para></listitem>
+			<listitem><para><emphasis>-1</emphasis> - the URI has no
+			<emphasis>gr</emphasis> parameter.</para></listitem>
+			<listitem><para><emphasis>-2</emphasis> - the URI is a GRUU that
+			does not decode, for example an unknown or expired temporary
+			GRUU token.</para></listitem>
+		</itemizedlist>
+		<para>
+		This function can be used from any route.
+		</para>
+		<example>
+		<title><function>gruu_resolve</function> usage</title>
+		<programlisting format="linespecific">
+...
+if (gruu_resolve($ru, $var(aor)))
+	xlog("request for a GRUU of $var(aor)\n");
 ...
 </programlisting>
 		</example>

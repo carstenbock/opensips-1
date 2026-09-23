@@ -92,6 +92,7 @@ static int bflag_fixup(void** param);
 
 /*! \brief Functions */
 static int add_sock_hdr(struct sip_msg* msg, str *str);
+static int w_gruu_resolve(struct sip_msg* msg, str *uri, pv_spec_t *aor_pv);
 
 int default_expires = 3600; 			/*!< Default expires value in seconds */
 qvalue_t default_q  = Q_UNSPECIFIED;	/*!< Default q value multiplied by 1000 */
@@ -177,6 +178,10 @@ static const cmd_export_t cmds[] = {
 	{"add_sock_hdr", (cmd_function)add_sock_hdr, {
 		{CMD_PARAM_STR,0,0}, {0,0,0}},
 		REQUEST_ROUTE|FAILURE_ROUTE|ONREPLY_ROUTE|BRANCH_ROUTE|LOCAL_ROUTE},
+	{"gruu_resolve", (cmd_function)w_gruu_resolve, {
+		{CMD_PARAM_STR,0,0},
+		{CMD_PARAM_VAR,0,0}, {0,0,0}},
+		ALL_ROUTES},
 	{"is_registered", (cmd_function)is_registered, {
 		{CMD_PARAM_STR|CMD_PARAM_STATIC, domain_fixup, 0},
 		{CMD_PARAM_STR|CMD_PARAM_OPT,0,0}, {0,0,0}},
@@ -502,6 +507,37 @@ static void mod_destroy(void)
 #include "../../data_lump.h"
 #include "../../ip_addr.h"
 #include "../../ut.h"
+
+/* Returns 1 and the usrloc AoR the GRUU belongs to, -1 when uri is not a
+ * GRUU, -2 when it is one that cannot be decoded (e.g. an unknown or
+ * expired temporary GRUU token). */
+static int w_gruu_resolve(struct sip_msg* msg, str *uri, pv_spec_t *aor_pv)
+{
+	struct sip_uri puri;
+	str aor, instance = STR_NULL, call_id = STR_NULL;
+	pv_value_t val;
+
+	if (parse_uri(uri->s, uri->len, &puri) < 0) {
+		LM_ERR("failed to parse URI <%.*s>\n", uri->len, uri->s);
+		return -2;
+	}
+	if (!puri.gr.s || !puri.gr.len)
+		return -1;
+
+	if (extract_aor(uri, &aor, &instance, &call_id, reg_use_domain) < 0) {
+		LM_INFO("GRUU <%.*s> does not resolve\n", uri->len, uri->s);
+		return -2;
+	}
+
+	memset(&val, 0, sizeof val);
+	val.flags = PV_VAL_STR;
+	val.rs = aor;
+	if (pv_set_value(msg, aor_pv, 0, &val) < 0) {
+		LM_ERR("failed to set the AoR variable\n");
+		return -2;
+	}
+	return 1;
+}
 
 static int add_sock_hdr(struct sip_msg* msg, str *hdr_name)
 {

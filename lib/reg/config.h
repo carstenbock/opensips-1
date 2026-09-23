@@ -50,8 +50,9 @@
 #define REG_SAVE_PATH_FLAG   (REG_SAVE_PATH_STRICT_FLAG|\
 			REG_SAVE_PATH_LAZY_FLAG|REG_SAVE_PATH_OFF_FLAG)
 #define REG_SAVE_REQ_CT_ONLY_FLAG      (1<<8)
+#define REG_SAVE_STORE_GRUU_FLAG       (1<<9)
 
 /* save() flags which are internally set, based on the SIP request */
-#define REG_SAVE__PN_ON_FLAG           (1<<9)
+#define REG_SAVE__PN_ON_FLAG           (1<<10)
 
 #endif /* __LIB_REG_CONFIG__ */
