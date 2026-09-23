@@ -130,13 +130,13 @@ static int mod_init(void)
 	bind_usrloc_t bind_usrloc;
 	bind_presence_t bind_presence;
 
-	if(publish_reginfo == 1) {
-		/* Verify the default domain: */
-		if(!reginfo_default_domain.s) {
-			LM_ERR("default domain parameter not set\n");
-			return -1;
-		}
+	/* Also needed with publish_reginfo=0: the usrloc callback appends it
+	 * to domain-less AoRs (usrloc use_domain=0). */
+	if(reginfo_default_domain.s)
 		reginfo_default_domain.len = strlen(reginfo_default_domain.s);
+	else if(publish_reginfo == 1) {
+		LM_ERR("default domain parameter not set\n");
+		return -1;
 	}
 	
 	if(!server_address.s) {
