@@ -559,11 +559,33 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 		if ((type & (UL_CONTACT_DELETE|UL_CONTACT_EXPIRE)) && (count == 0))	{
 			presentity.expires = 0;
 		} else {
-			presentity.expires = 3600;
+			/* The document must outlive the binding. A fixed 3600 dropped
+			 * the row while the contact was still registered, and the next
+			 * publish then failed its etag lookup. */
+			ucontact_t *c;
+			time_t now = time(NULL);
+			time_t remain = 0;
+
+			for (c = record->contacts; c; c = c->next) {
+				time_t left;
+
+				if (c->expires == 0)
+					left = 3600;
+				else if (c->expires > now)
+					left = c->expires - now;
+				else
+					continue;
+				if (left > remain)
+					remain = left;
+			}
+			presentity.expires = remain > 0 ? (int)remain : 3600;
 		}
 		presentity.received_time = (int)time(NULL);
 		key_value = ul.get_urecord_key(record, &reginfo_key_etag);
-		if (key_value && key_value->is_str) {
+		/* An empty string is still a str. Treating it as an existing etag
+		 * makes update_presentity look up "" and insert nothing, so another
+		 * P-CSCF has no row to fall back to. */
+		if (key_value && key_value->is_str && key_value->s.len > 0) {
 			presentity.old_etag = key_value->s;
 		} else {
 			id_buf_len = snprintf(id_buf, sizeof(id_buf), "%.*s;%i",
@@ -582,17 +604,29 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 		
 		presentity.body = body;
 
-		memset(&new_value, 0, sizeof(int_str_t));
-		new_value.is_str = 1;
-		new_value.s = presentity.new_etag;
-		ul.put_urecord_key(record, &reginfo_key_etag, &new_value);
-
 		/* query the database and update or insert */
 		if(pres.update_presentity(&presentity) <0)
 		{
 			LM_ERR("when updating presentity\n");
 			goto error;
 		}
+
+		/* update_presentity rotates the etag (etag_not_new is 0 for reg)
+		 * and fills new_etag. Write that value only after it succeeds.
+		 * Writing it beforehand stored "" on an update and the next publish
+		 * could not insert. An expires=0 delete leaves "" so the next
+		 * registration starts a new presentity. */
+		memset(&new_value, 0, sizeof(int_str_t));
+		new_value.is_str = 1;
+		if (presentity.expires == 0) {
+			new_value.s.s = "";
+			new_value.s.len = 0;
+		} else if (presentity.new_etag.s && presentity.new_etag.len > 0) {
+			new_value.s = presentity.new_etag;
+		}
+		if (presentity.expires == 0 ||
+				(presentity.new_etag.s && presentity.new_etag.len > 0))
+			ul.put_urecord_key(record, &reginfo_key_etag, &new_value);
 
 		LM_DBG("etag_new = %i, new_etag %.*s, old_etag %.*s\n", presentity.etag_new,
 		  presentity.new_etag.len, presentity.new_etag.s,

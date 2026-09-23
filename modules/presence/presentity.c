@@ -43,6 +43,7 @@
 #include "notify.h"
 #include "publish.h"
 #include "hash.h"
+#include "clustering.h"
 #include "utils_func.h"
 
 
@@ -594,9 +595,37 @@ int update_presentity(struct sip_msg* msg, presentity_t* presentity,
 			if (result->n <= 0)
 			{
 					pa_dbf.free_result(pa_db, result);
+					result = NULL;
+					/* A SIP PUBLISH with a stale etag is a 412. An internal
+					 * publish (pua_reginfo) has no watcher to tell, and
+					 * returning success here leaves no row, so the next
+					 * reg-event NOTIFY is empty. Insert a new document. */
+					if (!msg) {
+						LM_INFO("No E_Tag match [%.*s] for internal publish,"
+							" inserting\n", presentity->old_etag.len,
+							presentity->old_etag.s);
+						presentity->etag_new = 1;
+						presentity->old_etag.s = NULL;
+						presentity->old_etag.len = 0;
+						if (presentity->new_etag.s == NULL
+								|| presentity->new_etag.len == 0) {
+							if (generate_ETag(0, &presentity->new_etag) < 0)
+								goto error;
+						}
+						if (rules_doc) {
+							if (rules_doc->s)
+								pkg_free(rules_doc->s);
+							pkg_free(rules_doc);
+							rules_doc = NULL;
+						}
+						if (pres_uri.s)
+							pkg_free(pres_uri.s);
+						pres_uri.s = NULL;
+						return update_presentity(NULL, presentity, sent_reply);
+					}
 					LM_ERR("No E_Tag match [%.*s]\n", presentity->old_etag.len,
 							presentity->old_etag.s);
-					if (msg && sigb.reply(msg, 412, &pu_412_rpl, 0)==-1 )
+					if (sigb.reply(msg, 412, &pu_412_rpl, 0)==-1 )
 					{
 						LM_ERR("sending '412 Conditional request failed' reply\n");
 						goto error;
@@ -899,7 +928,30 @@ error:
 int internal_update_presentity(presentity_t* presentity)
 {
 	int dummy;
-	return update_presentity( NULL, presentity, &dummy);
+	int rc;
+
+	rc = update_presentity( NULL, presentity, &dummy);
+	if (rc < 0)
+		return rc;
+
+	/* SIP PUBLISH replicates from handle_publish(). Internal publishers
+	 * (pua_reginfo) do not, so the presentity stays on the node that
+	 * wrote it. A copy we received already carries PRES_FLAG_REPLICATED
+	 * and must not be broadcast again. A conditional-request failure
+	 * (no etag match) returns 0 without filling new_etag; only a stored
+	 * presentity, or an expires=0 delete, is worth sending. */
+	if (!(presentity->flags & PRES_FLAG_REPLICATED) &&
+			is_cluster_federation_enabled() &&
+			presentity->event && presentity->event->evp &&
+			is_event_clustered(presentity->event->evp->parsed) &&
+			(presentity->new_etag.s || presentity->expires == 0)) {
+		if (presentity->new_etag.s == NULL)
+			presentity->new_etag = presentity->old_etag;
+		if (presentity->new_etag.s)
+			replicate_publish_on_cluster(presentity);
+	}
+
+	return 0;
 }
 
 

@@ -1431,7 +1431,7 @@ static str ipsec_usrloc_mode = str_init("ipsec.mode");  /* NAT-T mode */
 	({ \
 		int_str_t *ret = ul_ipsec.get_ucontact_key(_c, &(_s)); \
 		if (!ret || !ret->is_str) { \
-			LM_ERR("%s%s!\n", _d, (ret?"has invalid type":"not found")); \
+			LM_ERR("%s %s!\n", _d, (ret?"has invalid type":"not found")); \
 			_e; \
 		} \
 		(ret->s); \
@@ -1442,7 +1442,7 @@ static str ipsec_usrloc_mode = str_init("ipsec.mode");  /* NAT-T mode */
 	({ \
 		int_str_t *ret = ul_ipsec.get_ucontact_key(_c, &(_s)); \
 		if (!ret || ret->is_str) { \
-			LM_ERR("%s%s!\n", _d, (ret?"has invalid type":"not found")); \
+			LM_ERR("%s %s!\n", _d, (ret?"has invalid type":"not found")); \
 			_e; \
 		} \
 		(ret->i); \
@@ -1462,6 +1462,12 @@ static str ipsec_usrloc_mode = str_init("ipsec.mode");  /* NAT-T mode */
 		_is.is_str = 0; \
 		(&_is); \
 	})
+
+/* Plain SIP bindings share this location table and carry no ipsec.* keys. */
+static int ipsec_contact_has_ck(ucontact_t *contact)
+{
+	return ul_ipsec.get_ucontact_key(contact, &ipsec_usrloc_ck) != NULL;
+}
 
 static struct ipsec_user *ipsec_usrloc_get_user(ucontact_t *contact)
 {
@@ -1509,6 +1515,15 @@ static void ipsec_usrloc_restore(ucontact_t *contact)
 	LM_DBG("restoring IPSec context for %.*s (%.*s)\n",
 			contact->aor->len, contact->aor->s,
 			contact->c.len, contact->c.s);
+
+	/* A contact saved from a plain REGISTER has no ipsec.ck. That is
+	 * expected: save() records it for terminating lookup, and there is
+	 * no SA to rebuild. */
+	if (!ipsec_contact_has_ck(contact)) {
+		LM_DBG("contact %.*s has no IPSec keys - skipping restore\n",
+				contact->c.len, contact->c.s);
+		return;
+	}
 
 	/* simulate a sec_agree_body */
 	memset(&sa, 0, sizeof sa);
@@ -1719,6 +1734,9 @@ void ipsec_usrloc_handler(void *binding, ul_cb_type type, ul_cb_extra *extra)
 			break;
 		case UL_CONTACT_DELETE:
 		case UL_CONTACT_EXPIRE:
+			/* Same as restore: a plain binding never had an SA. */
+			if (!ipsec_contact_has_ck(contact))
+				break;
 			ipsec_usrloc_delete(contact);
 			break;
 		default:

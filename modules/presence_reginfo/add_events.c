@@ -48,7 +48,9 @@ int reginfo_add_events(void)
 	/* modify XML body for each watcher to set the correct "version" */
 	event.aux_body_processing = reginfo_body_setversion;
 	event.aux_free_body= free_xml_body;
-	event.etag_not_new = 0;
+	/* One reginfo document per AoR, replaced in place. Rotating the etag
+	 * on every contact change makes the next publish miss the row. */
+	event.etag_not_new = 1;
 
 	if(pres_reginfo_aggregate_presentities) {
 		/* aggregate XML body and free() function */
