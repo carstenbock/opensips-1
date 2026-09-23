@@ -28,6 +28,7 @@
 #include "../../qvalue.h"
 #include "../../lib/csv.h"
 #include "../../trim.h"
+#include "../../script_cb.h"
 
 /*
 Contact: <sip:carsten@10.157.87.36:44733;transport=udp>;expires=600000;+g.oma.sip-im;language="en,fr";+g.3gpp.smsip;+g.oma.sip-im.large-message;audio;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-vs";+g.3gpp.cs-voice.
@@ -66,6 +67,21 @@ Call-ID: 9ad9f89f-164d-bb86-1072-52e7e9eb5025.
   ((_pstr_ != (str *)0) ? (_pstr_)->s : "")
 
 static int _pua_reginfo_self_op = 0;
+static int reginfo_deferred = 0;
+
+int w_reginfo_defer(struct sip_msg *msg)
+{
+	reginfo_deferred = 1;
+	return 1;
+}
+
+/* A request that set the flag and never reached reginfo_update() must not
+ * hold back the publishes of the next one in this process. */
+int reginfo_clear_defer(struct sip_msg *msg, void *param)
+{
+	reginfo_deferred = 0;
+	return SCB_RUN_ALL;
+}
 
 static pres_ev_t *reginfo_event = NULL;
 
@@ -75,8 +91,6 @@ void pua_reginfo_update_self_op(int v)
 }
 
 #define VERSION_HOLDER "00000000000"
-
-str reginfo_key_etag = str_init("reginfo_etag");
 
 
 static str xml_start = str_init("<?xml version=\"1.0\"?>\n");
@@ -505,7 +519,6 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 	char etag_buf[MD5_LEN];
 	str etag = {NULL, 0};
 	int_str_t * key_value;
-	int_str_t new_value;
 
 	char *at = NULL;
 	char id_buf[512];
@@ -517,7 +530,7 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 	str s, str_dup;
 
 	/* Get the URecord for the contact */
-	LM_ERR("Searching urecord for contact-AOR %.*s (Contact %.*s), type %i\n",
+	LM_DBG("Searching urecord for contact-AOR %.*s (Contact %.*s), type %i\n",
 		contact->aor->len, contact->aor->s,
 		contact->c.len, contact->c.s, (int)type);
 	ul.get_urecord(ul_domain, contact->aor, &record);
@@ -528,6 +541,19 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 		return;
 	}
 
+	/* With usrloc full-sharing every node applies every change. Only the node
+	 * that made it publishes; the shared presentity table carries the
+	 * document. A replicated copy published too, raced the originating node
+	 * and could leave a stale or incomplete document as the last one written. */
+	if(ul.in_replication && ul.in_replication()) {
+		return;
+	}
+	/* The script announced with reginfo_defer() that reginfo_update() follows
+	 * the save(); only that builds the document with every identity's GRUUs.
+	 * Removals are still published here. */
+	if(reginfo_deferred && (type & (UL_CONTACT_INSERT|UL_CONTACT_UPDATE))) {
+		return;
+	}
 	if(_pua_reginfo_self_op == 1) {
 		LM_DBG("operation triggered by own action for aor: %.*s (%d)\n",
 				record->aor.len, record->aor.s, type);
@@ -659,23 +685,21 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 			presentity.expires = remain > 0 ? (int)remain : 3600;
 		}
 		presentity.received_time = (int)time(NULL);
-		key_value = ul.get_urecord_key(record, &reginfo_key_etag);
-		/* An empty string is still a str. Treating it as an existing etag
-		 * makes update_presentity look up "" and insert nothing, so another
-		 * P-CSCF has no row to fall back to. */
-		if (key_value && key_value->is_str && key_value->s.len > 0) {
-			presentity.old_etag = key_value->s;
-		} else {
-			id_buf_len = snprintf(id_buf, sizeof(id_buf), "%.*s;%i",
-					record->aor.len, record->aor.s, count);
-			etag.s = id_buf;
-			etag.len = id_buf_len;
-			MD5StringArray(etag_buf, &etag, 1);
-
+		/* Any node sharing the presentity table can publish for this AoR,
+		 * and a urecord key does not replicate after the record is created.
+		 * An etag derived from the AoR addresses the same row on every node:
+		 * a publish upserts it and a delete finds it. */
+		id_buf_len = snprintf(id_buf, sizeof(id_buf), "%.*s",
+				record->aor.len, record->aor.s);
+		etag.s = id_buf;
+		etag.len = id_buf_len;
+		MD5StringArray(etag_buf, &etag, 1);
+		presentity.new_etag.s = etag_buf;
+		presentity.new_etag.len = MD5_LEN;
+		if (presentity.expires == 0)
+			presentity.old_etag = presentity.new_etag;
+		else
 			presentity.etag_new = 1;
-			presentity.new_etag.s = etag_buf;
-			presentity.new_etag.len = MD5_LEN;
-		}
 		LM_DBG("etag_new = %i, new_etag %.*s, old_etag %.*s\n", presentity.etag_new,
 		  presentity.new_etag.len, presentity.new_etag.s,
 		  presentity.old_etag.len, presentity.old_etag.s);
@@ -688,23 +712,6 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 			LM_ERR("when updating presentity\n");
 			goto error;
 		}
-
-		/* update_presentity rotates the etag (etag_not_new is 0 for reg)
-		 * and fills new_etag. Write that value only after it succeeds.
-		 * Writing it beforehand stored "" on an update and the next publish
-		 * could not insert. An expires=0 delete leaves "" so the next
-		 * registration starts a new presentity. */
-		memset(&new_value, 0, sizeof(int_str_t));
-		new_value.is_str = 1;
-		if (presentity.expires == 0) {
-			new_value.s.s = "";
-			new_value.s.len = 0;
-		} else if (presentity.new_etag.s && presentity.new_etag.len > 0) {
-			new_value.s = presentity.new_etag;
-		}
-		if (presentity.expires == 0 ||
-				(presentity.new_etag.s && presentity.new_etag.len > 0))
-			ul.put_urecord_key(record, &reginfo_key_etag, &new_value);
 
 		LM_DBG("etag_new = %i, new_etag %.*s, old_etag %.*s\n", presentity.etag_new,
 		  presentity.new_etag.len, presentity.new_etag.s,
@@ -851,6 +858,7 @@ static void collect_id_gruus(str *aor)
 int w_reginfo_update(struct sip_msg *msg, str * aor) {
 	urecord_t *record = NULL;
 
+	reginfo_deferred = 0;
 	collect_id_gruus(aor);
 
 	/* Let's lock that domain for this AOR: */

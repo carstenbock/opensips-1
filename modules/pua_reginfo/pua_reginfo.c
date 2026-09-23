@@ -31,6 +31,7 @@
 #include "subscribe.h"
 #include "notify.h"
 #include "usrloc_cb.h"
+#include "../../script_cb.h"
 
 usrloc_api_t ul; 		/*!< Structure containing pointers to usrloc functions*/
 pua_api_t pua;	 		/*!< Structure containing pointers to PUA functions*/
@@ -72,6 +73,8 @@ static cmd_export_t cmds[] = {
 				{CMD_PARAM_STR, 0, 0},
 				{0,0,0},
 			},
+			REQUEST_ROUTE | ONREPLY_ROUTE},
+		{"reginfo_defer", (cmd_function)w_reginfo_defer, {{0,0,0}},
 			REQUEST_ROUTE | ONREPLY_ROUTE},
 		{0,0,{{0,0,0}},0}
 	};
@@ -222,6 +225,11 @@ static int mod_init(void)
 
 	if (ul_identities_key.s)
 		ul_identities_key.len = strlen(ul_identities_key.s);
+
+	if (register_script_cb(reginfo_clear_defer, PRE_SCRIPT_CB|REQ_TYPE_CB, 0) < 0) {
+		LM_ERR("failed to register the pre-script callback\n");
+		return -1;
+	}
 
 	/*
 	 * Import use_domain parameter from usrloc

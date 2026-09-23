@@ -607,9 +607,11 @@ int cdb_add_ct_update(cdb_dict_t *updates, const ucontact_t *ct, char remove)
 			while(param) {
 				if(param->name.len > 0) {
 					if(param->body.len > 0) {
+						int q = ul_param_needs_quotes(&param->body);
 						str_buffer_append_str_fmt(buffer, &param_fmt,
-								param->name.len, param->name.s, "=", param->body.len, param->body.s,
-								param->next ? ";" : "");
+								param->name.len, param->name.s, q ? "=\"" : "=",
+								param->body.len, param->body.s,
+								q ? (param->next ? "\";" : "\"") : (param->next ? ";" : ""));
 					} else {
 						str_buffer_append_str_fmt(buffer, &param_fmt,
 								param->name.len, param->name.s, "", 0, NULL,

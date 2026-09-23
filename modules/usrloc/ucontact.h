@@ -330,4 +330,20 @@ int_str_t *get_ucontact_key(ucontact_t* _ct, const str* _key);
 int_str_t *put_ucontact_key(ucontact_t* _ct, const str* _key,
                             const int_str_t* _val);
 
+/* parse_params() drops the quotes of a quoted value. Written back bare, a
+ * ';' or ',' inside it (the ";gr" of a GRUU) becomes a parameter of its own
+ * on the next parse (replication, DB load, restart sync). */
+static inline int ul_param_needs_quotes(const str *body)
+{
+	int i;
+
+	if (body->len >= 2 && body->s[0] == '"' && body->s[body->len - 1] == '"')
+		return 0;
+	for (i = 0; i < body->len; i++)
+		if (body->s[i] == ';' || body->s[i] == ',' || body->s[i] == ' '
+		        || body->s[i] == '\t')
+			return 1;
+	return 0;
+}
+
 #endif /* UCONTACT_H */

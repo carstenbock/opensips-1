@@ -466,10 +466,31 @@ int update_presentity(struct sip_msg* msg, presentity_t* presentity,
 		}
 		*sent_reply= 1;
 
+		/* An internal publisher (pua_reginfo) reuses a stable etag, so the
+		 * entry can already be here; take its turn instead of adding another */
+		if (!msg) {
+			lock_get(&pres_htable[hash_code].lock);
+			p = search_phtable_etag(&pres_uri, presentity->event->evp->parsed,
+					&presentity->new_etag, hash_code);
+			if (p) {
+				turn = p->last_turn++;
+				while (p && turn!=p->current_turn) {
+					lock_release(&pres_htable[hash_code].lock);
+					sleep_us(100);
+					lock_get(&pres_htable[hash_code].lock);
+					p = search_phtable_etag(&pres_uri,
+						presentity->event->evp->parsed, &presentity->new_etag,
+						hash_code);
+				}
+			}
+			lock_release(&pres_htable[hash_code].lock);
+		}
+
 		/* insert new record in hash_table */
-		p = insert_phtable(&pres_uri, presentity->event->evp->parsed,
-				&presentity->new_etag, presentity->sphere,
-				presentity->flags, 1);
+		if (p==NULL)
+			p = insert_phtable(&pres_uri, presentity->event->evp->parsed,
+					&presentity->new_etag, presentity->sphere,
+					presentity->flags, 1);
 		if (p==NULL)
 		{
 			LM_ERR("inserting record in hash table\n");
@@ -536,7 +557,15 @@ int update_presentity(struct sip_msg* msg, presentity_t* presentity,
 		LM_DBG("inserting %d cols into table\n",n_query_cols);
 
 		//CON_SET_CURR_PS(pa_db, &my_ps_insert);
-		if (pa_dbf.insert(pa_db, query_cols, query_vals, n_query_cols) < 0)
+		/* Nodes sharing the DB derive the same etag for an internal
+		 * publish; the row one of them wrote is updated, not duplicated */
+		if (!msg && DB_CAPABILITY(pa_dbf, DB_CAP_INSERT_UPDATE)) {
+			if (pa_dbf.insert_update(pa_db, query_cols, query_vals,
+					n_query_cols) < 0) {
+				LM_ERR("inserting or updating record in database\n");
+				goto error;
+			}
+		} else if (pa_dbf.insert(pa_db, query_cols, query_vals, n_query_cols) < 0)
 		{
 			LM_ERR("inserting new record in database\n");
 			goto error;

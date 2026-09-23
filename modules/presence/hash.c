@@ -351,6 +351,14 @@ int update_shtable(shtable_t htable,unsigned int hash_code,
 		s->expires= subs->expires+ (unsigned int)(unsigned long)time(NULL);
 		s->remote_cseq= subs->remote_cseq;
 	}
+	else if(fallback2db)
+	{
+		/* subs was read from the DB, which every node notifying this
+		 * subscription keeps current; this copy may lag behind and would
+		 * make the NOTIFY reuse a CSeq and a reginfo version */
+		s->local_cseq= subs->local_cseq + 1;
+		s->version= subs->version + 1;
+	}
 	else
 	{
 		subs->local_cseq= s->local_cseq++;

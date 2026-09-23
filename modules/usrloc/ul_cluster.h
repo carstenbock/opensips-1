@@ -77,6 +77,7 @@ void replicate_ucontact_delete(urecord_t *r, ucontact_t *c,
         const struct ct_match *match);
 
 void receive_binary_packets(bin_packet_t *packet);
+int ul_in_replication(void);
 void receive_cluster_event(enum clusterer_event ev, int node_id);
 
 #endif /* _USRLOC_CLUSTER_H_ */

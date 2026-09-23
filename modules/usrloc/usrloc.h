@@ -444,6 +444,13 @@ typedef struct usrloc_api {
 	 */
 	int (*register_ulcb) (ul_cb_type types,
 	                      void (*cb) (void *binding, ul_cb_type type, ul_cb_extra *extra));
+
+	/**
+	 * 1 while a change received from another cluster node (replication or
+	 * sync) is applied. The callbacks it runs repeat an event that node has
+	 * already handled.
+	 */
+	int (*in_replication) (void);
 } usrloc_api_t;
 
 

@@ -979,6 +979,13 @@ int get_stored_info(struct sip_msg* msg, subs_t* subs, int* reply_code,
 	int i;
 	unsigned int hash_code;
 
+	/* With fallback2db several nodes can notify the same subscription and
+	 * each of them writes local_cseq and version to the DB; the copy in this
+	 * node's memory lags behind, and a refresh NOTIFY built from it reuses a
+	 * CSeq the watcher already saw (RFC 3261 12.2.1.1). */
+	if(fallback2db)
+		return get_database_info(msg, subs, reply_code, reply_str);
+
 	/* first try to_user== pres_user and to_domain== pres_domain */
 
 	if(subs->pres_uri.s == NULL)

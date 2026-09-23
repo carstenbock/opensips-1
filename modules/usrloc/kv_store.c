@@ -27,6 +27,37 @@
 #include "../../lib/cJSON.h"
 #include "../../lib/osips_malloc.h"
 #include "urecord.h"
+#include "ul_mod.h"
+#include "ul_cluster.h"
+
+extern str urec_store_key;
+
+/* The record K/V store replicates packed into a contact, and only when that
+ * contact is inserted or updated. A key set by the script after save() would
+ * reach the other nodes with the next refresh; send the contact now. */
+static void replicate_urecord_kv(urecord_t *r)
+{
+	struct ct_match match = {CT_MATCH_CONTACT_CALLID, NULL};
+	ucontact_t *c;
+
+	if (!have_data_replication() || !r->contacts || ul_in_replication() ||
+			map_size(r->kv_storage) == 0)
+		return;
+
+	if (persist_urecord_kv_store(r) != 0) {
+		LM_ERR("failed to pack the K/V store of '%.*s'\n",
+			r->aor.len, r->aor.s);
+		return;
+	}
+
+	for (c = r->contacts; c; c = c->next)
+		if (map_find(c->kv_storage, urec_store_key))
+			break;
+	if (!c)
+		c = r->contacts;
+
+	replicate_ucontact_update(r, c, &match);
+}
 
 int_str_t *kv_get(map_t _store, const str* _key)
 {
@@ -184,6 +215,10 @@ map_t store_deserialize(const str *input)
 		return NULL;
 	}
 
+	/* a record or contact without keys replicates as an empty string */
+	if (ZSTRP(input))
+		return map;
+
 	cJSON_InitHooks(&shm_hooks);
 
 	json_map = cJSON_Parse(input->s);
@@ -261,6 +296,7 @@ int w_add_key(struct sip_msg* _m, void* _d, str* aor, str* key, str* value)
 		} else {
 			kv_del(r->kv_storage, key);
 		}
+		replicate_urecord_kv(r);
 	} else {
 		unlock_udomain(domain, aor);
 		LM_WARN("No record found - not inserting key into KV store - user not registered?\n");

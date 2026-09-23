@@ -35,6 +35,7 @@
 #include "../../sr_module.h"
 #include "ul_mod.h"
 #include "ul_evi.h"
+#include "ul_cluster.h"
 
 extern unsigned int nat_bflag;
 
@@ -92,6 +93,7 @@ int bind_usrloc(usrloc_api_t* api)
 
 	/* usrloc callbacks */
 	api->register_ulcb  = register_ulcb;
+	api->in_replication = ul_in_replication;
 
 	return 0;
 }

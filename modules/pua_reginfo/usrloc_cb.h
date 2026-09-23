@@ -29,5 +29,7 @@
 void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_);
 void pua_reginfo_update_self_op(int v);
 int w_reginfo_update(struct sip_msg *msg, str * aor);
+int w_reginfo_defer(struct sip_msg *msg);
+int reginfo_clear_defer(struct sip_msg *msg, void *param);
 
 #endif

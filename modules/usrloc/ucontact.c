@@ -787,9 +787,11 @@ int db_insert_ucontact(ucontact_t* _c,query_list_t **ins_list, int update)
 			while(param) {
 				if(param->name.len > 0) {
 					if(param->body.len > 0) {
+						int q = ul_param_needs_quotes(&param->body);
 						str_buffer_append_str_fmt(buffer, &param_fmt,
-								param->name.len, param->name.s, "=", param->body.len, param->body.s,
-								param->next ? ";" : "");
+								param->name.len, param->name.s, q ? "=\"" : "=",
+								param->body.len, param->body.s,
+								q ? (param->next ? "\";" : "\"") : (param->next ? ";" : ""));
 					} else {
 						str_buffer_append_str_fmt(buffer, &param_fmt,
 								param->name.len, param->name.s, "", 0, NULL,
@@ -1001,9 +1003,11 @@ int db_update_ucontact(ucontact_t* _c)
 			while(param) {
 				if(param->name.len > 0) {
 					if(param->body.len > 0) {
+						int q = ul_param_needs_quotes(&param->body);
 						str_buffer_append_str_fmt(buffer, &param_fmt,
-								param->name.len, param->name.s, "=", param->body.len, param->body.s,
-								param->next ? ";" : "");
+								param->name.len, param->name.s, q ? "=\"" : "=",
+								param->body.len, param->body.s,
+								q ? (param->next ? "\";" : "\"") : (param->next ? ";" : ""));
 					} else {
 						str_buffer_append_str_fmt(buffer, &param_fmt,
 								param->name.len, param->name.s, "", 0, NULL,

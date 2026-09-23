@@ -264,9 +264,11 @@ void bin_push_contact(bin_packet_t *packet, urecord_t *r, ucontact_t *c,
 		while(param) {
 			if(param->name.len > 0) {
 				if(param->body.len > 0) {
+					int q = ul_param_needs_quotes(&param->body);
 					str_buffer_append_str_fmt(buffer, &param_fmt,
-							param->name.len, param->name.s, "=", param->body.len, param->body.s,
-							param->next ? ";" : "");
+							param->name.len, param->name.s, q ? "=\"" : "=",
+							param->body.len, param->body.s,
+							q ? (param->next ? "\";" : "\"") : (param->next ? ";" : ""));
 				} else {
 					str_buffer_append_str_fmt(buffer, &param_fmt,
 							param->name.len, param->name.s, "", 0, NULL,
@@ -983,12 +985,20 @@ static int receive_sync_packet(bin_packet_t *packet)
 	return rc;
 }
 
+static int ul_replicating;
+
+int ul_in_replication(void)
+{
+	return ul_replicating;
+}
+
 void receive_binary_packets(bin_packet_t *pkt)
 {
 	int rc;
 
 	LM_DBG("received a binary packet [%d]!\n", pkt->type);
 
+	ul_replicating = 1;
 	switch (pkt->type) {
 	case REPL_URECORD_INSERT:
 		_ensure_bin_version2(pkt, UL_BIN_V2, UL_BIN_V6, "usrloc aor-ins packet");
@@ -1024,6 +1034,7 @@ void receive_binary_packets(bin_packet_t *pkt)
 		rc = -1;
 		LM_ERR("invalid usrloc binary packet type: %d\n", pkt->type);
 	}
+	ul_replicating = 0;
 
 	if (rc != 0)
 		LM_ERR("failed to process binary packet!\n");
