@@ -196,6 +196,32 @@ static inline int copy_echoed_attrs(char *dst, ucontact_t *c, int gruu_emitted)
 }
 
 /*! \brief
+ * The temporary GRUU that save() stored with the binding (store-gruu).
+ *
+ * RFC 5627 5.2: the 200 OK carries the most recently created temporary GRUU.
+ * That is the stored one, which the reg-event document also lists; minting
+ * another here would hand the UE a GRUU it cannot find in the NOTIFY.
+ * usrloc keeps the value with or without its SIP quotes.
+ */
+static inline int stored_temp_gruu(ucontact_t *c, str *v)
+{
+	param_t *p;
+
+	for (p = c->params; p; p = p->next) {
+		if (p->name.len != 9 || strncasecmp(p->name.s, "temp-gruu", 9) != 0)
+			continue;
+		*v = p->body;
+		if (v->len >= 2 && v->s[0] == '"' && v->s[v->len - 1] == '"') {
+			v->s++;
+			v->len -= 2;
+		}
+		if (v->len > 0)
+			return 1;
+	}
+	return 0;
+}
+
+/*! \brief
  * Calculate the length of buffer needed to
  * print contacts
  */
@@ -242,20 +268,28 @@ static inline unsigned int calc_buf_len(ucontact_t* c,int build_gruu,
 					+ gr.len
 					+ 1 /* quote */
 					;
-				if (reg_gruu_target(c->aor, sock, 1, &guser, &ghost) < 0
-						|| ghost.len <= 0)
-					ghost.len = sock ? sock->name.len + 1 + sock->port_no_str.len : 0;
 				/* temp gruu */
-				len += TEMP_GRUU_SIZE
-					+ 1 /* quote */
-					+ SIP_PROTO_SIZE
-					+ TEMP_GRUU_HEADER_SIZE
-					+ calc_temp_gruu_len(c->aor,&c->instance,&c->callid)
-					+ 1 /* @ */
-					+ ghost.len
-					+ GR_NO_VAL_SIZE
-					+ 1 /* quote */
-					;
+				if (stored_temp_gruu(c, &gr)) {
+					len += TEMP_GRUU_SIZE
+						+ 1 /* quote */
+						+ gr.len
+						+ 1 /* quote */
+						;
+				} else {
+					if (reg_gruu_target(c->aor, sock, 1, &guser, &ghost) < 0
+							|| ghost.len <= 0)
+						ghost.len = sock ? sock->name.len + 1 + sock->port_no_str.len : 0;
+					len += TEMP_GRUU_SIZE
+						+ 1 /* quote */
+						+ SIP_PROTO_SIZE
+						+ TEMP_GRUU_HEADER_SIZE
+						+ calc_temp_gruu_len(c->aor,&c->instance,&c->callid)
+						+ 1 /* @ */
+						+ ghost.len
+						+ GR_NO_VAL_SIZE
+						+ 1 /* quote */
+						;
+				}
 				/* sip.instance */
 				len += SIP_INSTANCE_SIZE
 					+ 1 /* quote */
@@ -379,36 +413,41 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 				p += gr.len;
 				*p++ = '\"';
 
-				if (reg_gruu_target(c->aor, sock, 1, &guser, &ghost) < 0
-						|| ghost.len <= 0) {
-					LM_ERR("failed to select temporary GRUU host\n");
-					contact.data_len = 0;
-					rerrno = R_INTERNAL;
-					return -1;
-				}
 				/* build temp GRUU */
 				memcpy(p,TEMP_GRUU,TEMP_GRUU_SIZE);
 				p += TEMP_GRUU_SIZE;
 				*p++ = '\"';
-				memcpy(p,SIP_PROTO,SIP_PROTO_SIZE);
-				p += SIP_PROTO_SIZE;
-				memcpy(p,TEMP_GRUU_HEADER,TEMP_GRUU_HEADER_SIZE);
-				p += TEMP_GRUU_HEADER_SIZE;
+				if (stored_temp_gruu(c, &gr)) {
+					memcpy(p, gr.s, gr.len);
+					p += gr.len;
+				} else {
+					if (reg_gruu_target(c->aor, sock, 1, &guser, &ghost) < 0
+							|| ghost.len <= 0) {
+						LM_ERR("failed to select temporary GRUU host\n");
+						contact.data_len = 0;
+						rerrno = R_INTERNAL;
+						return -1;
+					}
+					memcpy(p,SIP_PROTO,SIP_PROTO_SIZE);
+					p += SIP_PROTO_SIZE;
+					memcpy(p,TEMP_GRUU_HEADER,TEMP_GRUU_HEADER_SIZE);
+					p += TEMP_GRUU_HEADER_SIZE;
 
-				grlen = build_temp_gruu(c->aor,&c->instance,&c->callid,
-						(int)c->expires,p);
-				if (grlen < 0) {
-					LM_ERR("failed to build temporary GRUU\n");
-					contact.data_len = 0;
-					rerrno = R_INTERNAL;
-					return -1;
+					grlen = build_temp_gruu(c->aor,&c->instance,&c->callid,
+							(int)c->expires,p);
+					if (grlen < 0) {
+						LM_ERR("failed to build temporary GRUU\n");
+						contact.data_len = 0;
+						rerrno = R_INTERNAL;
+						return -1;
+					}
+					p += grlen;
+					*p++ = '@';
+					memcpy(p, ghost.s, ghost.len);
+					p += ghost.len;
+					memcpy(p,GR_NO_VAL,GR_NO_VAL_SIZE);
+					p += GR_NO_VAL_SIZE;
 				}
-				p += grlen;
-				*p++ = '@';
-				memcpy(p, ghost.s, ghost.len);
-				p += ghost.len;
-				memcpy(p,GR_NO_VAL,GR_NO_VAL_SIZE);
-				p += GR_NO_VAL_SIZE;
 				*p++ = '\"';
 
 				/* build +sip.instance, "<...>" as the UE sent it (RFC 5626 4.1) */

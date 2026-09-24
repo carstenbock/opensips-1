@@ -164,7 +164,7 @@ static const cmd_export_t cmds[] = {
 		{CMD_PARAM_STR|CMD_PARAM_OPT,0,0},
 		{CMD_PARAM_STR|CMD_PARAM_OPT,0,0},
 		{CMD_PARAM_STR|CMD_PARAM_OPT, bflag_fixup,0}, {0,0,0}},
-		REQUEST_ROUTE|ONREPLY_ROUTE},
+		REQUEST_ROUTE|ONREPLY_ROUTE|EVENT_ROUTE},
 	{"remove_ip_port", (cmd_function)_remove_ip_port, {
 		{CMD_PARAM_STR, 0, 0},
 		{CMD_PARAM_INT, 0, 0},
@@ -175,7 +175,7 @@ static const cmd_export_t cmds[] = {
 		{CMD_PARAM_STR|CMD_PARAM_STATIC, domain_fixup, 0},
 		{CMD_PARAM_STR|CMD_PARAM_OPT, lookup_flags_fixup, lookup_flags_fixup_free},
 		{CMD_PARAM_STR|CMD_PARAM_OPT,0,0}, {0,0,0}},
-		REQUEST_ROUTE|ONREPLY_ROUTE|FAILURE_ROUTE},
+		REQUEST_ROUTE|ONREPLY_ROUTE|FAILURE_ROUTE|LOCAL_ROUTE},
 	{"add_sock_hdr", (cmd_function)add_sock_hdr, {
 		{CMD_PARAM_STR,0,0}, {0,0,0}},
 		REQUEST_ROUTE|FAILURE_ROUTE|ONREPLY_ROUTE|BRANCH_ROUTE|LOCAL_ROUTE},

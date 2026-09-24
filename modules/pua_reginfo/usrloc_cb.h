@@ -31,5 +31,7 @@ void pua_reginfo_update_self_op(int v);
 int w_reginfo_update(struct sip_msg *msg, str * aor);
 int w_reginfo_defer(struct sip_msg *msg);
 int reginfo_clear_defer(struct sip_msg *msg, void *param);
+int reginfo_notifier_init(void);
+void reginfo_notifier_loop(int rank);
 
 #endif

@@ -821,7 +821,9 @@ save("location", , , "vip");
 			</itemizedlist>
 		</para>
 		<para>
-		This function can be used from REQUEST_ROUTE and ONREPLY_ROUTE.
+		This function can be used from REQUEST_ROUTE, ONREPLY_ROUTE and
+		EVENT_ROUTE, e.g. for a Diameter request received in
+		event_route[E_DM_REQUEST].
 		</para>
 		<example>
 		<title><function>remove</function> usage</title>
@@ -935,7 +937,15 @@ remove_ip_port("8.8.8.8",43213,"location","sip:bob@atlanta.com");
 		&lookup_retcodes;
 
 		<para>
-		This function can be used from REQUEST_ROUTE, FAILURE_ROUTE.
+		In LOCAL_ROUTE it rewrites the RURI of a locally generated request,
+		e.g. an in-dialog request whose remote target is a GRUU. It also sets
+		the destination URI, the path vector and the outgoing socket of the
+		binding; save and restore them in the script to keep the route set
+		of the dialog.
+		</para>
+		<para>
+		This function can be used from REQUEST_ROUTE, FAILURE_ROUTE,
+		ONREPLY_ROUTE, LOCAL_ROUTE.
 		</para>
 		<example>
 		<title><function>lookup</function> usage</title>

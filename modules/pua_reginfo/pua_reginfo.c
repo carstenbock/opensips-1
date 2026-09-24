@@ -87,6 +87,12 @@ static param_export_t params[] = {
 		{"ul_identities_key", STR_PARAM, &ul_identities_key.s},
 		{"publish_reginfo", INT_PARAM, &publish_reginfo}, {0, 0, 0}};
 
+static const proc_export_t procs[] = {
+	{"reginfo notifier", 0, 0, reginfo_notifier_loop, 1,
+		PROC_FLAG_INITCHILD|PROC_FLAG_HAS_IPC|PROC_FLAG_NEEDS_SCRIPT},
+	{0, 0, 0, 0, 0, 0}
+};
+
 /* module exports */
 static const dep_export_t deps = {
 	{ /* OpenSIPS module dependencies */
@@ -115,7 +121,7 @@ struct module_exports exports= {
     0,							/* exported MI functions */
     0,							/* exported pseudo-variables */
     0,			 				/* exported transformations */
-    0,							/* extra processes */
+    procs,						/* extra processes */
     0,							/* module pre-initialization function */
     mod_init,					/* module initialization function */
     0,							/* response handling function */
@@ -225,6 +231,9 @@ static int mod_init(void)
 
 	if (ul_identities_key.s)
 		ul_identities_key.len = strlen(ul_identities_key.s);
+
+	if (reginfo_notifier_init() < 0)
+		return -1;
 
 	if (register_script_cb(reginfo_clear_defer, PRE_SCRIPT_CB|REQ_TYPE_CB, 0) < 0) {
 		LM_ERR("failed to register the pre-script callback\n");

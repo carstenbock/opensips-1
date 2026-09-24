@@ -29,6 +29,10 @@
 #include "../../lib/csv.h"
 #include "../../trim.h"
 #include "../../script_cb.h"
+#include "../../ipc.h"
+#include "../../pt.h"
+#include "../../reactor_proc.h"
+#include "../../mem/shm_mem.h"
 
 /*
 Contact: <sip:carsten@10.157.87.36:44733;transport=udp>;expires=600000;+g.oma.sip-im;language="en,fr";+g.3gpp.smsip;+g.oma.sip-im.large-message;audio;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-application.ims.iari.gsma-vs";+g.3gpp.cs-voice.
@@ -38,7 +42,7 @@ Call-ID: 9ad9f89f-164d-bb86-1072-52e7e9eb5025.
 /*<?xml version="1.0"?>
 <reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="0" state="full">
 .<registration aor="sip:carsten@ng-voice.com" id="0xb33fa860" state="active">
-..<contact id="0xb33fa994" state="active" event="registered" expires="3600">
+..<contact id="0xb33fa994.0" state="active" event="registered" expires="3600">
 ...<uri>sip:carsten@10.157.87.36:43582;transport=udp</uri>
 ...<unknown-param name="+g.3gpp.cs-voice"></unknown-param>
 ...<unknown-param name="+g.3gpp.icsi-ref">urn0X0.0041FB74E7B54P-1022urn-70X0P+03gpp-application.ims.iari.gsma-vs</unknown-param>
@@ -90,6 +94,130 @@ void pua_reginfo_update_self_op(int v)
 	_pua_reginfo_self_op = v;
 }
 
+static pres_ev_t *get_reginfo_event(void)
+{
+	event_t ev;
+
+	if (reginfo_event == NULL) {
+		/* now search it back as we need the internal event structure */
+		memset(&ev, 0, sizeof(event_t));
+		ev.parsed = EVENT_REG;
+		ev.text.s = "reg";
+		ev.text.len = 3;
+		reginfo_event = pres.search_event( &ev );
+		if (reginfo_event==NULL)
+			LM_CRIT("BUG: failed to get back the registered REG-INFO event!\n");
+	}
+	return reginfo_event;
+}
+
+/* The presentity update sends the NOTIFYs, and their local_route may call
+ * lookup(), which locks the usrloc record. The usrloc callbacks and
+ * reginfo_update() run with that record already locked, so the update is
+ * handed to the notifier process, which runs the updates of this node one
+ * at a time, in order. process_no of the notifier, -1 until it runs. */
+static int *notifier_proc_no = NULL;
+
+struct reginfo_pres_job {
+	str user;
+	str domain;
+	str etag;
+	str body;
+	time_t expires;
+	time_t received_time;
+	short etag_new;
+	short old_etag;
+};
+
+static void reginfo_pres_job_run(int sender, void *param)
+{
+	struct reginfo_pres_job *job = (struct reginfo_pres_job *)param;
+	presentity_t presentity;
+
+	memset(&presentity, 0, sizeof(presentity_t));
+	presentity.user = job->user;
+	presentity.domain = job->domain;
+	presentity.event = get_reginfo_event();
+	presentity.new_etag = job->etag;
+	if (job->old_etag)
+		presentity.old_etag = job->etag;
+	presentity.etag_new = job->etag_new;
+	presentity.expires = job->expires;
+	presentity.received_time = job->received_time;
+	presentity.body = job->body;
+
+	if (presentity.event && pres.update_presentity(&presentity) < 0)
+		LM_ERR("when updating presentity %.*s@%.*s\n",
+			job->user.len, job->user.s, job->domain.len, job->domain.s);
+	shm_free(job);
+}
+
+static int reginfo_update_presentity(presentity_t *p)
+{
+	struct reginfo_pres_job *job;
+	char *s;
+
+	/* Before the notifier runs (startup) and in the notifier itself, no
+	 * usrloc record is locked by the caller. */
+	if (*notifier_proc_no < 0 || *notifier_proc_no == process_no)
+		return pres.update_presentity(p);
+
+	job = shm_malloc(sizeof *job + p->user.len + p->domain.len
+			+ p->new_etag.len + p->body.len);
+	if (!job) {
+		LM_ERR("no more shm memory\n");
+		return -1;
+	}
+	s = (char *)(job + 1);
+	job->user.s = s;
+	job->user.len = p->user.len;
+	memcpy(s, p->user.s, p->user.len);
+	s += p->user.len;
+	job->domain.s = s;
+	job->domain.len = p->domain.len;
+	memcpy(s, p->domain.s, p->domain.len);
+	s += p->domain.len;
+	job->etag.s = s;
+	job->etag.len = p->new_etag.len;
+	memcpy(s, p->new_etag.s, p->new_etag.len);
+	s += p->new_etag.len;
+	job->body.s = s;
+	job->body.len = p->body.len;
+	memcpy(s, p->body.s, p->body.len);
+	job->expires = p->expires;
+	job->received_time = p->received_time;
+	job->etag_new = p->etag_new;
+	job->old_etag = p->old_etag.len > 0;
+
+	if (ipc_send_rpc(*notifier_proc_no, reginfo_pres_job_run, job) < 0) {
+		LM_ERR("failed to hand the presentity update to the notifier\n");
+		shm_free(job);
+		return -1;
+	}
+	return 0;
+}
+
+int reginfo_notifier_init(void)
+{
+	notifier_proc_no = shm_malloc(sizeof *notifier_proc_no);
+	if (!notifier_proc_no) {
+		LM_ERR("no more shm memory\n");
+		return -1;
+	}
+	*notifier_proc_no = -1;
+	return 0;
+}
+
+void reginfo_notifier_loop(int rank)
+{
+	if (reactor_proc_init("reginfo notifier") < 0) {
+		LM_ERR("failed to init the reginfo notifier reactor\n");
+		return;
+	}
+	*notifier_proc_no = process_no;
+	reactor_proc_loop();
+}
+
 #define VERSION_HOLDER "00000000000"
 
 
@@ -118,11 +246,11 @@ static str r_refreshed = str_init("refreshed");
 static str r_expired = str_init("expired");
 static str r_unregistered = str_init("unregistered");
 static str contact_s =
-		str_init("\t\t<contact id=\"%p\" state=\"%.*s\" event=\"%.*s\" "
+		str_init("\t\t<contact id=\"%p.%d\" state=\"%.*s\" event=\"%.*s\" "
 						"expires=\"%d\" callid=\"%.*s\">\n");
 
 static str contact_s_q =
-		str_init("\t\t<contact id=\"%p\" state=\"%.*s\" "
+		str_init("\t\t<contact id=\"%p.%d\" state=\"%.*s\" "
 						"event=\"%.*s\" expires=\"%d\" q=\"%.3f\" callid=\"%.*s\">\n");
 static str contact_e = str_init("\t\t</contact>\n");		// 13, but 14
 
@@ -319,20 +447,22 @@ static void append_gruu(str_buffer *buffer, str *open, str *value, int cseq)
 }
 
 /* own_gruu: the stored pub-gruu / temp-gruu belong to this identity.
- * Otherwise the GRUUs come from id_gruus, and a tel: identity gets none. */
+ * Otherwise the GRUUs come from id_gruus, and a tel: identity gets none.
+ * Every <registration> lists the same contacts, so id_idx (the identity
+ * index) keeps the contact ids unique within the document (RFC 3680 5.2). */
 static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int expires, str state, str event,
-		const str *identity, int own_gruu)
+		const str *identity, int own_gruu, int id_idx)
 {
 	param_t *param;	
 	struct id_gruu *g;
 	if(ptr->q != -1) {
 		float q = (float)ptr->q / 1000;
 
-		str_buffer_append_str_fmt(buffer, &contact_s_q, ptr,
+		str_buffer_append_str_fmt(buffer, &contact_s_q, ptr, id_idx,
 				STR_FMT(&state), STR_FMT(&event), expires, q, STR_FMT(&ptr->callid));
 	} else {
 		// XXX: before was it contact_s_q but no q so changed to contact_s
-		str_buffer_append_str_fmt(buffer, &contact_s, ptr,
+		str_buffer_append_str_fmt(buffer, &contact_s, ptr, id_idx,
 				STR_FMT(&state), STR_FMT(&event), expires, STR_FMT(&ptr->callid));
 	}
 
@@ -376,6 +506,23 @@ static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int exp
 	}
 
 	if(!own_gruu && ptr->instance.len > 0) {
+		/* SPEC-DEVIATION: RFC 5628 §5, TS 24.229 5.4.2.1.2 -- the pub-gruu of
+		 * the registered identity is also listed under the other SIP
+		 * identities, ahead of their own. Samsung IMS 6.0 subscribes for the
+		 * default identity with that GRUU as Contact and does not answer a
+		 * NOTIFY whose <registration> for that identity lacks it. */
+		str key;
+
+		for(param = identity_ul_key(identity, &key) == 0 ? ptr->params : NULL;
+				param; param = param->next) {
+			str value;
+
+			if(!param_name_eq(&param->name, "pub-gruu", 8))
+				continue;
+			value = param_value(param);
+			if(value.len > 0)
+				append_gruu(buffer, &gr_pub_open, &value, 0);
+		}
 		for(g = id_gruus; g; g = g->next) {
 			if(!str_match(&g->identity, identity)
 					|| !str_match(&g->instance, &ptr->instance))
@@ -495,7 +642,7 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 			}
 
 			process_xml_for_contact(buffer, ptr, expires, state, event,
-					&aor[i], own_gruu);
+					&aor[i], own_gruu, i);
 			ptr = ptr->next;
 		}
 
@@ -520,7 +667,6 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 	ucontact_t *contact = (ucontact_t*)binding;
 	urecord_t *record = NULL;
-	event_t ev;
 	str body = {NULL, 0};
 	publ_info_t publ;
 	presentity_t presentity;
@@ -652,18 +798,8 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 	LM_DBG("XML-Body (%i entries):\n%.*s\n", count, body.len, body.s);
 
 	if (pres.update_presentity != NULL) {
-		if (reginfo_event == NULL) {
-			/* now search it back as we need the internal event structure */
-			memset(&ev, 0, sizeof(event_t));
-			ev.parsed = EVENT_REG;
-			ev.text.s = "reg";
-			ev.text.len = 3;
-			reginfo_event = pres.search_event( &ev );
-			if (reginfo_event==NULL) {
-				LM_CRIT("BUG: failed to get back the registered REG-INFO event!\n");
-				goto error;
-			}		
-		}
+		if (get_reginfo_event() == NULL)
+			goto error;
 
 		/* now we have all the necessary values */
 		/* fill in the fields of the structure */
@@ -718,7 +854,7 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 		presentity.body = body;
 
 		/* query the database and update or insert */
-		if(pres.update_presentity(&presentity) <0)
+		if(reginfo_update_presentity(&presentity) <0)
 		{
 			LM_ERR("when updating presentity\n");
 			goto error;
