@@ -163,7 +163,7 @@ int reg_ci_attach_gruu(ucontact_info_t *ci, str *aor)
 	static const char sip_proto[] = "sip:";
 	static const char gr_param[] = ";gr=";
 	static const char gr_no_val[] = ";gr";
-	str guser, ghost, pub = STR_NULL, tmp = STR_NULL;
+	str guser, ghost, gr, pub = STR_NULL, tmp = STR_NULL;
 	param_t *pub_p = NULL, *tmp_p = NULL, *tail;
 	char *p;
 	int glen;
@@ -178,9 +178,10 @@ int reg_ci_attach_gruu(ucontact_info_t *ci, str *aor)
 		LM_ERR("failed to select GRUU host\n");
 		return -1;
 	}
+	reg_pub_gruu_gr(&ci->instance, &gr);
 	pub.s = pkg_malloc(2 + sizeof(sip_proto) - 1 + guser.len
 			+ (ghost.len ? 1 + ghost.len : 0) + sizeof(gr_param) - 1
-			+ ci->instance.len - 2);
+			+ gr.len);
 	if(pub.s == NULL)
 		goto oom;
 	p = pub.s;
@@ -196,8 +197,8 @@ int reg_ci_attach_gruu(ucontact_info_t *ci, str *aor)
 	}
 	memcpy(p, gr_param, sizeof(gr_param) - 1);
 	p += sizeof(gr_param) - 1;
-	memcpy(p, ci->instance.s + 1, ci->instance.len - 2);
-	p += ci->instance.len - 2;
+	memcpy(p, gr.s, gr.len);
+	p += gr.len;
 	*p++ = '"';
 	pub.len = p - pub.s;
 

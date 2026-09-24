@@ -25,6 +25,7 @@
 #include "../../mod_fix.h"
 
 #include "common.h"
+#include "gruu.h"
 
 ucontact_t **selected_cts; /* always has an extra terminating NULL ptr */
 int selected_cts_sz = 20;
@@ -226,6 +227,16 @@ static int cmp_ucontact(const void *_ct1, const void *_ct2)
 	return ct1->sipping_latency - ct2->sipping_latency;
 }
 
+/* A public GRUU whose gr is the UUID derived from the contact's IMEI. */
+static int pub_gr_match(const ucontact_t *ct, const str *gr, const str *call_id)
+{
+	str own;
+
+	if (!ZSTR(*call_id) || ct->instance.len < 2)
+		return 0;
+	reg_pub_gruu_gr(&ct->instance, &own);
+	return str_match(&own, gr);
+}
 
 static ucontact_t **select_contacts(struct sip_msg *msg, ucontact_t *contacts,
                         int flags, const str *sip_instance, const str *call_id,
@@ -263,8 +274,9 @@ static ucontact_t **select_contacts(struct sip_msg *msg, ucontact_t *contacts,
 			have_gruu = 1;
 			LM_DBG("ruri has gruu\n");
 
-			if (ZSTR(ct->instance) || ct->instance.len-2 != sip_instance->len ||
-			        memcmp(ct->instance.s+1, sip_instance->s, sip_instance->len)) {
+			if (ZSTR(ct->instance) || ((ct->instance.len-2 != sip_instance->len ||
+			        memcmp(ct->instance.s+1, sip_instance->s, sip_instance->len))
+			        && !pub_gr_match(ct, sip_instance, call_id))) {
 
 				LM_DBG("no match to sip instance - [%.*s] - [%.*s]\n",
 				       ZSTR(ct->instance) ? 0 : ct->instance.len-2,

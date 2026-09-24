@@ -42,6 +42,7 @@ extern int gruu_legacy_xor;
 extern int gruu_legacy_host;
 extern str gruu_domain;
 extern str gruu_cachedb_url;
+extern str gruu_imei_namespace;
 
 struct socket_info;
 
@@ -70,5 +71,10 @@ int build_temp_gruu(str *aor, str *instance, str *callid, int expires,
  * point into a static buffer. Returns 0 on success. */
 int reg_temp_gruu_decode(const str *user, str *aor, str *instance,
 		str *call_id);
+
+/* The "gr" value of the public GRUU for a stored instance ("<...>"). An
+ * IMEI URN maps to a name-based UUID (TS 24.229 5.4.7A.2); any other
+ * instance is returned as is. gr may point into a static buffer. */
+void reg_pub_gruu_gr(const str *instance, str *gr);
 
 #endif /* __LIB_REG_GRUU_H__ */

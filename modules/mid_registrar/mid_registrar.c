@@ -103,6 +103,7 @@ int case_sensitive  = 1; /*!< If set to 0, username in aor will be case insensit
 str gruu_secret = {0,0};
 str gruu_domain = {0,0};
 str gruu_cachedb_url = {0,0};
+str gruu_imei_namespace = {0,0};
 int disable_gruu = 1;
 int gruu_legacy_xor = 0;
 int gruu_legacy_host = 0;

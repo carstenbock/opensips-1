@@ -505,6 +505,35 @@ modparam("registrar", "gruu_domain", "ims.mnc001.mcc001.3gppnetwork.org")
 		</programlisting>
 		</example>
 	</section>
+	<section id="param_gruu_imei_namespace" xreflabel="gruu_imei_namespace">
+		<title><varname>gruu_imei_namespace</varname> (string)</title>
+		<para>
+		Namespace UUID for the public GRUU of an IMEI instance ID. When the
+		<emphasis>+sip.instance</emphasis> is an IMEI URN (RFC 7254), the
+		<emphasis>gr</emphasis> parameter is the name-based SHA-1 UUID
+		(RFC 9562 version 5) of the TAC and SNR in this namespace, as
+		TS 24.229 clause 5.4.7A.2 requires, so the GRUU does not expose the
+		IMEI. Other instance IDs are copied unchanged.
+		</para>
+		<para>
+		Generate the value once from random numbers (a version 4 UUID) and
+		use the same value on every registrar of the domain. Changing it
+		changes every public GRUU of an IMEI instance. Lookup still accepts
+		public GRUUs that carry the IMEI itself.
+		</para>
+		<para>
+		Default value is empty: the <emphasis>gr</emphasis> parameter is the
+		IMEI URN, and startup logs a warning when GRUU is enabled.
+		</para>
+		<example>
+		<title>Set <varname>gruu_imei_namespace</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("registrar", "gruu_imei_namespace", "3f1c9a52-7b0e-4d8a-9c61-2e5f7a0b4d13")
+...
+		</programlisting>
+		</example>
+	</section>
 	<section id="param_gruu_legacy_host" xreflabel="gruu_legacy_host">
 		<title><varname>gruu_legacy_host</varname> (integer)</title>
 		<para>

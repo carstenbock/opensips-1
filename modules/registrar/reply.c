@@ -224,13 +224,14 @@ static inline unsigned int calc_buf_len(ucontact_t* c,int build_gruu,
 					;
 			}
 			if (build_gruu && c->instance.s) {
-				str guser, ghost;
+				str guser, ghost, gr;
 
 				sock = (c->sock)?(c->sock):(_m->rcv.bind_address);
 				if (reg_gruu_target(c->aor, sock, 0, &guser, &ghost) < 0) {
 					guser.len = c->aor ? c->aor->len : 0;
 					ghost.len = 0;
 				}
+				reg_pub_gruu_gr(&c->instance, &gr);
 				/* pub gruu */
 				len += PUB_GRUU_SIZE
 					+ 1 /* quote */
@@ -238,7 +239,7 @@ static inline unsigned int calc_buf_len(ucontact_t* c,int build_gruu,
 					+ guser.len
 					+ (ghost.len ? 1 + ghost.len : 0)
 					+ GR_PARAM_SIZE
-					+ (c->instance.len - 2)
+					+ gr.len
 					+ 1 /* quote */
 					;
 				if (reg_gruu_target(c->aor, sock, 1, &guser, &ghost) < 0
@@ -258,7 +259,7 @@ static inline unsigned int calc_buf_len(ucontact_t* c,int build_gruu,
 				/* sip.instance */
 				len += SIP_INSTANCE_SIZE
 					+ 1 /* quote */
-					+ (c->instance.len - 2)
+					+ c->instance.len
 					+ 1 /* quote */
 					;
 			}
@@ -348,7 +349,7 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 			}
 
 			if (build_gruu && c->instance.s) {
-				str guser, ghost;
+				str guser, ghost, gr;
 
 				sock = (c->sock)?(c->sock):(_m->rcv.bind_address);
 				if (reg_gruu_target(c->aor, sock, 0, &guser, &ghost) < 0) {
@@ -373,8 +374,9 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 				}
 				memcpy(p,GR_PARAM,GR_PARAM_SIZE);
 				p += GR_PARAM_SIZE;
-				memcpy(p,c->instance.s+1,c->instance.len-2);
-				p += c->instance.len-2;
+				reg_pub_gruu_gr(&c->instance, &gr);
+				memcpy(p, gr.s, gr.len);
+				p += gr.len;
 				*p++ = '\"';
 
 				if (reg_gruu_target(c->aor, sock, 1, &guser, &ghost) < 0
@@ -409,12 +411,12 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 				p += GR_NO_VAL_SIZE;
 				*p++ = '\"';
 
-				/* build +sip.instance */
+				/* build +sip.instance, "<...>" as the UE sent it (RFC 5626 4.1) */
 				memcpy(p,SIP_INSTANCE,SIP_INSTANCE_SIZE);
 				p += SIP_INSTANCE_SIZE;
 				*p++ = '\"';
-				memcpy(p,c->instance.s+1,c->instance.len-2);
-				p += c->instance.len-2;
+				memcpy(p,c->instance.s,c->instance.len);
+				p += c->instance.len;
 				*p++ = '\"';
 			}
 

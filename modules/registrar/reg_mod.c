@@ -130,6 +130,7 @@ str sock_hdr_name = {0,0};
 str gruu_secret = {0,0};
 str gruu_domain = {0,0};
 str gruu_cachedb_url = {0,0};
+str gruu_imei_namespace = {0,0};
 int disable_gruu = 1;
 int gruu_legacy_xor = 0;
 int gruu_legacy_host = 0;
@@ -228,6 +229,7 @@ static const param_export_t params[] = {
 	{"gruu_legacy_xor",    INT_PARAM, &gruu_legacy_xor       },
 	{"gruu_legacy_host",   INT_PARAM, &gruu_legacy_host      },
 	{"gruu_cachedb_url",   STR_PARAM, &gruu_cachedb_url.s    },
+	{"gruu_imei_namespace",STR_PARAM, &gruu_imei_namespace.s },
 	{"disable_gruu",       INT_PARAM, &disable_gruu          },
 
 	/* common registrar modparams */

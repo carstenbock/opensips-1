@@ -109,7 +109,7 @@ static str r_reginfo_e = str_init("</reginfo>\n");
 static str r_active = str_init("active");
 static str r_terminated = str_init("terminated");
 static str registration_s = str_init(
-		"\t<registration aor=\"%.*s\" id=\"%p\" state=\"%.*s\">\n");
+		"\t<registration aor=\"%.*s\" id=\"%p.%d\" state=\"%.*s\">\n");
 static str registration_e = str_init("\t</registration>\n");
 
 //richard: we only use reg unreg refrsh and expire
@@ -137,6 +137,7 @@ static str unknown_param_empty_end = str_init("\"></unknown-param>\n");
 static str gr_pub_open = str_init("\t\t\t<gr:pub-gruu uri=\"");
 static str gr_temp_open = str_init("\t\t\t<gr:temp-gruu uri=\"");
 static str gr_close = str_init("\"/>\n");
+static str gr_first_cseq = str_init("\" first-cseq=\"%d\"/>\n");
 
 /* RFC 3840 media feature tags. Prefixed tags (+g.3gpp.*, +sip.instance, ...)
  * are recognised by the leading '+', so they are not listed here. */
@@ -263,6 +264,7 @@ struct id_gruu {
 	str instance;
 	str pub;
 	str temp;
+	int cseq;
 	struct id_gruu *next;
 };
 static struct id_gruu *id_gruus = NULL;
@@ -303,11 +305,17 @@ static int identity_ul_key(const str *identity, str *key)
 	return 0;
 }
 
-static void append_gruu(str_buffer *buffer, str *open, str *value)
+/* RFC 5628: first-cseq is required on <temp-gruu>. The temporary GRUU is
+ * reassigned by every REGISTER (TS 24.229 5.4.1.2.2F), so the contact's
+ * CSeq is the one that created it. */
+static void append_gruu(str_buffer *buffer, str *open, str *value, int cseq)
 {
 	str_buffer_append_str(buffer, open);
 	append_xml_escaped(buffer, value, 1);
-	str_buffer_append_str(buffer, &gr_close);
+	if(open == &gr_temp_open)
+		str_buffer_append_str_fmt(buffer, &gr_first_cseq, cseq);
+	else
+		str_buffer_append_str(buffer, &gr_close);
 }
 
 /* own_gruu: the stored pub-gruu / temp-gruu belong to this identity.
@@ -344,10 +352,12 @@ static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int exp
 			if(own_gruu && value.len > 0)
 				append_gruu(buffer,
 						param_name_eq(&param->name, "pub-gruu", 8)
-								? &gr_pub_open : &gr_temp_open, &value);
+								? &gr_pub_open : &gr_temp_open, &value, ptr->cseq);
 		} else if(is_feature_tag(&param->name)) {
 			/* RFC 3680: the element content is the parameter value. '<' and
-			 * '>' are escaped; SIP quotes are not added around it. */
+			 * '>' are escaped; SIP quotes are not added around it. The RFC
+			 * 5628 example quotes it, but a UE seen in the field (IMEI TAC
+			 * 35986626) stops answering the NOTIFY when it is quoted. */
 			value = param_value(param);
 			LM_DBG("Feature tag [%.*s] body [%.*s]\n",
 					param->name.len, param->name.s, value.len, value.s);
@@ -371,9 +381,9 @@ static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int exp
 					|| !str_match(&g->instance, &ptr->instance))
 				continue;
 			if(g->pub.len > 0)
-				append_gruu(buffer, &gr_pub_open, &g->pub);
+				append_gruu(buffer, &gr_pub_open, &g->pub, 0);
 			if(g->temp.len > 0)
-				append_gruu(buffer, &gr_temp_open, &g->temp);
+				append_gruu(buffer, &gr_temp_open, &g->temp, g->cseq);
 		}
 	}
 
@@ -435,10 +445,11 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 		own_gruu = identity_ul_key(&aor[i], &key) == 0
 				&& str_casematch(&key, &record->aor);
 
-		/* Registration Node */
+		/* Registration Node. The ids share one record, so the identity index
+		 * keeps them unique within the document (RFC 3680 5.2). */
 		LM_DBG("Registration Node for AOR %.*s [%.*s]\n", aor[i].len, aor[i].s, STR_FMT(&state));
 		str_buffer_append_str_fmt(buffer, &registration_s,
-				STR_FMT(&aor[i]), record, STR_FMT(&state));
+				STR_FMT(&aor[i]), record, i, STR_FMT(&state));
 
 		ptr = record->contacts;
 		LM_DBG("Records %p\n", ptr);
@@ -797,6 +808,7 @@ static int add_id_gruu(const str *identity, ucontact_t *c)
 	g->temp.len = temp.len > 0 ? temp.len : 0;
 	if(g->temp.len)
 		memcpy(p, temp.s, temp.len);
+	g->cseq = c->cseq;
 	g->next = id_gruus;
 	id_gruus = g;
 	return 0;

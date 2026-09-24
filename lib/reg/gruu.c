@@ -22,12 +22,14 @@
 
 #include <fcntl.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "../../cachedb/cachedb.h"
 #include "../../cachedb/cachedb_cap.h"
 #include "../../dprint.h"
 #include "../../mem/mem.h"
+#include "../../sha1.h"
 #include "../../sha256.h"
 #include "../../socket_info.h"
 #include "../../ut.h"
@@ -58,6 +60,10 @@ static const uint8_t gruu_aad[] = "tgruu.v1";
 
 static uint8_t gruu_key[AEAD_KEY_LEN];
 static int gruu_ready;
+
+static uint8_t gruu_imei_ns[16];
+static int gruu_imei_ns_set;
+static int parse_uuid(const str *s, uint8_t out[16]);
 
 /* Token mode (RFC 5627 Appendix A.2): a binding id names one cachedb
  * entry per AoR, instance and Call-ID, and each temporary GRUU is
@@ -203,7 +209,96 @@ int reg_gruu_init(void)
 				"the registrar socket as the GRUU host\n");
 		return -1;
 	}
+
+	gruu_imei_ns_set = 0;
+	if (gruu_imei_namespace.s && *gruu_imei_namespace.s) {
+		gruu_imei_namespace.len = strlen(gruu_imei_namespace.s);
+		if (parse_uuid(&gruu_imei_namespace, gruu_imei_ns) < 0) {
+			LM_ERR("gruu_imei_namespace is not a UUID "
+					"(xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)\n");
+			return -1;
+		}
+		gruu_imei_ns_set = 1;
+	} else if (!disable_gruu) {
+		/* SPEC-DEVIATION: TS 24.229 5.4.7A.2 -- without a namespace UUID the
+		 * public GRUU of an IMEI instance carries the IMEI itself. */
+		LM_WARN("gruu_imei_namespace is not set - public GRUUs of IMEI "
+				"instances expose the IMEI (TS 24.229 5.4.7A.2)\n");
+	}
 	return 0;
+}
+
+static int parse_uuid(const str *s, uint8_t out[16])
+{
+	int i, n = 0, hi, lo;
+
+	if (s->len != 36)
+		return -1;
+	for (i = 0; i < 36; ) {
+		if (i == 8 || i == 13 || i == 18 || i == 23) {
+			if (s->s[i++] != '-')
+				return -1;
+			continue;
+		}
+		hi = hex2int(s->s[i]);
+		lo = hex2int(s->s[i + 1]);
+		if (hi < 0 || lo < 0)
+			return -1;
+		out[n++] = (uint8_t)(hi << 4 | lo);
+		i += 2;
+	}
+	return 0;
+}
+
+#define IMEI_URN_PREFIX     "urn:gsma:imei:"
+#define IMEI_URN_PREFIX_LEN (sizeof(IMEI_URN_PREFIX) - 1)
+#define UUID_URN_PREFIX     "urn:uuid:"
+#define UUID_URN_PREFIX_LEN (sizeof(UUID_URN_PREFIX) - 1)
+
+/* SPEC-DEVIATION: TS 24.229 5.4.7A.2 -- the S-CSCF "shall store" the gr
+ * value with its instance. The UUID is recomputed from the stored instance
+ * instead, which yields the same mapping without a second store. MEID URNs
+ * are not mapped; the platform only serves 3GPP UEs. */
+void reg_pub_gruu_gr(const str *instance, str *gr)
+{
+	static const char hex[] = "0123456789abcdef";
+	static char buf[UUID_URN_PREFIX_LEN + 36];
+	uint8_t in[16 + 14], h[20];
+	const char *v;
+	char *p;
+	int i;
+
+	gr->s = instance->s + 1;
+	gr->len = instance->len - 2;
+
+	/* RFC 7254: urn:gsma:imei:<8-digit TAC>-<6-digit SNR>-<spare>[;...] */
+	if (!gruu_imei_ns_set || gr->len < (int)IMEI_URN_PREFIX_LEN + 15
+			|| strncasecmp(gr->s, IMEI_URN_PREFIX, IMEI_URN_PREFIX_LEN))
+		return;
+	v = gr->s + IMEI_URN_PREFIX_LEN;
+	for (i = 0; i < 15; i++) {
+		if (i == 8 ? v[i] != '-' : (v[i] < '0' || v[i] > '9'))
+			return;
+	}
+
+	/* RFC 9562 version 5: SHA-1 over namespace || name, name = TAC || SNR */
+	memcpy(in, gruu_imei_ns, 16);
+	memcpy(in + 16, v, 8);
+	memcpy(in + 24, v + 9, 6);
+	sha1(in, sizeof in, h);
+	h[6] = (h[6] & 0x0f) | 0x50;
+	h[8] = (h[8] & 0x3f) | 0x80;
+
+	memcpy(buf, UUID_URN_PREFIX, UUID_URN_PREFIX_LEN);
+	p = buf + UUID_URN_PREFIX_LEN;
+	for (i = 0; i < 16; i++) {
+		if (i == 4 || i == 6 || i == 8 || i == 10)
+			*p++ = '-';
+		*p++ = hex[h[i] >> 4];
+		*p++ = hex[h[i] & 0x0f];
+	}
+	gr->s = buf;
+	gr->len = p - buf;
 }
 
 int reg_gruu_child_init(void)
