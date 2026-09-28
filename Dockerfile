@@ -29,4 +29,5 @@ pip3 install --break-system-packages --no-cache-dir opensipscli==0.4.0 opensips=
 apt-get autoremove --purge -y && \
 apt-get clean && \
 rm -rf /var/lib/apt/lists/*
+COPY docker/sip-ping /usr/local/bin/sip-ping
 ENTRYPOINT ["/usr/sbin/opensips", "-F"]

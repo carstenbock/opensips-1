@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Kubernetes liveness probe for OpenSIPS: send one SIP OPTIONS over UDP and
+wait for a final response.
+
+A TCP connect to a listening socket succeeds even when every SIP worker is
+stuck; a SIP reply needs a free worker, so this detects a hung SIP stack.
+
+Usage: sip-ping <host> <port> <timeout-seconds>
+Exit status: 0 on any final response (>= 200), 1 on timeout, 2 on usage error.
+"""
+import secrets
+import socket
+import sys
+import time
+
+
+def build_options(host, port, lport, branch, tag, callid):
+    return (
+        f"OPTIONS sip:{host}:{port} SIP/2.0\r\n"
+        f"Via: SIP/2.0/UDP {host}:{lport};branch=z9hG4bK{branch};rport\r\n"
+        "Max-Forwards: 1\r\n"
+        f"To: <sip:{host}:{port}>\r\n"
+        f"From: <sip:sip-ping@{host}>;tag={tag}\r\n"
+        f"Call-ID: {callid}\r\n"
+        "CSeq: 1 OPTIONS\r\n"
+        "User-Agent: sip-ping\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n"
+    ).encode()
+
+
+def final_status(data, callid):
+    """Return the status code of a final response for our Call-ID, else None."""
+    try:
+        text = data.decode("utf-8", "replace")
+    except Exception:
+        return None
+    lines = text.split("\r\n")
+    parts = lines[0].split(" ", 2)
+    if len(parts) < 2 or parts[0] != "SIP/2.0" or not parts[1].isdigit():
+        return None
+    code = int(parts[1])
+    if code < 200:
+        return None
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        if name.strip().lower() in ("call-id", "i") and value.strip() == callid:
+            return code
+    return None
+
+
+def main():
+    if len(sys.argv) != 4:
+        print("Usage: sip-ping <host> <port> <timeout-seconds>", file=sys.stderr)
+        return 2
+    host, port = sys.argv[1], int(sys.argv[2])
+    timeout = float(sys.argv[3])
+
+    # Bind to the target address so the request's source IP is the pod's own
+    # address; the OpenSIPS scripts answer OPTIONS only from that source.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((host, 0))
+    lport = sock.getsockname()[1]
+    callid = f"{secrets.token_hex(8)}@sip-ping"
+    msg = build_options(host, port, lport, secrets.token_hex(8),
+                        secrets.token_hex(4), callid)
+
+    deadline = time.monotonic() + timeout
+    sock.sendto(msg, (host, port))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(f"sip-ping: no SIP response from {host}:{port} within "
+                  f"{timeout:g}s", file=sys.stderr)
+            return 1
+        sock.settimeout(remaining)
+        try:
+            data, _ = sock.recvfrom(65535)
+        except socket.timeout:
+            continue
+        code = final_status(data, callid)
+        if code is not None:
+            print(f"sip-ping: {host}:{port} answered {code}")
+            return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
