@@ -35,6 +35,7 @@
 /* event params */
 #define UL_EV_PARAM_DOMAIN    "domain"
 #define UL_EV_PARAM_AOR       "aor"
+#define UL_EV_PARAM_AOR_KV    "kv_store"
 #define UL_EV_PARAM_CT_URI    "uri"
 #define UL_EV_PARAM_CT_RCV    "received"
 #define UL_EV_PARAM_CT_PATH   "path"

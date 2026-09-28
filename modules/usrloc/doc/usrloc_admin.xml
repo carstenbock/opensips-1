@@ -1930,6 +1930,11 @@ ul_del_key("location", "$tU@$td", "service_route");
 			<listitem><para>
 				<emphasis>aor</emphasis> - The AOR of the inserted record.
 			</para></listitem>
+			<listitem><para>
+				<emphasis>kv_store</emphasis> - The key-value store of the
+				record (see <xref linkend="func_ul_add_key"/>) as a JSON
+				object, <quote>{}</quote> when empty.
+			</para></listitem>
 		</itemizedlist>
 	</section>
 	<section id="event_E_UL_AOR_DELETE" xreflabel="E_UL_AOR_DELETE">
@@ -1947,6 +1952,13 @@ ul_del_key("location", "$tU@$td", "service_route");
 			</para></listitem>
 			<listitem><para>
 				<emphasis>aor</emphasis> - The AOR of the deleted record.
+			</para></listitem>
+			<listitem><para>
+				<emphasis>kv_store</emphasis> - The key-value store of the
+				record (see <xref linkend="func_ul_add_key"/>) as a JSON
+				object, <quote>{}</quote> when empty. The record itself is
+				already gone when an event route runs, so
+				<function>ul_get_key</function> cannot read it any more.
 			</para></listitem>
 		</itemizedlist>
 	</section>

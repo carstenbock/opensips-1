@@ -22,6 +22,7 @@
 #include "../../ipc.h"
 
 #include "ul_evi.h"
+#include "kv_store.h"
 
 #define UL_ASYNC_CT_REFRESH 1
 
@@ -33,6 +34,7 @@ static evi_params_p ul_aor_event_params;
 static struct {
 	evi_param_p domain;
 	evi_param_p aor;
+	evi_param_p kv_store;
 } ul_aor_event;
 
 /* Contact events and parameters */
@@ -147,6 +149,13 @@ int ul_event_init(void)
 	                                _str(UL_EV_PARAM_AOR));
 	if (!ul_aor_event.domain) {
 		LM_ERR("cannot create AOR parameter\n");
+		return -1;
+	}
+
+	ul_aor_event.kv_store = evi_param_create(ul_aor_event_params,
+	                                _str(UL_EV_PARAM_AOR_KV));
+	if (!ul_aor_event.kv_store) {
+		LM_ERR("cannot create AOR kv_store parameter\n");
 		return -1;
 	}
 
@@ -373,6 +382,9 @@ int ul_event_init(void)
  */
 void ul_raise_aor_event(event_id_t _e, struct urecord* _r)
 {
+	static str empty_kv = str_init("{}");
+	str kv;
+
 	if (_e == EVI_ERROR) {
 		LM_ERR("event not yet registered %d\n", _e);
 		return;
@@ -388,8 +400,19 @@ void ul_raise_aor_event(event_id_t _e, struct urecord* _r)
 		return;
 	}
 
+	/* the record is freed right after E_UL_AOR_DELETE, and script routes
+	 * run later from a dispatched job, so ship the KV store with the event */
+	kv = store_serialize(_r->kv_storage);
+	if (evi_param_set_str(ul_aor_event.kv_store, kv.s ? &kv : &empty_kv) < 0) {
+		LM_ERR("cannot set AOR kv_store parameter\n");
+		store_free_buffer(&kv);
+		return;
+	}
+
 	if (evi_raise_event(_e, ul_aor_event_params) < 0)
 		LM_ERR("cannot raise event\n");
+
+	store_free_buffer(&kv);
 }
 
 
