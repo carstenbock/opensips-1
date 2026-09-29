@@ -689,6 +689,22 @@ modparam("registrar", "disable_gruu", 0)
 					<xref linkend="param_disable_gruu"/> is set.
 					</para>
 				</listitem>
+				<listitem>
+					<para><emphasis>'gruu-aor=[uri]'</emphasis> - the reply
+					returns the <emphasis>pub-gruu</emphasis> and
+					<emphasis>temp-gruu</emphasis> stored
+					(<emphasis>store-gruu</emphasis>) for the same
+					<emphasis>+sip.instance</emphasis> under the AOR of this
+					URI, instead of GRUUs of the AOR being saved. TS 24.229
+					5.4.7A.2 and 5.4.7A.3 require this when the identity in the
+					To header field is barred: the GRUUs are those of the
+					default public user identity. That identity has to be saved
+					with <emphasis>store-gruu</emphasis> first. A contact for
+					which that AOR has no GRUUs gets none in the reply. The URI
+					must not contain a comma. Ignored while
+					<xref linkend="param_disable_gruu"/> is set.
+					</para>
+				</listitem>
 			</itemizedlist>
 			<para>This parameter is a string composed of a set of flags.</para>
 		</listitem>

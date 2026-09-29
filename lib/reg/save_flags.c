@@ -38,13 +38,14 @@ static str save_flag_names[] = {
 	STR_NULL
 };
 
-#define SAVE_KV_FLAGS_NO 4
+#define SAVE_KV_FLAGS_NO 5
 
 static str save_kv_flag_names[] = {
 	str_init("max-contacts"),
 	str_init("min-expires"),
 	str_init("max-expires"),
 	str_init("matching-mode"),
+	str_init("gruu-aor"),
 	STR_NULL
 };
 
@@ -124,6 +125,9 @@ int reg_fixup_save_flags(void** param, struct save_flags *default_flags)
 				"discarding trailing <%c>\n", *p);
 		}
 	}
+	/* gruu-aor */
+	if (flag_vals[4].s)
+		save_flags->gruu_aor = flag_vals[4];
 
 	return 0;
 }

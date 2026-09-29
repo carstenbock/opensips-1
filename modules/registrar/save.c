@@ -699,6 +699,10 @@ int save_aux(struct sip_msg* _m, str* forced_binding, void* _d,
 	if (disable_gruu)
 		sctx.flags &= ~REG_SAVE_STORE_GRUU_FLAG;
 
+	/* Before the AoR below: both use the static extract_aor() buffer. */
+	if (!disable_gruu && flags && flags->gruu_aor.len > 0)
+		reg_lend_gruus((udomain_t*)_d, &flags->gruu_aor);
+
 	if (extract_aor(uri, &sctx.aor, 0, 0, reg_use_domain) < 0) {
 		LM_ERR("failed to extract Address Of Record\n");
 		goto error;
@@ -734,6 +738,7 @@ int save_aux(struct sip_msg* _m, str* forced_binding, void* _d,
 		goto return_minus_one;
 
 	reg_ci_detach_gruu();
+	reg_drop_lent_gruus();
 	if (forced_c) free_contacts(&forced_c);
 
 	return 1;
@@ -744,12 +749,14 @@ error:
 		send_reply(_m,sctx.flags);
 
 	reg_ci_detach_gruu();
+	reg_drop_lent_gruus();
 	if (forced_c) free_contacts(&forced_c);
 
 	return -2;
 
 return_minus_one:
 	reg_ci_detach_gruu();
+	reg_drop_lent_gruus();
 	if (forced_c) free_contacts(&forced_c);
 
 	return -1;

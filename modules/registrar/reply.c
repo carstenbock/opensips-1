@@ -222,6 +222,153 @@ static inline int stored_temp_gruu(ucontact_t *c, str *v)
 }
 
 /*! \brief
+ * GRUUs lent by the binding of another identity (save flag gruu-aor).
+ *
+ * TS 24.229 5.4.7A.2 / 5.4.7A.3: when the identity in the To header field of
+ * the REGISTER is barred, the 200 OK returns the GRUUs of the default public
+ * user identity. They are copied before save() locks its own record, so the
+ * reply never holds two usrloc record locks.
+ */
+struct lent_gruu {
+	str instance;
+	str pub;
+	str temp;
+	struct lent_gruu *next;
+};
+static struct lent_gruu *lent_gruus;
+/* Set for a save() with gruu-aor, even when nothing could be lent: a contact
+ * without a lent GRUU then gets none rather than one of the barred identity. */
+static int lend_gruus;
+
+static inline str unquote_param(str v)
+{
+	if (v.len >= 2 && v.s[0] == '"' && v.s[v.len - 1] == '"') {
+		v.s++;
+		v.len -= 2;
+	}
+	return v;
+}
+
+void reg_drop_lent_gruus(void)
+{
+	struct lent_gruu *lg, *next;
+
+	for (lg = lent_gruus; lg; lg = next) {
+		next = lg->next;
+		pkg_free(lg);
+	}
+	lent_gruus = NULL;
+	lend_gruus = 0;
+}
+
+int reg_lend_gruus(udomain_t *d, str *uri)
+{
+	static char aor_buf[MAX_AOR_LEN];
+	str aor, pub, temp;
+	urecord_t *r = NULL;
+	ucontact_t *c;
+	param_t *p;
+	struct lent_gruu *lg;
+	char *w;
+
+	reg_drop_lent_gruus();
+	lend_gruus = 1;
+
+	/* extract_aor() returns a static buffer that save() reuses for its own
+	 * AoR, so keep a copy. */
+	if (extract_aor(uri, &aor, 0, 0, reg_use_domain) < 0
+			|| aor.len > MAX_AOR_LEN) {
+		LM_ERR("bad gruu-aor <%.*s>\n", uri->len, uri->s);
+		return -1;
+	}
+	memcpy(aor_buf, aor.s, aor.len);
+	aor.s = aor_buf;
+
+	ul.lock_udomain(d, &aor);
+	if (ul.get_urecord(d, &aor, &r) == 0 && r) {
+		for (c = r->contacts; c; c = c->next) {
+			if (c->instance.len <= 0)
+				continue;
+			pub.len = temp.len = 0;
+			for (p = c->params; p; p = p->next) {
+				if (p->name.len == 8 && strncasecmp(p->name.s, "pub-gruu", 8) == 0)
+					pub = unquote_param(p->body);
+				else if (p->name.len == 9
+						&& strncasecmp(p->name.s, "temp-gruu", 9) == 0)
+					temp = unquote_param(p->body);
+			}
+			if (pub.len <= 0)
+				continue;
+			lg = pkg_malloc(sizeof *lg + c->instance.len + pub.len + temp.len);
+			if (!lg) {
+				LM_ERR("no more pkg memory\n");
+				break;
+			}
+			w = (char *)(lg + 1);
+			lg->instance.s = w;
+			lg->instance.len = c->instance.len;
+			memcpy(w, c->instance.s, c->instance.len);
+			w += c->instance.len;
+			lg->pub.s = w;
+			lg->pub.len = pub.len;
+			memcpy(w, pub.s, pub.len);
+			w += pub.len;
+			lg->temp.s = w;
+			lg->temp.len = temp.len;
+			memcpy(w, temp.s, temp.len);
+			lg->next = lent_gruus;
+			lent_gruus = lg;
+		}
+	}
+	ul.unlock_udomain(d, &aor);
+
+	if (!lent_gruus)
+		LM_WARN("no GRUUs stored for gruu-aor <%.*s>, the reply carries none\n",
+			uri->len, uri->s);
+	return 0;
+}
+
+/*! \brief
+ * The lent pub-gruu and temp-gruu parameters of c.
+ *
+ * Writes into dst when dst is non-NULL and returns the byte count either way,
+ * for the same reason as copy_echoed_attrs().
+ */
+static inline int lent_gruu_params(char *dst, ucontact_t *c)
+{
+	struct lent_gruu *lg;
+	int total;
+
+	for (lg = lent_gruus; lg; lg = lg->next)
+		if (str_match(&lg->instance, &c->instance))
+			break;
+	if (!lg)
+		return 0;
+
+	total = PUB_GRUU_SIZE + 2 + lg->pub.len;
+	if (lg->temp.len)
+		total += TEMP_GRUU_SIZE + 2 + lg->temp.len;
+	if (!dst)
+		return total;
+
+	memcpy(dst, PUB_GRUU, PUB_GRUU_SIZE);
+	dst += PUB_GRUU_SIZE;
+	*dst++ = '\"';
+	memcpy(dst, lg->pub.s, lg->pub.len);
+	dst += lg->pub.len;
+	*dst++ = '\"';
+	if (lg->temp.len) {
+		memcpy(dst, TEMP_GRUU, TEMP_GRUU_SIZE);
+		dst += TEMP_GRUU_SIZE;
+		*dst++ = '\"';
+		memcpy(dst, lg->temp.s, lg->temp.len);
+		dst += lg->temp.len;
+		*dst++ = '\"';
+	}
+	return total;
+}
+
+/*! \brief
  * Calculate the length of buffer needed to
  * print contacts
  */
@@ -249,7 +396,14 @@ static inline unsigned int calc_buf_len(ucontact_t* c,int build_gruu,
 					+ 1 /* dquote */
 					;
 			}
-			if (build_gruu && c->instance.s) {
+			if (build_gruu && c->instance.s && lend_gruus) {
+				len += lent_gruu_params(NULL, c);
+				len += SIP_INSTANCE_SIZE
+					+ 1 /* quote */
+					+ c->instance.len
+					+ 1 /* quote */
+					;
+			} else if (build_gruu && c->instance.s) {
 				str guser, ghost, gr;
 
 				sock = (c->sock)?(c->sock):(_m->rcv.bind_address);
@@ -382,7 +536,15 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 				*p++ = '\"';
 			}
 
-			if (build_gruu && c->instance.s) {
+			if (build_gruu && c->instance.s && lend_gruus) {
+				p += lent_gruu_params(p, c);
+				memcpy(p,SIP_INSTANCE,SIP_INSTANCE_SIZE);
+				p += SIP_INSTANCE_SIZE;
+				*p++ = '\"';
+				memcpy(p,c->instance.s,c->instance.len);
+				p += c->instance.len;
+				*p++ = '\"';
+			} else if (build_gruu && c->instance.s) {
 				str guser, ghost, gr;
 
 				sock = (c->sock)?(c->sock):(_m->rcv.bind_address);

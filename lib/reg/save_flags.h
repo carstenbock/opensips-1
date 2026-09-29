@@ -54,6 +54,9 @@ struct save_flags {
 	struct ct_match cmatch;
 	/* the 'match_params' field from cmatch will point to this field */
 	str_list match_params;
+	/* "gruu-aor": the identity whose GRUUs the reply returns. Points into
+	 * the input save flags, like match_params. */
+	str gruu_aor;
 };
 
 int reg_fixup_free_save_flags(void** param);

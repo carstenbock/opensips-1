@@ -32,6 +32,7 @@
 
 #include "../../parser/msg_parser.h"
 #include "../usrloc/ucontact.h"
+#include "../usrloc/udomain.h"
 
 /*! \brief
  * Send a reply
@@ -43,6 +44,14 @@ int send_reply(struct sip_msg* _m, unsigned int _flags);
  * Build Contact HF for reply
  */
 int build_contact(ucontact_t* c,struct sip_msg *_m);
+
+
+/*! \brief
+ * Make build_contact() return the stored GRUUs of the AoR of uri instead of
+ * building them from each contact's own AoR (save flag gruu-aor)
+ */
+int reg_lend_gruus(udomain_t *d, str *uri);
+void reg_drop_lent_gruus(void);
 
 
 /*! \brief

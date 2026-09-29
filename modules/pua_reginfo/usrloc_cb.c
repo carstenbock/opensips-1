@@ -449,9 +449,11 @@ static void append_gruu(str_buffer *buffer, str *open, str *value, int cseq)
 /* own_gruu: the stored pub-gruu / temp-gruu belong to this identity.
  * Otherwise the GRUUs come from id_gruus, and a tel: identity gets none.
  * Every <registration> lists the same contacts, so id_idx (the identity
- * index) keeps the contact ids unique within the document (RFC 3680 5.2). */
+ * index) keeps the contact ids unique within the document (RFC 3680 5.2).
+ * copy_pub: the registered identity is listed itself, so its pub-gruu may be
+ * repeated under the other identities. */
 static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int expires, str state, str event,
-		const str *identity, int own_gruu, int id_idx)
+		const str *identity, int own_gruu, int copy_pub, int id_idx)
 {
 	param_t *param;	
 	struct id_gruu *g;
@@ -510,10 +512,14 @@ static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int exp
 		 * the registered identity is also listed under the other SIP
 		 * identities, ahead of their own. Samsung IMS 6.0 subscribes for the
 		 * default identity with that GRUU as Contact and does not answer a
-		 * NOTIFY whose <registration> for that identity lacks it. */
+		 * NOTIFY whose <registration> for that identity lacks it.
+		 * Not for a barred registered identity: TS 24.229 5.4.2.1.2 lists
+		 * non-barred identities only, and its 200 OK carried the default
+		 * identity's GRUUs (5.4.7A.2), which that <registration> lists. */
 		str key;
 
-		for(param = identity_ul_key(identity, &key) == 0 ? ptr->params : NULL;
+		for(param = copy_pub && identity_ul_key(identity, &key) == 0
+					? ptr->params : NULL;
 				param; param = param->next) {
 			str value;
 
@@ -548,7 +554,17 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 	int expires = 0;
 	int i = 0;
 	int own_gruu;
+	int copy_pub = 0;
 	str key;
+
+	/* A barred registered identity is not among the listed ones. */
+	for (i = 0; i < aor_count; i++) {
+		if (identity_ul_key(&aor[i], &key) == 0
+				&& str_casematch(&key, &record->aor)) {
+			copy_pub = 1;
+			break;
+		}
+	}
 
 	buffer = new_str_buffer();
 	if(!buffer) {
@@ -642,7 +658,7 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 			}
 
 			process_xml_for_contact(buffer, ptr, expires, state, event,
-					&aor[i], own_gruu, i);
+					&aor[i], own_gruu, copy_pub, i);
 			ptr = ptr->next;
 		}
 
