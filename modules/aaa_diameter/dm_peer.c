@@ -505,7 +505,21 @@ static int dm_send_custom_req(struct dm_message *msg)
 	}
 	FD_CHECK(dm_add_pending_reply(&tid_str, msg->reply_cond));
 
-	FD_CHECK(fd_msg_send(&dmsg, NULL, NULL));
+	if (msg->reply_cond) {
+		struct timespec expire;
+
+		clock_gettime(CLOCK_REALTIME, &expire);
+		expire.tv_sec += dm_answer_timeout / 1000;
+		expire.tv_nsec += (dm_answer_timeout % 1000) * 1000000L;
+		if (expire.tv_nsec >= 1000000000L) {
+			expire.tv_sec++;
+			expire.tv_nsec -= 1000000000L;
+		}
+		FD_CHECK(fd_msg_send_timeout(&dmsg, NULL, msg->reply_cond,
+			dm_custom_req_expired, &expire));
+	} else {
+		FD_CHECK(fd_msg_send(&dmsg, NULL, NULL));
+	}
 	return 0;
 }
 

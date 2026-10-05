@@ -144,8 +144,19 @@ struct dm_cond {
 
 	int experimental_rc;   /* Experimental-Result-Code AVP (298) */
 	int vendor_id;         /* Vendor-Id from Experimental-Result (266) */
+
+	/* Ownership between the requester and the answer (under dm_cond_lk).
+	 * A requester that times out only marks the cond abandoned: the answer
+	 * may still arrive and write into it. Whoever finishes last frees it. */
+	int answered;
+	int abandoned;
 };
 int init_mutex_cond(pthread_mutex_t *mutex, pthread_cond_t *cond);
+/* Requester gives up on @cond; returns 1 if an answer is already on its way */
+int dm_cond_abandon(struct dm_cond *cond);
+/* freeDiameter expiry callback of a custom request sent with a reply cond */
+void dm_custom_req_expired(void *data, DiamId_t sentto, size_t sentto_len,
+		struct msg **req);
 
 extern struct list_head dm_unreplied_req;
 extern gen_lock_t dm_unreplied_req_lk;

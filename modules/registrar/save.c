@@ -803,8 +803,12 @@ int save(struct sip_msg* _m, void* _d, void* _f, str* _s, str* _owtag)
 
 	if (parse_reg_headers(_m) < 0) return -1;
 	if (check_contacts(_m, &st) > 0) return -1;
-	if (parse_reg_headers(msg) < 0) return -1;
-	if (check_contacts(msg, &st) > 0) return -1;
+	/* parsing the shm clone attaches pkg structures to it: clean them up on
+	 * every exit, or another process later follows these pointers */
+	if (parse_reg_headers(msg) < 0 || check_contacts(msg, &st) > 0) {
+		clean_msg_clone(t->uas.request, t->uas.request, t->uas.end_request);
+		return -1;
+	}
 
 	/* detach the path vec from the msg as it is allocated in shm, and all
 	 * the parse/set ops (done below by save_aux) assume it is in pkg */

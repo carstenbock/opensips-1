@@ -263,11 +263,61 @@ out:
 	return 0;
 }
 
+static gen_lock_t *dm_cond_lk;
+
+static void dm_free_cond(struct dm_cond *cond)
+{
+	if (cond->rpl.json) {
+		cJSON_InitHooks(&shm_mem_hooks);
+		cJSON_Delete(cond->rpl.json);
+		cJSON_InitHooks(NULL);
+		cond->rpl.json = NULL;
+	}
+	if (cond->type == DM_TYPE_COND) {
+		pthread_cond_destroy(&cond->sync.cond.cond);
+		pthread_mutex_destroy(&cond->sync.cond.mutex);
+	}
+	shm_free(cond);
+}
+
+int dm_cond_abandon(struct dm_cond *cond)
+{
+	int answered;
+
+	lock_get(dm_cond_lk);
+	cond->abandoned = 1;
+	answered = cond->answered;
+	lock_release(dm_cond_lk);
+	return answered;
+}
+
+/* Answer side: returns 1 if the requester gave up (the caller then owns and
+ * frees @cond), else 0 and the requester will be signalled */
+static int dm_cond_answer(struct dm_cond *cond)
+{
+	int abandoned;
+
+	lock_get(dm_cond_lk);
+	abandoned = cond->abandoned;
+	if (!abandoned)
+		cond->answered = 1;
+	lock_release(dm_cond_lk);
+	return abandoned;
+}
+
 static void dm_cond_event_resume(int sender, void *param)
 {
 	int ret;
 	static unsigned long r = 1;
 	struct dm_cond *cond = (struct dm_cond *)param;
+
+	if (cond->abandoned) {
+		/* the async request timed out while this answer was on its way;
+		 * its eventfd is already closed */
+		LM_INFO("late Diameter answer for a timed-out request, dropping\n");
+		dm_free_cond(cond);
+		return;
+	}
 
 	/* signal the reactor that the result is available */
 	do {
@@ -356,7 +406,12 @@ static int dm_auth_reply(struct msg **_msg, struct avp * avp, struct session * s
 	} else {
 		rpl_cond->rpl.is_error = 0;
 	}
-	dm_cond_signal(rpl_cond);
+	if (dm_cond_answer(rpl_cond)) {
+		LM_INFO("late Diameter answer for a timed-out request, dropping\n");
+		dm_free_cond(rpl_cond);
+	} else {
+		dm_cond_signal(rpl_cond);
+	}
 
 out:
 	FD_CHECK(fd_msg_free(msg));
@@ -694,11 +749,13 @@ static int dm_receive_msg(struct msg **_msg, struct avp * avp, struct session * 
 	rpl_cond = *prpl_cond;
 
 	if (!hash_find_key(pending_replies, tid)) {
+		hash_unlock(pending_replies, hentry);
 		LM_ERR("Transaction_Id %.*s already processed!\n", tid.len, tid.s);
 		goto out;
 	}
 
 	rpl_cond->rpl.json = avps;
+	avps = NULL; /* owned by the waiting request now */
 
 	hash_remove_key(pending_replies, tid);
 	hash_unlock(pending_replies, hentry);
@@ -747,14 +804,71 @@ static int dm_receive_msg(struct msg **_msg, struct avp * avp, struct session * 
 				(int)h->avp_value->os.len, h->avp_value->os.data);
 	}
 
-	dm_cond_signal(rpl_cond);
+	if (dm_cond_answer(rpl_cond)) {
+		/* the requester timed out: nobody will read this answer */
+		LM_INFO("late Diameter answer for a timed-out request, dropping\n");
+		dm_free_cond(rpl_cond); /* still under the shm cJSON hooks */
+	} else {
+		dm_cond_signal(rpl_cond);
+	}
 
 out:
+	if (avps)
+		cJSON_Delete(avps); /* not handed over: unmatched or duplicate answer */
 	cJSON_InitHooks(NULL);
 
 	FD_CHECK(fd_msg_free(msg));
 	*_msg = NULL;
 	return 0;
+}
+
+
+/* freeDiameter calls this when a custom request got no answer within
+ * answer_timeout; it has already dropped the request from its sent list, so
+ * no answer can follow. Fail the requester: a launch()ed request has no other
+ * timeout, and would otherwise keep its eventfd and cond forever. */
+void dm_custom_req_expired(void *data, DiamId_t sentto, size_t sentto_len,
+		struct msg **req)
+{
+	struct dm_cond *cond = (struct dm_cond *)data, **prpl_cond;
+	struct avp *a = NULL;
+	struct avp_hdr *h = NULL;
+	unsigned int hentry;
+	str tid;
+
+	if (fd_msg_search_avp(*req, dm_dict.Session_Id, &a) != 0 || !a)
+		fd_msg_search_avp(*req, dm_dict.Transaction_Id, &a);
+	if (!a || fd_msg_avp_hdr(a, &h) != 0) {
+		LM_ERR("expired request without Session-Id/Transaction-Id\n");
+		goto out;
+	}
+	tid.s = (char *)h->avp_value->os.data;
+	tid.len = (int)h->avp_value->os.len;
+
+	hentry = hash_entry(pending_replies, tid);
+	hash_lock(pending_replies, hentry);
+	prpl_cond = (struct dm_cond **)hash_find(pending_replies, hentry, tid);
+	if (!prpl_cond || *prpl_cond != cond) {
+		/* a newer request reused the Session-Id and owns the entry */
+		hash_unlock(pending_replies, hentry);
+		goto out;
+	}
+	hash_remove_key(pending_replies, tid);
+	hash_unlock(pending_replies, hentry);
+
+	LM_WARN("no Diameter answer from %.*s within %d ms (Session-Id %.*s)\n",
+		(int)sentto_len, sentto, dm_answer_timeout, tid.len, tid.s);
+
+	cond->rpl.rc = 0;
+	cond->rpl.is_error = 1;
+	if (dm_cond_answer(cond))
+		dm_free_cond(cond); /* the requester timed out first */
+	else
+		dm_cond_signal(cond);
+
+out:
+	fd_msg_free(*req);
+	*req = NULL;
 }
 
 
@@ -1525,6 +1639,11 @@ int dm_init_minimal(void)
 		return -1;
 	}
 
+	if (!(dm_cond_lk = lock_alloc()) || !lock_init(dm_cond_lk)) {
+		LM_ERR("oom\n");
+		return -1;
+	}
+
 	LM_INFO("initializing the Diameter object dictionary...\n");
 
 	fd_g_config = &g_conf;
@@ -2044,6 +2163,15 @@ int _dm_get_message_response(struct dm_cond *cond, char **rpl_avps)
 		*rpl_avps = cJSON_PrintUnformatted(obj);
 		LM_DBG("AVPs: %s\n", *rpl_avps);
 	}
+
+	/* _dm_get_message_reply() detached the reply from @cond, so
+	 * _dm_release_message_response() can no longer free it: without this,
+	 * every answer leaked its AVP tree in shm */
+	if (rpl.json) {
+		cJSON_InitHooks(&shm_mem_hooks);
+		cJSON_Delete(rpl.json);
+		cJSON_InitHooks(NULL);
+	}
 	return rc;
 }
 
@@ -2086,6 +2214,11 @@ int _dm_send_message(aaa_conn *_, aaa_message *msg, struct dm_cond **reply_cond)
 	if (rc != 0) {
 		LM_ERR("timeout (errno: %d '%s') while awaiting Diameter "
 		       "reply\n", rc, strerror(rc));
+		/* The answer may still arrive. Leave this cond to it (it frees
+		 * abandoned conds) and use a fresh one, or the late answer would
+		 * be taken as the answer to this process's next request. */
+		dm_cond_abandon(my_reply_cond);
+		my_reply_cond = dm_get_cond(DM_TYPE_COND, NULL, NULL);
 		return -2;
 	}
 

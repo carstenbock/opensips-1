@@ -569,10 +569,16 @@ static int dm_send_request_async_tout(int fd,
 	struct dm_async_msg *amsg = (struct dm_async_msg *)param;
 	pv_value_t val = {STR_NULL, 0, PV_VAL_NULL};
 
-	if (pv_set_value(msg, amsg->ret, 0, &val) != 0)
+	if (amsg->ret && pv_set_value(msg, amsg->ret, 0, &val) != 0)
 		LM_ERR("failed to set output rpl_avps pv to NULL\n");
 
-	dm_free_sync_msg(amsg);
+	/* The answer may still arrive and write into the cond, so do not free
+	 * it here: abandoning it hands it over to the answer path. Close the
+	 * eventfd now; a late resume will not write to it. */
+	if (amsg->cond)
+		dm_cond_abandon(amsg->cond);
+	async_status = ASYNC_DONE_CLOSE_FD;
+	pkg_free(amsg);
 	return -2;
 }
 

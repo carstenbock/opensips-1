@@ -134,6 +134,13 @@ int t_resume_async_request(int fd, void*param, int was_timeout)
 	if (t->uac[0])
 		bind_address = TM_BRANCH( t, 0).request.dst.send_sock;
 
+	/* the resume function may already reply (e.g. auth_aka sends its
+	 * challenge from there), so it must run under the route type the async
+	 * call was made from, not whatever this process last ran: after a reply
+	 * route, t_reply() refused with "unsupported route_type (4)" and the
+	 * reply was lost */
+	swap_route_type(route, ctx->route_type);
+
 	async_status = ASYNC_DONE; /* assume default status as done */
 	/* call the resume function in order to read and handle data */
 	return_code = ((async_resume_module*)
@@ -192,11 +199,9 @@ route:
 		LM_ERR("resume route [%s] not present in cfg anymore\n",
 			ctx->resume_route->name.s);
 	} else {
-		swap_route_type(route, ctx->route_type);
 		if (ctx->parent_ctx_set)
 			route_trace_set_ctx(&ctx->parent_ctx);
 		run_resume_route( ctx->resume_route, &faked_req, 1);
-		set_route_type(route);
 	}
 
 	/* no need for the context anymore */
@@ -215,6 +220,7 @@ route:
 
 restore:
 	/* restore original environment */
+	set_route_type(route);
 	set_t(backup_t);
 	set_cancelled_t(backup_cancelled_t);
 	set_e2eack_t(backup_e2eack_t);
@@ -277,11 +283,14 @@ int t_resume_async_reply(int fd, void*param, int was_timeout)
 	if (onreply_avp_mode)
 		LOCK_REPLIES(t);
 
-	/* call the resume function in order to read and handle data */
+	/* call the resume function in order to read and handle data, under
+	 * the route type of the async call (see t_resume_async_request()) */
+	swap_route_type(route, ctx->route_type);
 	return_code = ((async_resume_module*)
 		(was_timeout ? ctx->async.timeout_f : ctx->async.resume_f))
 		( (valid_async_fd(fd) ? fd: ASYNC_FD_NONE), ctx->reply,
 		ctx->async.resume_param );
+	set_route_type(route);
 
 	if (async_status==ASYNC_CONTINUE) {
 		/* do not run the resume route */
@@ -311,6 +320,7 @@ int t_resume_async_reply(int fd, void*param, int was_timeout)
 		/* insert the new fd inside the reactor */
 		if(reactor_add_reader(fd,F_SCRIPT_ASYNC,RCT_PRIO_ASYNC,(void*)ctx)<0) {
 			LM_ERR("failed to add async FD to reactor -> act in sync mode\n");
+			swap_route_type(route, ctx->route_type);
 			do {
 				async_status = ASYNC_DONE;
 				return_code = ((async_resume_module*)ctx->async.resume_f)(
@@ -318,6 +328,7 @@ int t_resume_async_reply(int fd, void*param, int was_timeout)
 				if (async_status == ASYNC_CHANGE_FD)
 					fd=return_code;
 			} while(async_status==ASYNC_CONTINUE||async_status==ASYNC_CHANGE_FD);
+			set_route_type(route);
 			goto route;
 		}
 
