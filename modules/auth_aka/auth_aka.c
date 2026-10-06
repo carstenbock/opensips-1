@@ -89,6 +89,7 @@ static mi_response_t *mi_aka_av_fail(const mi_params_t *params,
 int load_aka_av_api_bind(aka_av_api *api);
 
 static int mod_init(void);         /* Module initialization function */
+static int child_init(int rank);   /* Per-process initialization function */
 
 /*
  * Module parameter variables
@@ -253,10 +254,32 @@ struct module_exports exports = {
 	mod_init,   /* module initialization function */
 	0,          /* response function */
 	0,          /* destroy function */
-	0,          /* child initialization function */
+	child_init, /* child initialization function */
 	0           /* reload confirm function */
 };
 
+
+/*
+ * Per-process initialization: every process opens its own CacheDB connection.
+ * A connection opened in mod_init() is inherited by all workers, which then
+ * write to one socket at the same time: commands interleave and each process
+ * reads replies meant for another, so an AV lookup returned another user's
+ * AV, ":1" or "+OK" ("invalid state in cached AV") and the REGISTER carrying
+ * the response was challenged again.
+ */
+static int child_init(int rank)
+{
+	if (!aka_cachedb_url.s)
+		return 0;
+
+	aka_cdb = aka_cdbf.init(&aka_cachedb_url);
+	if (!aka_cdb) {
+		LM_ERR("cannot connect to cachedb_url %.*s\n",
+			aka_cachedb_url.len, aka_cachedb_url.s);
+		return -1;
+	}
+	return 0;
+}
 
 /*
  * Module initialization function
@@ -293,12 +316,7 @@ static int mod_init(void)
 				aka_cachedb_url.len, aka_cachedb_url.s);
 			return -1;
 		}
-		aka_cdb = aka_cdbf.init(&aka_cachedb_url);
-		if (!aka_cdb) {
-			LM_ERR("cannot connect to cachedb_url %.*s\n",
-				aka_cachedb_url.len, aka_cachedb_url.s);
-			return -1;
-		}
+		/* the connection itself is opened per process, in child_init() */
 		LM_INFO("CacheDB AV sync enabled with %.*s\n",
 			aka_cachedb_url.len, aka_cachedb_url.s);
 	}
