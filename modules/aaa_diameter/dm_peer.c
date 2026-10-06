@@ -453,10 +453,8 @@ static int dm_pack_avps(void *root, struct list_head *subavps)
 
 static int dm_send_custom_req(struct dm_message *msg)
 {
-	str tid_str;
 	struct msg *dmsg;
 	struct avp *avp;
-	struct avp_hdr *h;
 	union avp_value val;
 	struct dict_object *req; /* a custom Diameter request */
 	int rc;
@@ -498,13 +496,9 @@ static int dm_send_custom_req(struct dm_message *msg)
 		FD_CHECK(fd_msg_avp_setvalue(avp, &val));
 		FD_CHECK(fd_msg_avp_add(dmsg, MSG_BRW_LAST_CHILD, avp));
 
-		tid_str = (str){(char *)val.os.data, val.os.len};
-	} else {
-		FD_CHECK(fd_msg_avp_hdr(avp, &h));
-		tid_str = (str){(char *)h->avp_value->os.data, h->avp_value->os.len};
 	}
-	FD_CHECK(dm_add_pending_reply(&tid_str, msg->reply_cond));
-
+	/* The answer finds its cond through this request (see dm_receive_msg()),
+	 * not through a table keyed by Session-Id */
 	if (msg->reply_cond) {
 		struct timespec expire;
 

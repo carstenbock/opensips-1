@@ -186,7 +186,8 @@ int dm_avp_add(aaa_conn *_, aaa_message *msg, aaa_map *avp, void *val,
 int dm_build_avps(struct list_head *subavps, cJSON *array);
 int dm_send_message(aaa_conn *_, aaa_message *req, aaa_message **__);
 int _dm_send_message(aaa_conn *_, aaa_message *req, struct dm_cond **reply_cond);
-int _dm_send_message_async(aaa_conn *_, aaa_message *req, int *fd);
+int _dm_send_message_async(aaa_conn *_, aaa_message *req, int *fd,
+		struct dm_cond **reply_cond);
 int _dm_get_message_response(struct dm_cond *cond, char **rpl_avps);
 void _dm_release_message_response(struct dm_cond *cond, char *rpl_avps);
 int dm_destroy_message(aaa_conn *con, aaa_message *msg);

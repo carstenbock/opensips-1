@@ -180,7 +180,7 @@ static inline void dm_update_unreplied_req(struct msg *req)
 			LM_DBG("Diameter request timeout (unhandled), cleaning up\n");
 			list_del(&rit->list);
 			fd_msg_free(rit->req);
-			pkg_free(rit);
+			free(rit);
 		} else {
 			break;
 		}
@@ -188,7 +188,9 @@ static inline void dm_update_unreplied_req(struct msg *req)
 
 	lock_release(&dm_unreplied_req_lk);
 
-	ml = pkg_malloc(sizeof *ml);
+	/* libc, not pkg: this runs on freeDiameter's threads, and the pkg
+	 * allocator of the process is not thread-safe */
+	ml = malloc(sizeof *ml);
 	if (!ml) {
 		LM_ERR("oom\n");
 		return;
@@ -218,7 +220,7 @@ int dm_remove_unreplied_req(struct msg *req)
 			list_del(&rit->list);
 			lock_release(&dm_unreplied_req_lk);
 			LM_DBG("matched unreplied req, removing from list\n");
-			pkg_free(rit);
+			free(rit);
 			return 0;
 		}
 	}
@@ -327,6 +329,16 @@ static void dm_cond_event_resume(int sender, void *param)
 		LM_ERR("could not notify resume: %s\n", strerror(errno));
 }
 
+/* runs in an OpenSIPS worker, see dm_cond_signal() */
+static void dm_cond_cb_run(int sender, void *param)
+{
+	struct dm_cond *cond = (struct dm_cond *)param;
+
+	if (cond->sync.cb.f)
+		cond->sync.cb.f(NULL, &cond->rpl, cond->sync.cb.p);
+	shm_free(cond);
+}
+
 static void dm_cond_signal(struct dm_cond *cond)
 {
 	LM_INFO("singalling %p/%d\n", cond, cond->type);
@@ -344,9 +356,16 @@ static void dm_cond_signal(struct dm_cond *cond)
 		pthread_mutex_unlock(&cond->sync.cond.mutex);
 		break;
 	case DM_TYPE_CB:
-		if (cond->sync.cb.f)
-			cond->sync.cb.f(NULL, &cond->rpl, cond->sync.cb.p);
-		shm_free(cond);
+		/* Hand the callback to a worker process. This function runs on a
+		 * freeDiameter thread, several of them at a time, and the callback
+		 * is another module's code written for a single-threaded process:
+		 * auth_aka's handler uses pkg memory and its CacheDB connection,
+		 * and two MAAs handled together corrupted the pkg allocator
+		 * ("freeing already freed pointer", S-CSCF abort). */
+		if (ipc_dispatch_rpc(dm_cond_cb_run, cond) < 0) {
+			LM_ERR("could not dispatch the reply callback, running it inline\n");
+			dm_cond_cb_run(0, cond);
+		}
 		break;
 	}
 }
@@ -687,9 +706,7 @@ static int dm_receive_msg(struct msg **_msg, struct avp * avp, struct session * 
 	struct avp *a = NULL;
 	struct avp_hdr * h = NULL;
 	int rc;
-	str tid;
-	struct dm_cond **prpl_cond, *rpl_cond;
-	unsigned int hentry;
+	struct dm_cond *rpl_cond;
 
 	FD_CHECK(fd_msg_hdr(msg, &hdr));
 
@@ -711,54 +728,28 @@ static int dm_receive_msg(struct msg **_msg, struct avp * avp, struct session * 
 		goto out;
 	}
 
-	rc = fd_msg_search_avp(msg, dm_dict.Session_Id, &a);
-	if (rc != 0) {
-		LM_DBG("Missing Session-Id AVP in Diameter Answer %d/%d (rc: %d), "
-		        "looking for Transaction-Id\n", hdr->msg_appl, hdr->msg_code, rc);
-		rc = fd_msg_search_avp(msg, dm_dict.Transaction_Id, &a);
-		if (rc != 0) {
-			LM_WARN("Missing Transaction-Id AVP in Diameter Answer %d/%d (rc: %d)\n",
-				   hdr->msg_appl, hdr->msg_code, rc);
+	/* Find the waiting request through the query freeDiameter matched this
+	 * answer to (hop-by-hop id); the cond was attached to it when it was
+	 * sent, see dm_send_custom_req(). Matching by Session-Id is wrong as soon
+	 * as two requests of one session are in flight: the P-CSCF reuses one
+	 * Rx Session-Id for the AAR of every (re-)registration and for the STR,
+	 * so the second request replaced the first one's table entry, an answer
+	 * resumed the wrong request and a cond was used after it was freed. */
+	{
+		struct msg *qry = NULL;
+		void *data = NULL;
+
+		if (fd_msg_answ_getq(msg, &qry) != 0 || !qry ||
+				fd_msg_anscb_get(qry, NULL, NULL, &data) != 0 || !data) {
+			LM_ERR("Diameter answer %u/%u without a waiting request\n",
+				hdr->msg_appl, hdr->msg_code);
 			goto out;
 		}
-
-		FD_CHECK_GT(fd_msg_avp_hdr(a, &h));
-		tid.s = (char *)h->avp_value->os.data;
-		tid.len = (int)h->avp_value->os.len;
-
-		LM_DBG("%d/%d reply, Transaction-Id: %.*s\n", hdr->msg_appl,
-			   hdr->msg_code, tid.len, tid.s);
-	} else {
-		FD_CHECK_GT(fd_msg_avp_hdr(a, &h));
-		tid.s = (char *)h->avp_value->os.data;
-		tid.len = (int)h->avp_value->os.len;
-
-		LM_DBG("%d/%d reply, Session-Id: %.*s\n", hdr->msg_appl,
-			   hdr->msg_code, tid.len, tid.s);
-	}
-
-	hentry = hash_entry(pending_replies, tid);
-	hash_lock(pending_replies, hentry);
-	prpl_cond = (struct dm_cond **)hash_find(pending_replies, hentry, tid);
-	if (!prpl_cond) {
-		hash_unlock(pending_replies, hentry);
-		LM_ERR("failed to match Transaction_Id %.*s to a pending request\n",
-		       tid.len, tid.s);
-		goto out;
-	}
-	rpl_cond = *prpl_cond;
-
-	if (!hash_find_key(pending_replies, tid)) {
-		hash_unlock(pending_replies, hentry);
-		LM_ERR("Transaction_Id %.*s already processed!\n", tid.len, tid.s);
-		goto out;
+		rpl_cond = (struct dm_cond *)data;
 	}
 
 	rpl_cond->rpl.json = avps;
 	avps = NULL; /* owned by the waiting request now */
-
-	hash_remove_key(pending_replies, tid);
-	hash_unlock(pending_replies, hentry);
 
 	rpl_cond->rpl.is_error = 0;
 
@@ -830,35 +821,13 @@ out:
 void dm_custom_req_expired(void *data, DiamId_t sentto, size_t sentto_len,
 		struct msg **req)
 {
-	struct dm_cond *cond = (struct dm_cond *)data, **prpl_cond;
-	struct avp *a = NULL;
-	struct avp_hdr *h = NULL;
-	unsigned int hentry;
-	str tid;
+	struct dm_cond *cond = (struct dm_cond *)data;
 
-	if (fd_msg_search_avp(*req, dm_dict.Session_Id, &a) != 0 || !a)
-		fd_msg_search_avp(*req, dm_dict.Transaction_Id, &a);
-	if (!a || fd_msg_avp_hdr(a, &h) != 0) {
-		LM_ERR("expired request without Session-Id/Transaction-Id\n");
-		goto out;
-	}
-	tid.s = (char *)h->avp_value->os.data;
-	tid.len = (int)h->avp_value->os.len;
+	LM_WARN("no Diameter answer from %.*s within %d ms\n",
+		(int)sentto_len, sentto, dm_answer_timeout);
 
-	hentry = hash_entry(pending_replies, tid);
-	hash_lock(pending_replies, hentry);
-	prpl_cond = (struct dm_cond **)hash_find(pending_replies, hentry, tid);
-	if (!prpl_cond || *prpl_cond != cond) {
-		/* a newer request reused the Session-Id and owns the entry */
-		hash_unlock(pending_replies, hentry);
-		goto out;
-	}
-	hash_remove_key(pending_replies, tid);
-	hash_unlock(pending_replies, hentry);
-
-	LM_WARN("no Diameter answer from %.*s within %d ms (Session-Id %.*s)\n",
-		(int)sentto_len, sentto, dm_answer_timeout, tid.len, tid.s);
-
+	/* freeDiameter hands a request either to its answer or to this
+	 * callback, never both, so the cond is completed exactly once */
 	cond->rpl.rc = 0;
 	cond->rpl.is_error = 1;
 	if (dm_cond_answer(cond))
@@ -866,7 +835,6 @@ void dm_custom_req_expired(void *data, DiamId_t sentto, size_t sentto_len,
 	else
 		dm_cond_signal(cond);
 
-out:
 	fd_msg_free(*req);
 	*req = NULL;
 }
@@ -2090,7 +2058,10 @@ static void dm_push_queue(aaa_message *msg, struct dm_cond *cond)
 	pthread_mutex_unlock(msg_send_lk);
 }
 
-int _dm_send_message_async(aaa_conn *_, aaa_message *req, int *fd)
+/* @reply_cond is returned here because @req must not be read once it is
+ * queued: the Diameter process may send and free it at once. */
+int _dm_send_message_async(aaa_conn *_, aaa_message *req, int *fd,
+		struct dm_cond **reply_cond)
 {
 	struct dm_cond *cond;
 
@@ -2104,7 +2075,10 @@ int _dm_send_message_async(aaa_conn *_, aaa_message *req, int *fd)
 	}
 
 	*fd = cond->sync.event.fd;
+	if (reply_cond)
+		*reply_cond = cond;
 	dm_push_queue(req, cond);
+	/* WARNING: @req *cannot* be read anymore here! (dangling pointer) */
 
 	LM_DBG("message queued for async sending\n");
 
@@ -2565,14 +2539,18 @@ static cJSON *dict_avp_dec_hex(struct avp_hdr * h, struct dict_avp_data *avp)
 		LM_ERR("invalid base type for IP: %d\n", avp->avp_basetype);
 		return NULL;
 	}
-	buf = pkg_malloc(h->avp_value->os.len * 2);
+	/* libc, not pkg: answers are decoded on freeDiameter's threads, several
+	 * at a time, and the pkg allocator of the process is not thread-safe.
+	 * Two MAAs decoded together corrupted it ("freeing already freed
+	 * pointer", S-CSCF abort). */
+	buf = malloc(h->avp_value->os.len * 2 + 1);
 	if (!buf) {
 		LM_ERR("oom for hex buffer\n");
 		return NULL;
 	}
 	len = string2hex((const char *)h->avp_value->os.data, h->avp_value->os.len, buf);
 	obj = cJSON_CreateStr(buf, len);
-	pkg_free(buf);
+	free(buf);
 	return obj;
 }
 

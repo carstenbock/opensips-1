@@ -501,14 +501,14 @@ struct dm_async_msg {
 	struct dm_cond *cond;
 };
 
-static struct dm_async_msg *dm_get_async_msg(pv_spec_t *rpl_avps_pv, aaa_message *dmsg)
+static struct dm_async_msg *dm_get_async_msg(pv_spec_t *rpl_avps_pv, struct dm_cond *cond)
 {
 	struct dm_async_msg *msg = pkg_malloc(sizeof *msg);
 	if (!msg)
 		return NULL;
 	memset(msg, 0, sizeof *msg);
 	msg->ret = rpl_avps_pv;
-	msg->cond = ((struct dm_message *)(dmsg->avpair))->reply_cond;
+	msg->cond = cond;
 	return msg;
 }
 
@@ -589,6 +589,7 @@ static int dm_send_request_async(struct sip_msg *msg, async_ctx *ctx,
 	struct dict_object *req;
 	cJSON *avps;
 	struct dm_async_msg *amsg;
+	struct dm_cond *cond = NULL;
 
 	if (fd_dict_search(fd_g_config->cnf_dict, DICT_COMMAND, CMD_BY_CODE_R,
 	      cmd_code, &req, ENOENT) == ENOENT) {
@@ -628,12 +629,16 @@ static int dm_send_request_async(struct sip_msg *msg, async_ctx *ctx,
 		_dm_destroy_message(dmsg);
 		goto error;
 	}
-	if (_dm_send_message_async(NULL, dmsg, &async_status) < 0) {
+	/* The cond is taken from the send call, not read back from @dmsg: once
+	 * queued, the Diameter process may have sent and freed the message
+	 * already, and the pointer read from it was then whatever reused that
+	 * memory (P-CSCF segfault in dm_send_request_async_reply). */
+	if (_dm_send_message_async(NULL, dmsg, &async_status, &cond) < 0) {
 		LM_ERR("cannot send async message!\n");
 		goto error;
 	}
 
-	amsg = dm_get_async_msg(rpl_avps_pv, dmsg);
+	amsg = dm_get_async_msg(rpl_avps_pv, cond);
 	if (!amsg)
 		goto error;
 	cJSON_Delete(avps);
