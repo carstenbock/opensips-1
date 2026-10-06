@@ -173,6 +173,12 @@ cdb_ctdict2info(const cdb_dict_t *ct_fields, str *contact)
 	cdb_pair_t *pair;
 	int port, proto;
 
+	/* The parameters are parsed into pkg memory and the contact keeps its
+	 * own shm copy. @ci is static, so the list of the previous call is
+	 * freed here: it never was, and every replicated or loaded contact
+	 * leaked it until the process ran out of pkg memory. */
+	if (ci.params)
+		free_params(ci.params);
 	memset(&ci, 0, sizeof(ucontact_info_t));
 
 	/* TODO: find a less convoluted way of implementing this */
@@ -287,6 +293,12 @@ static inline ucontact_info_t* dbrow2info(db_val_t *vals, str *contact)
 	char *p;
 	param_hooks_t hooks;
 
+	/* The parameters are parsed into pkg memory and the contact keeps its
+	 * own shm copy. @ci is static, so the list of the previous call is
+	 * freed here: it never was, and every replicated or loaded contact
+	 * leaked it until the process ran out of pkg memory. */
+	if (ci.params)
+		free_params(ci.params);
 	memset( &ci, 0, sizeof(ucontact_info_t));
 
 	ci.contact_id = VAL_BIGINT(vals);

@@ -569,6 +569,12 @@ static int receive_ucontact_insert(bin_packet_t *packet)
 	short pkg_ver = get_bin_pkg_version(packet);
 	param_hooks_t hooks;
 
+	/* The parameters are parsed into pkg memory and the contact keeps its
+	 * own shm copy. @ci is static, so the list of the previous call is
+	 * freed here: it never was, and every replicated or loaded contact
+	 * leaked it until the process ran out of pkg memory. */
+	if (ci.params)
+		free_params(ci.params);
 	memset(&ci, 0, sizeof ci);
 
 	bin_pop_str(packet, &d);

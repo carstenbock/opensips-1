@@ -912,8 +912,14 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 		}
 	}
 error:
-	for (i = 0; i < aor_count; i++)
+	for (i = 0; i < aor_count; i++) {
+		if (aorlist[i].s == uri.s)
+			uri.s = NULL; /* the AoR itself is the only entry */
 		pkg_free(aorlist[i].s);
+	}
+	/* otherwise the AoR URI is not in the list and leaked on every call */
+	if(uri.s)
+		pkg_free(uri.s);
 	if(body.s)
 		pkg_free(body.s);
 
