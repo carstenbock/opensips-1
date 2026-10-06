@@ -665,12 +665,14 @@ void dm_peer_loop(int _)
 	pthread_mutex_lock(msg_send_lk);
 
 	for (;;) {
-		LM_DBG("waiting to send new messages...\n");
-		pthread_cond_wait(msg_send_cond, msg_send_lk);
-
-		if (list_empty(msg_send_queue)) {
-			LM_BUG("pthread cond signal on empty queue");
-			continue;
+		/* Wait only while the queue is empty. A signal sent while this loop
+		 * is busy sending is not remembered, so waiting once per message
+		 * left every message of a burst but the first in the queue until
+		 * some later request signalled again: requests went out hundreds of
+		 * milliseconds late, or after their requester had timed out. */
+		while (list_empty(msg_send_queue)) {
+			LM_DBG("waiting to send new messages...\n");
+			pthread_cond_wait(msg_send_cond, msg_send_lk);
 		}
 
 		LM_DBG("have new message to send -- processing...\n");
