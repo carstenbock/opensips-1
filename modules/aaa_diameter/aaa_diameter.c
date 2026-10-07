@@ -363,10 +363,19 @@ static int dm_send_request(struct sip_msg *msg, int *app_id, int *cmd_code,
 	dm_last_experimental_rc = rpl->experimental_rc;
 
 	if (rpl_avps_pv) {
-		pv_value_t val = {(str){rpl_avps, strlen(rpl_avps)}, 0, PV_VAL_STR};
+		/* no body at all when the request expired without an answer (see
+		 * dm_custom_req_expired()): strlen(NULL) crashed the worker */
+		pv_value_t val = {STR_NULL, 0, PV_VAL_NULL};
+
+		if (rpl_avps) {
+			val.rs.s = rpl_avps;
+			val.rs.len = strlen(rpl_avps);
+			val.flags = PV_VAL_STR;
+		}
 		if (pv_set_value(msg, rpl_avps_pv, 0, &val) != 0)
-			LM_ERR("failed to set output rpl_avps pv to: %s\n", rpl_avps);
-		_dm_release_message_response(rpl, rpl_avps);
+			LM_ERR("failed to set output rpl_avps pv\n");
+		if (rpl_avps)
+			_dm_release_message_response(rpl, rpl_avps);
 	}
 
 	if (rc != 0) {
