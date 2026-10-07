@@ -740,10 +740,16 @@ reply:
 			aka_av_set_new(user, avs[c]);
 	} else {
 		ret = -3;
+		/* nothing to challenge with: a 401/407 without its challenge header
+		 * is malformed (RFC 3261 22.2) and leaves the UE nothing to
+		 * answer, so report the failure instead */
+		_code = 500;
 	}
 	if (auth_api.send_resp(_msg, _code, NULL, auth_hfs, nalgs) < 0)
 		ret = -5;
-	while (--nalgs > 0)
+	/* free all of them, index 0 included: with a pre-decrement the header of
+	 * the first (usually the only) algorithm leaked on every challenge */
+	while (nalgs-- > 0)
 		pkg_free(auth_hfs[nalgs].s);
 	return ret;
 }
@@ -777,7 +783,11 @@ static inline int aka_avs_get_new(struct aka_user *user, int *algmask,
 	for (c = 0; c < count - *err_count;) {
 		switch (aka_av_get_new(user, *algmask, &avs[c])) {
 			case -1: /* error */
-				c--;
+				/* an error is one AV less to expect, not one AV less
+				 * fetched: decrementing c here returned a negative count,
+				 * wrote the next AV in front of the array and made the
+				 * async challenge wait for its timeout and then send a
+				 * 401 without WWW-Authenticate instead of a 500 */
 				(*err_count)++;
 				break;
 			case  0: /* no AV found within the expected time */
@@ -1132,7 +1142,8 @@ static int aka_challenge_async(struct sip_msg *_msg, async_ctx *ctx,
 	/* try to sort them out synchronously */
 	if (count == 1) {
 		avs = &av;
-		if (aka_avs_get_new(user, &algmask, &av, 1, &err_count) == 1)
+		c = aka_avs_get_new(user, &algmask, &av, 1, &err_count);
+		if (c == 1)
 			goto synchronous;
 		if (err_count)
 			goto error;
@@ -1195,7 +1206,8 @@ static int aka_challenge_async(struct sip_msg *_msg, async_ctx *ctx,
 
 synchronous:
 	async_status = ASYNC_NO_IO;
-	ret = aka_send_resp(_msg, &realm, user, avs, count, qop,
+	/* only the AVs that were fetched: the rest of the array is not set */
+	ret = aka_send_resp(_msg, &realm, user, avs, c, qop,
 			_code, _challenge_msg);
 error:
 	if (param)

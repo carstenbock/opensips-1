@@ -941,12 +941,26 @@ void aka_pop_async(struct aka_user *user, struct list_head *subs)
 	cond_unlock(&user->cond);
 }
 
+/* users found idle by the expire iterator, freed once the walk is over */
+struct aka_user_idle {
+	struct aka_user *user;
+	struct aka_user_idle *next;
+};
+static struct aka_user_idle *aka_idle_users;
+
 static int aka_async_hash_iterator(void *param, str key, void *value)
 {
 	struct list_head *it, *safe, *uit, *usafe;
 	unsigned int ticks = *(unsigned int*)param;
 	struct aka_user *user;
 	struct aka_user_impi *impi = (struct aka_user_impi *)value;
+	struct aka_user_idle *idle;
+	int is_idle;
+
+	/* aka_user_get() leaves the entry without a value if it runs out of
+	 * memory creating the identity */
+	if (!impi)
+		return 0;
 
 	list_for_each_safe(uit, usafe, &impi->impus) {
 		user = list_entry(uit, struct aka_user, list);
@@ -958,13 +972,40 @@ static int aka_async_hash_iterator(void *param, str key, void *value)
 			aka_check_expire_av(ticks, list_entry(it, struct aka_av, list),
 				&user->impu, &user->impi->impi);
 		}
+		is_idle = (user->ref == 0 && list_empty(&user->avs) &&
+				list_empty(&user->async));
 		cond_unlock(&user->cond);
-		aka_user_try_free(user);
+		if (!is_idle)
+			continue;
+		/* Do not free the user here: freeing the last user of an identity
+		 * removes the identity from the map this function is called from,
+		 * in the middle of its traversal. With many users expiring that
+		 * walked freed nodes and crashed the timer process. */
+		idle = pkg_malloc(sizeof *idle);
+		if (!idle)
+			continue; /* stays until the next run */
+		idle->user = user;
+		idle->next = aka_idle_users;
+		aka_idle_users = idle;
 	}
 	return 0;
 }
 
 void aka_async_expire(unsigned int ticks, void* param)
 {
-	hash_for_each_locked(aka_users, aka_async_hash_iterator, &ticks);
+	struct aka_user_idle *idle;
+	int i;
+
+	for (i = 0; i < aka_users->size; i++) {
+		hash_lock(aka_users, i);
+		hash_for_each_entry(aka_users, i, aka_async_hash_iterator, &ticks);
+		/* still under the lock of this entry, so none of them was taken
+		 * into use again */
+		while ((idle = aka_idle_users) != NULL) {
+			aka_idle_users = idle->next;
+			aka_user_try_free(idle->user);
+			pkg_free(idle);
+		}
+		hash_unlock(aka_users, i);
+	}
 }
