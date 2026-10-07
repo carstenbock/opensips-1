@@ -983,6 +983,41 @@ int ipsec_sa_add(struct mnl_socket *sock, struct ipsec_ctx *ctx,
 
 /*
  * CTX - structure that describes an IPSec tunnel
+ *
+ * Ownership model - who holds a reference (ctx->ref) and who drops it:
+ *
+ *  creator       ipsec_ctx_new() returns the ctx with one reference.
+ *                ipsec_create() hands it to the processing context of the
+ *                401 (ipsec_ctx_push()), which drops it when it is
+ *                destroyed; ipsec_usrloc_restore() drops it itself once the
+ *                ctx is linked to its user.
+ *  registration  taken by ipsec_ctx_push_user() (ctx->reg_ref) when the ctx
+ *                is linked into user->sas.  It stands for "this set belongs
+ *                to a (pending) registration" and is dropped exactly once,
+ *                by ipsec_ctx_unregister(): when the usrloc contact is
+ *                deleted/expires, or when the lifetime of the set runs out.
+ *  lifetime list held while the ctx is linked into ipsec_tmp_contexts
+ *                (ctx->tmp), taken by ipsec_ctx_push_user(TMP) and
+ *                ipsec_ctx_add_tmp() and dropped by whoever unlinks it: the
+ *                timer, or ipsec_ctx_confirm() when the 200 OK turns a
+ *                temporary set into an established one.
+ *  transaction   taken by ipsec_handle_register_req() for the REGISTER that
+ *                arrived over the set, dropped by tm with the transaction.
+ *  processing    the lookups (ipsec_get_ctx_user(), ipsec_ctx_find(),
+ *                ipsec_get_ctx_ip_port()) return a referenced ctx; the caller
+ *                drops it or hands it over to the processing context.
+ *
+ * user->sas itself holds no reference: a ctx stays linked there until it is
+ * freed, so that the ports of a set which a transaction still uses remain
+ * visible to the next registration.  Each linked ctx holds one reference on
+ * its user (user->ref), dropped when it is unlinked.
+ *
+ * Kernel SAs are installed by ipsec_sa_add_all() and removed exactly once
+ * (ctx->sa_removed): when the lifetime of the set expires, when it has to
+ * make room for a new set using the same ports, or with the last reference.
+ *
+ * Lock order: user map -> user -> lifetime list -> ctx.  Nothing is freed
+ * and no netlink I/O is done with the lifetime list locked.
  */
 
 #define IPSEC_GET_CTX() ((struct ipsec_ctx *)context_get_ptr(CONTEXT_GLOBAL, \
@@ -992,17 +1027,20 @@ int ipsec_sa_add(struct mnl_socket *sock, struct ipsec_ctx *ctx,
 
 void ipsec_sa_rm_all(struct ipsec_socket *sock, struct ipsec_ctx *ctx)
 {
+	int removed;
+
 	/*
-	 * Kernel XFRM allows exactly one policy per (selector, dir).  When an
-	 * old ctx is torn down in the re-auth 401 handler before the new ctx
-	 * installs its SAs, the TMP-timer later reaps the old ctx and would
-	 * attempt to delete the *same* selectors - which now belong to the
-	 * new ctx.  Guard the second call so it cannot destroy the active
-	 * policies of the successor ctx.
+	 * Kernel XFRM allows exactly one policy per (selector, dir) and
+	 * policies are deleted by selector: removing the SAs of a ctx twice
+	 * would delete the policies of a later ctx that reuses the same
+	 * ports.  The flag makes the removal happen at most once.
 	 */
-	if (ctx->sa_removed)
-		return;
+	lock_get(&ctx->lock);
+	removed = ctx->sa_removed;
 	ctx->sa_removed = 1;
+	lock_release(&ctx->lock);
+	if (removed)
+		return;
 	ipsec_sa_rm(sock, ctx, IPSEC_POLICY_IN, 0);
 	ipsec_sa_rm(sock, ctx, IPSEC_POLICY_OUT, 0);
 	ipsec_sa_rm(sock, ctx, IPSEC_POLICY_IN, 1);
@@ -1027,6 +1065,9 @@ int ipsec_sa_add_all(struct ipsec_socket *sock, struct ipsec_ctx *ctx)
 		LM_ERR("could not add P(pc)->UE(us) SA\n");
 		goto release_sa3;
 	}
+	lock_get(&ctx->lock);
+	ctx->sa_removed = 0;
+	lock_release(&ctx->lock);
 	return 0;
 
 release_sa3:
@@ -1112,7 +1153,9 @@ struct ipsec_ctx *ipsec_ctx_new(sec_agree_body_t *sa, struct ip_addr *ip,
 		goto error;
 	}
 	INIT_LIST_HEAD(&ctx->list);
+	INIT_LIST_HEAD(&ctx->tmp);
 	ctx->ref = 1;
+	ctx->sa_removed = 1; /* until ipsec_sa_add_all() */
 	ctx->server = ss;
 	ctx->client = sc;
 	ctx->alg = alg;
@@ -1152,14 +1195,34 @@ struct ipsec_ctx *ipsec_ctx_get(void)
 	return IPSEC_GET_CTX();
 }
 
-struct ipsec_ctx *ipsec_ctx_find(struct ipsec_user *user, unsigned short port)
+/* takes a reference, unless the ctx is already being freed */
+int ipsec_ctx_tryref(struct ipsec_ctx *ctx)
+{
+	int ok;
+
+	lock_get(&ctx->lock);
+	ok = (ctx->ref > 0 && VALID_IPSEC_STATE(ctx->state));
+	if (ok)
+		IPSEC_CTX_REF_UNSAFE(ctx);
+	lock_release(&ctx->lock);
+	return ok;
+}
+
+/*
+ * Returns the (referenced) ctx of a usrloc contact.  The P-CSCF SPI is
+ * unique among the contexts, the UE port alone is not: a UE may reuse its
+ * ports for a later set.
+ */
+struct ipsec_ctx *ipsec_ctx_find(struct ipsec_user *user, unsigned short port,
+		unsigned int spi_pc)
 {
 	struct list_head *it;
 	struct ipsec_ctx *ctx = NULL;
 	lock_get(&user->lock);
 	list_for_each(it, &user->sas) {
 		ctx = list_entry(it, struct ipsec_ctx, list);
-		if (ctx->ue.port_c == port)
+		if (ctx->ue.port_c == port && ctx->me.spi_c == spi_pc &&
+				ipsec_ctx_tryref(ctx))
 			break;
 		ctx = NULL;
 	}
@@ -1194,7 +1257,9 @@ void ipsec_ctx_release(struct ipsec_ctx *ctx)
 		return;
 	}
 
-	if (!VALID_IPSEC_STATE(ctx->state)) {
+	/* a ctx that never got linked to a user (state NEW) is released like
+	 * any other - only one that is being freed already is left alone */
+	if (ctx->state == IPSEC_STATE_INVALID) {
 		LM_DBG("ctx %p is not in a valid state %d\n", ctx, ctx->state);
 		return;
 	}
@@ -1209,7 +1274,9 @@ void ipsec_ctx_release(struct ipsec_ctx *ctx)
 			ipsec_ctx_release_user(ctx);
 			ctx->user = NULL; /* avoid double release */
 		}
-		ipsec_ctx_remove_free_tmp(ctx, 0);
+		/* nobody can list it any more: ipsec_ctx_tryref() fails */
+		if (!list_empty(&ctx->tmp))
+			LM_BUG("freeing ctx %p which is still on the lifetime list\n", ctx);
 		ipsec_ctx_free(ctx);
 	} else {
 		LM_DBG("IPSec ctx %p not released, ref=%d\n", ctx, ctx->ref);
@@ -1217,24 +1284,8 @@ void ipsec_ctx_release(struct ipsec_ctx *ctx)
 		
 }
 
-struct ipsec_ctx_tmp {
-	struct ipsec_ctx *ctx;
-	time_t expire;
-	struct list_head list;
-};
-
 void ipsec_ctx_push_user(struct ipsec_user *user, struct ipsec_ctx *ctx, enum ipsec_state state)
 {
-	struct ipsec_ctx_tmp *tmp = shm_malloc(sizeof *tmp);
-	if (!tmp) {
-		LM_ERR("could not push ctx in ue - dropping it!\n");
-		return;
-	}
-	memset(tmp, 0, sizeof *tmp);
-	INIT_LIST_HEAD(&tmp->list);
-	tmp->expire = get_ticks() + ipsec_tmp_timeout;
-	tmp->ctx = ctx;
-
 	/* add to the user */
 	lock_get(&user->lock);
 	ctx->user = user;
@@ -1242,99 +1293,251 @@ void ipsec_ctx_push_user(struct ipsec_user *user, struct ipsec_ctx *ctx, enum ip
 	list_add_tail(&ctx->list, &user->sas);
 	lock_release(&user->lock);
 
-	/* ref the context, and mark its state as temporarily */
+	/* add to temporarily list, with the state the timer expects there */
+	lock_get(ipsec_tmp_contexts_lock);
 	lock_get(&ctx->lock);
-	IPSEC_CTX_REF_COUNT_UNSAFE(ctx, (state == IPSEC_STATE_TMP?2:1)); /* first in user, second in tmp list */
+	/* first is the registration reference, second the one of the lifetime list */
+	IPSEC_CTX_REF_COUNT_UNSAFE(ctx, (state == IPSEC_STATE_TMP?2:1));
+	ctx->reg_ref = 1;
 	ctx->state = state;
 	lock_release(&ctx->lock);
-
-	/* add to temporarily list */
 	if (state == IPSEC_STATE_TMP) {
-		lock_get(ipsec_tmp_contexts_lock);
-		list_add_tail(&tmp->list, ipsec_tmp_contexts);
-		lock_release(ipsec_tmp_contexts_lock);
+		ctx->expire = get_ticks() + ipsec_tmp_timeout;
+		list_add_tail(&ctx->tmp, ipsec_tmp_contexts);
 	}
-}
-
-void ipsec_ctx_add_tmp(struct ipsec_ctx *ctx)
-{
-	struct ipsec_ctx_tmp *tmp = shm_malloc(sizeof *tmp);
-	if (!tmp) {
-		LM_ERR("could not push ctx in ue - dropping it!\n");
-		return;
-	}
-	memset(tmp, 0, sizeof *tmp);
-	INIT_LIST_HEAD(&tmp->list);
-	tmp->expire = get_ticks() + ipsec_tmp_timeout;
-	tmp->ctx = ctx;
-	ctx->state = IPSEC_STATE_TMP;
-
-	lock_get(ipsec_tmp_contexts_lock);
-	list_add_tail(&tmp->list, ipsec_tmp_contexts);
 	lock_release(ipsec_tmp_contexts_lock);
 }
 
-void ipsec_ctx_release_tmp_user(struct ipsec_user *user)
+/*
+ * Limits the SIP level lifetime of a set: puts the ctx on the lifetime list
+ * (which takes its own reference) or, if it is already there, shortens its
+ * lifetime.  When the lifetime is over the timer removes the SAs and drops
+ * the registration reference.
+ */
+void ipsec_ctx_add_tmp(struct ipsec_ctx *ctx, int lifetime)
 {
-	struct list_head *it, *safe;
-	struct ipsec_ctx *ctx;
+	time_t expire = get_ticks() + lifetime;
 
-	lock_get(&user->lock);
-	list_for_each_safe(it, safe, &user->sas) {
-		ctx = list_entry(it, struct ipsec_ctx, list);
-		if (ctx->state == IPSEC_STATE_TMP)
-			ipsec_ctx_remove_tmp(ctx);
+	lock_get(ipsec_tmp_contexts_lock);
+	if (!list_empty(&ctx->tmp)) {
+		if (ctx->expire > expire)
+			ctx->expire = expire;
+	} else if (ipsec_ctx_tryref(ctx)) {
+		ctx->expire = expire;
+		list_add_tail(&ctx->tmp, ipsec_tmp_contexts);
 	}
-	lock_release(&user->lock);
+	lock_release(ipsec_tmp_contexts_lock);
 }
 
-void ipsec_ctx_release_user(struct ipsec_ctx *ctx)
+/* one (UE port, P-CSCF port) pair is one selector in each direction */
+static int ipsec_ctx_same_ports(struct ipsec_ctx *ctx,
+		unsigned short ue_port, unsigned short port)
 {
-	int release = 0;
-	struct ipsec_user *user = ctx->user;
-	struct list_head *it, *safe, *prev = NULL;
-	struct list_head new;
-	struct ipsec_ctx *tmp_ctx;
+	return (ctx->ue.port_c == ue_port && ctx->me.port_s == port) ||
+		(ctx->ue.port_s == ue_port && ctx->me.port_c == port);
+}
 
-	INIT_LIST_HEAD(&new);
+static int ipsec_ctx_collides(struct ipsec_ctx *ctx,
+		unsigned short ue_port_c, unsigned short ue_port_s,
+		unsigned short port_ps, unsigned short port_pc)
+{
+	return ipsec_ctx_same_ports(ctx, ue_port_c, port_ps) ||
+		ipsec_ctx_same_ports(ctx, ue_port_s, port_pc);
+}
+
+/*
+ * Tells whether a new set with the given ports could be installed next to
+ * the existing sets of the user (the kernel takes one XFRM policy per
+ * selector):
+ *   0 - yes
+ *   1 - only after removing an old (superseded) set, or the temporary set
+ *       that protected the REGISTER
+ *   2 - only after removing an established set that is in use
+ * Temporary sets do not count otherwise: a new challenge deletes them.
+ */
+int ipsec_ctx_collisions(struct ipsec_user *user, struct ipsec_ctx *prot,
+		unsigned short ue_port_c, unsigned short ue_port_s,
+		unsigned short port_ps, unsigned short port_pc)
+{
+	struct list_head *it;
+	struct ipsec_ctx *ctx;
+	int ret = 0, c;
 
 	lock_get(&user->lock);
-	LM_DBG("User %.*s has %d contexts, list %d\n",
-			user->impi.len, user->impi.s, list_size(&user->sas), list_size(&user->list));
-
-	list_for_each_safe(it, safe, &user->sas) {
-		tmp_ctx = list_entry(it, struct ipsec_ctx, list);
-		LM_DBG("User: Context %p (state %d)\n",
-				tmp_ctx, tmp_ctx->state);
-		if (tmp_ctx == ctx) {
-			LM_DBG("User: Found context %p (state %d)\n",
-					tmp_ctx, tmp_ctx->state);
-			prev = it;
-			break; /* found */
-		}
+	list_for_each(it, &user->sas) {
+		ctx = list_entry(it, struct ipsec_ctx, list);
+		if (!IPSEC_CTX_LIVE(ctx) ||
+				(ctx->state == IPSEC_STATE_TMP && ctx != prot))
+			continue;
+		if (!ipsec_ctx_collides(ctx, ue_port_c, ue_port_s, port_ps, port_pc))
+			continue;
+		c = (ctx->state == IPSEC_STATE_OK && !ctx->old)?2:1;
+		if (c > ret)
+			ret = c;
 	}
-	if (prev) {
-		LM_DBG("Found Context in user %.*s\n",
-				user->impi.len, user->impi.s);
-		list_cut_position(&new, &user->sas, prev);
-		if (list_size(&user->sas) > 0) {
-			LM_DBG("User %.*s has %d contexts left\n",
-					user->impi.len, user->impi.s, list_size(&user->sas));
-		} else {
-			LM_DBG("User %.*s has no contexts left, releasing\n",
-					user->impi.len, user->impi.s);
-			release = 1;
-		}
-	}
-
-	if (list_is_valid(&ctx->list)) {
-		list_del(&ctx->list);
-	}
-	ctx->user = NULL; /* avoid double release */
-
 	lock_release(&user->lock);
-	if (release)
-		ipsec_release_user(user);
+	return ret;
+}
+
+/*
+ * A 401 (Unauthorized) to a REGISTER of this user is about to set up a new
+ * temporary set of security associations with the given ports.  "prot" is
+ * the set that protected the REGISTER, NULL if it came unprotected.
+ */
+void ipsec_ctx_challenge_user(struct ipsec_user *user, struct ipsec_ctx *prot,
+		unsigned short ue_port_c, unsigned short ue_port_s,
+		unsigned short port_ps, unsigned short port_pc)
+{
+	struct list_head *it;
+	struct ipsec_ctx *ctx;
+	struct ipsec_socket *sock = ipsec_sock_new();
+
+	if (!sock)
+		return;
+	lock_get(&user->lock);
+	list_for_each(it, &user->sas) {
+		ctx = list_entry(it, struct ipsec_ctx, list);
+		if (!IPSEC_CTX_LIVE(ctx))
+			continue;
+		if (ctx->state == IPSEC_STATE_TMP && ctx != prot) {
+			/*
+			 * 3GPP TS 24.229 5.2.2.2: a 401 to a REGISTER deletes any
+			 * temporary set of security associations towards the UE.
+			 * The ctx is freed by the timer, which holds the reference
+			 * of its lifetime list entry.
+			 */
+			ipsec_sa_rm_all(sock, ctx);
+			ipsec_ctx_add_tmp(ctx, 0);
+			continue;
+		}
+		/*
+		 * 3GPP TS 24.229 5.2.2.2, TS 33.203 7.4.2a: the established sets
+		 * (and the set the 401 is sent on) are kept; what becomes of them
+		 * is decided when the 200 OK arrives (ipsec_ctx_confirm()) or the
+		 * temporary set expires.
+		 */
+		if (!ipsec_ctx_collides(ctx, ue_port_c, ue_port_s, port_ps, port_pc))
+			continue;
+		/*
+		 * SPEC-DEVIATION: TS 33.203 7.1 rule 3, TS 24.229 5.2.2.2 -- a
+		 * REGISTER whose protected ports are already bound to a set of
+		 * this user is not rejected, and that set is deleted at the 401
+		 * instead of being kept until the new set is established: the
+		 * kernel takes one XFRM policy per selector, and a UE that lost
+		 * its SAs (or a P-CSCF with a single protected client port, see
+		 * ipsec_create()) comes back with the very same ports
+		 */
+		LM_INFO("removing SAs of ctx %p (UE ports %hu/%hu, own ports %hu/%hu):"
+				" new set uses the same ports\n", ctx, ctx->ue.port_c,
+				ctx->ue.port_s, ctx->me.port_c, ctx->me.port_s);
+		ipsec_sa_rm_all(sock, ctx);
+		ipsec_ctx_add_tmp(ctx, 0);
+	}
+	lock_release(&user->lock);
+	ipsec_sock_close(sock);
+}
+
+/*
+ * The 200 OK to a REGISTER received over this set is being processed.
+ * Returns:
+ *   1 - the temporary set became an established one
+ *   0 - the set was established already (registration refresh)
+ *  -1 - the set is not usable any more (expired, deleted or superseded)
+ */
+int ipsec_ctx_confirm(struct ipsec_ctx *ctx)
+{
+	struct list_head *it;
+	struct ipsec_ctx *old;
+	struct ipsec_user *user;
+	struct ipsec_socket *sock;
+	int ret = -1;
+
+	/* the state changes together with the lifetime list, so that the timer
+	 * either expires the temporary set or does not see it at all */
+	lock_get(ipsec_tmp_contexts_lock);
+	lock_get(&ctx->lock);
+	user = ctx->user;
+	if (!user || !IPSEC_CTX_LIVE(ctx) || ctx->old) {
+		ret = -1;
+	} else if (ctx->state == IPSEC_STATE_OK) {
+		ret = 0;
+	} else if (!list_empty(&ctx->tmp)) {
+		list_del(&ctx->tmp);
+		INIT_LIST_HEAD(&ctx->tmp);
+		ctx->state = IPSEC_STATE_OK;
+		/* reference of the lifetime list; the caller holds its own */
+		if (IPSEC_CTX_UNREF_UNSAFE(ctx))
+			LM_BUG("ctx %p confirmed without a reference\n", ctx);
+		ret = 1;
+	}
+	lock_release(&ctx->lock);
+	lock_release(ipsec_tmp_contexts_lock);
+	if (ret != 1)
+		return ret;
+
+	sock = ipsec_sock_new();
+	lock_get(&user->lock);
+	list_for_each(it, &user->sas) {
+		old = list_entry(it, struct ipsec_ctx, list);
+		if (old == ctx || !IPSEC_CTX_LIVE(old) || old->state != IPSEC_STATE_OK)
+			continue;
+		if (ctx->initial) {
+			/*
+			 * 3GPP TS 33.203 7.4.2a, TS 24.229 table 5.2.2-1: the
+			 * REGISTER that started this authentication came
+			 * unprotected, so the UE does not have the old sets any
+			 * more - delete them
+			 */
+			if (sock)
+				ipsec_sa_rm_all(sock, old);
+			ipsec_ctx_add_tmp(old, 0);
+		} else if (!old->old) {
+			/*
+			 * 3GPP TS 24.229 5.2.2.2: the old set is kept, with its
+			 * SIP level lifetime reduced to 64*T1.
+			 * SPEC-DEVIATION: TS 24.229 5.2.2.2, TS 33.203 7.4.2a -- the
+			 * new set is taken into use (and the lifetime of the old
+			 * set reduced) with the 200 OK already, not with the first
+			 * message the UE sends over the new set or when the old
+			 * set is about to expire: only REGISTER requests are
+			 * matched to a set on reception
+			 */
+			ipsec_ctx_add_tmp(old, IPSEC_OLD_SA_LIFETIME);
+		}
+		old->old = 1;
+	}
+	lock_release(&user->lock);
+	if (sock)
+		ipsec_sock_close(sock);
+	return ret;
+}
+
+/* drops the registration reference, if it is still held */
+void ipsec_ctx_unregister(struct ipsec_ctx *ctx)
+{
+	int drop;
+
+	lock_get(&ctx->lock);
+	drop = ctx->reg_ref;
+	ctx->reg_ref = 0;
+	lock_release(&ctx->lock);
+	if (drop)
+		ipsec_ctx_release(ctx);
+}
+
+/* unlinks the ctx from its user and drops the user reference of the link */
+void ipsec_ctx_release_user(struct ipsec_ctx *ctx)
+{
+	struct ipsec_user *user = ctx->user;
+
+	lock_get(&user->lock);
+	LM_DBG("User %.*s has %d contexts, releasing %p\n",
+			user->impi.len, user->impi.s, list_size(&user->sas), ctx);
+	list_del(&ctx->list);
+	INIT_LIST_HEAD(&ctx->list);
+	ctx->user = NULL; /* avoid double release */
+	lock_release(&user->lock);
+	ipsec_release_user(user);
 }
 
 /*
@@ -1498,92 +1701,57 @@ out:
 	ipsec_sock_close(sock);
 }
 
+#define IPSEC_TIMER_BATCH 256
+
 void ipsec_ctx_timer(unsigned int ticks, void* param)
 {
-	struct list_head *it, *safe, *prev = NULL;
-	struct list_head new;
-	struct ipsec_ctx_tmp *tmp;
+	struct list_head *it, *safe;
+	struct ipsec_ctx *batch[IPSEC_TIMER_BATCH];
 	struct ipsec_ctx *ctx;
-	int free;
+	struct ipsec_socket *sock;
+	int n, i;
 
-	INIT_LIST_HEAD(&new);
-
-	lock_get(ipsec_tmp_contexts_lock);
-	list_for_each_safe(it, safe, ipsec_tmp_contexts) {
-
-		tmp = list_entry(it, struct ipsec_ctx_tmp, list);
-		LM_DBG("Context %p (state %d) expire at %u, current ticks %u\n",
-				tmp->ctx, tmp->ctx->state, (unsigned int)tmp->expire, ticks);
-		if (ticks < tmp->expire)
-			break; /* finished */
-		LM_DBG("IPSec ctx %p removing\n", tmp->ctx);
-		prev = it;
-	}
-	if (!prev) {
-		LM_DBG("No expired contexts found\n");
-		lock_release(ipsec_tmp_contexts_lock);
-		goto reconcile;
-	}
-	/* unlink from the shared list */
-	if (prev)
-		list_cut_position(&new, ipsec_tmp_contexts, prev);
-	LM_DBG("Unlinked %d expired contexts\n", list_size(&new));
-	lock_release(ipsec_tmp_contexts_lock);
-
-	list_for_each_safe(it, safe, &new) {
-		tmp = list_entry(it, struct ipsec_ctx_tmp, list);
-		LM_DBG("Context %p (state %d) Refcount %d\n",
-				tmp->ctx, tmp->ctx->state, tmp->ctx->ref);
-		if (VALID_IPSEC_STATE(tmp->ctx->state)) {
-			lock_get(&tmp->ctx->lock);
-			LM_DBG("Got lock for context %p (state %d)\n", tmp->ctx, tmp->ctx->state);
-			if (tmp->ctx->state == IPSEC_STATE_TMP)
-				LM_ERR("IPSec ctx %p expired\n", tmp->ctx);
-			list_del(&tmp->list);
-			ctx = tmp->ctx;
-			/* Drop the TMP-list ref. push_user() took +2 (user list + tmp
-			 * list); without also dropping the user-list ref below,
-			 * ipsec_ctx_free() never runs and kernel XFRM SAs leak. */
-			free = IPSEC_CTX_UNREF_UNSAFE(ctx);
-			lock_release(&ctx->lock);
-			shm_free(tmp);
-
-			/*
-			 * Always tear down kernel SAs on TMP expiry. The UE never sent
-			 * the protected REGISTER (no 200 OK), so these selectors are
-			 * dead. Leaving them blocks the next attempt (NLM_F_EXCL) and
-			 * they survive OpenSIPS restarts (hostNetwork).
-			 */
-			{
-				struct ipsec_socket *rm_sock = ipsec_sock_new();
-				if (rm_sock) {
-					ipsec_sa_rm_all(rm_sock, ctx);
-					ipsec_sock_close(rm_sock);
-				}
-			}
-
-			if (ctx->user)
-				ipsec_ctx_release_user(ctx);
-
-			lock_get(&ctx->lock);
-			if (!free)
-				free = IPSEC_CTX_UNREF_UNSAFE(ctx);
-			if (free)
-				ctx->state = IPSEC_STATE_INVALID;
-			lock_release(&ctx->lock);
-			LM_DBG("Released lock for context %p (state %d), free=%d\n", ctx, ctx->state, free);
-			if (free)
-				ipsec_ctx_free(ctx);
-			LM_DBG("IPSec ctx %p deleted\n", ctx);
-		} else {
-			LM_DBG("IPSec ctx %p already deleted\n", tmp->ctx);
-			list_del(&tmp->list);
-			shm_free(tmp);
+	do {
+		/*
+		 * Unlink the expired sets, a batch at a time; their list
+		 * references pass to the batch.  The lifetimes differ, so the
+		 * list is not ordered.
+		 */
+		n = 0;
+		lock_get(ipsec_tmp_contexts_lock);
+		list_for_each_safe(it, safe, ipsec_tmp_contexts) {
+			ctx = list_entry(it, struct ipsec_ctx, tmp);
+			if (ticks < ctx->expire)
+				continue;
+			list_del(&ctx->tmp);
+			INIT_LIST_HEAD(&ctx->tmp);
+			batch[n++] = ctx;
+			if (n == IPSEC_TIMER_BATCH)
+				break;
 		}
-	}
-	LM_DBG("Finished removing expired contexts\n");
+		lock_release(ipsec_tmp_contexts_lock);
 
-reconcile:
+		sock = n?ipsec_sock_new():NULL;
+		for (i = 0; i < n; i++) {
+			ctx = batch[i];
+			if (ctx->state == IPSEC_STATE_TMP && !ctx->sa_removed)
+				LM_ERR("IPSec ctx %p expired\n", ctx);
+			/*
+			 * The lifetime of the set is over (3GPP TS 24.229 5.2.2.2:
+			 * "the P-CSCF shall delete any security association from
+			 * the IPsec database when their SIP level lifetime
+			 * expires"): remove the SAs now, even if a transaction
+			 * still holds the ctx.
+			 */
+			if (sock)
+				ipsec_sa_rm_all(sock, ctx);
+			ipsec_ctx_unregister(ctx);
+			ipsec_ctx_release(ctx); /* reference of the lifetime list */
+		}
+		if (sock)
+			ipsec_sock_close(sock);
+	} while (n == IPSEC_TIMER_BATCH);
+
 	if (ipsec_reconcile_interval &&
 			++ipsec_reconcile_tick >= ipsec_reconcile_interval) {
 		ipsec_reconcile_tick = 0;
@@ -1591,60 +1759,14 @@ reconcile:
 	}
 }
 
-void ipsec_ctx_remove_tmp(struct ipsec_ctx *ctx)
-{
-	return ipsec_ctx_remove_free_tmp(ctx, 1);
-}
-
-void ipsec_ctx_remove_free_tmp(struct ipsec_ctx *ctx, int _free)
-{
-	struct list_head *it, *safe;
-	struct ipsec_ctx_tmp *tmp;
-	int free = 0;
-
-	lock_get(ipsec_tmp_contexts_lock);
-	lock_get(&ctx->lock);
-	list_for_each_safe(it, safe, ipsec_tmp_contexts) {
-		tmp = list_entry(it, struct ipsec_ctx_tmp, list);
-		if (tmp->ctx != ctx)
-			continue;
-		list_del(&tmp->list);
-		if (_free)
-			free = IPSEC_CTX_UNREF_UNSAFE(tmp->ctx);
-		shm_free(tmp);
-		break;
-	}
-	lock_release(&ctx->lock);
-	if (free) {
-		LM_BUG("removing an already deleted temporary context\n");
-		ipsec_ctx_free(ctx);
-	}
-	lock_release(ipsec_tmp_contexts_lock);
-}
-
 void ipsec_ctx_extend_tmp(struct ipsec_ctx *ctx)
 {
-	struct list_head *it, *safe;
-	struct ipsec_ctx_tmp *tmp;
-
 	lock_get(ipsec_tmp_contexts_lock);
 	lock_get(&ctx->lock);
-	if (ctx->state != IPSEC_STATE_TMP)
-		goto end;
-	list_for_each_safe(it, safe, ipsec_tmp_contexts) {
-		tmp = list_entry(it, struct ipsec_ctx_tmp, list);
-		if (tmp->ctx == ctx)
-			break;
-		tmp = NULL;
-	}
-	if (tmp) {
-		list_del(&tmp->list);
-		tmp->expire = get_ticks() + ipsec_tmp_timeout;
-		list_add_tail(&tmp->list, ipsec_tmp_contexts); /* move to the end */
-	} else {
-		LM_BUG("temporary ctx %p not found!\n", ctx);
-	}
-end:
+	/* a set the timer is expiring right now is not listed any more */
+	if (ctx->state == IPSEC_STATE_TMP && !ctx->sa_removed &&
+			!list_empty(&ctx->tmp))
+		ctx->expire = get_ticks() + ipsec_tmp_timeout;
 	lock_release(&ctx->lock);
 	lock_release(ipsec_tmp_contexts_lock);
 }

@@ -501,7 +501,7 @@ static int proto_ipsec_send(const struct socket_info* source,
 		unsigned int id)
 {
 	struct ip_addr ip;
-	unsigned short port;
+	unsigned short port, lookup_port;
 	int ret;
 	struct socket_info *ipsec_si;
 	struct ipsec_ctx *ctx = NULL;
@@ -511,6 +511,7 @@ static int proto_ipsec_send(const struct socket_info* source,
 
 	sockaddr2ip_addr(&ip, &to->s);
 	port = su_getport(to);
+	lookup_port = port;
 
 	parse_first_line(buf, len, &fl);
 	if (fl.type == SIP_INVALID) {
@@ -532,10 +533,15 @@ static int proto_ipsec_send(const struct socket_info* source,
 		if (ctx) {
 			LM_DBG("Got context %p (state = %d) from transaction\n",
 					ctx, ctx->state);
-			if (ctx->state == IPSEC_STATE_INVALID) {
+			if (!IPSEC_CTX_LIVE(ctx)) {
+				/* the SAs of the set the transaction started on are
+				 * gone and nothing must leave its protected ports
+				 * unprotected (3GPP TS 33.203 7.1): use the set that
+				 * replaced it - the protected server port of the UE
+				 * is the same (TS 33.203 7.4.0) */
 				LM_DBG("invalid state (%d) for %s:%hu\n", ctx->state,
 						ip_addr2a(&ip), port);
-				IPSEC_CTX_UNREF(ctx);
+				lookup_port = ctx->ue.port_s;
 				ctx = NULL;
 			} else {
 				IPSEC_CTX_REF(ctx); /* ref it, so we can use it */
@@ -543,7 +549,7 @@ static int proto_ipsec_send(const struct socket_info* source,
 		}
 		if (!ctx) {
 			LM_DBG("no valid IPSec context for %s:%hu\n", ip_addr2a(&ip), port);
-			ctx = ipsec_get_ctx_ip_port(&ip, port);
+			ctx = ipsec_get_ctx_ip_port(&ip, lookup_port);
 			if (ctx) {
 				LM_DBG("Got context %p (state = %d) for %s:%hu\n",
 						ctx, ctx->state, ip_addr2a(&ip), port);
@@ -788,6 +794,46 @@ static struct socket_info *ipsec_get_socket_info(const struct socket_info *bind_
 
 
 
+/*
+ * Picks the protected client port (port_pc) of a new set of security
+ * associations.
+ *
+ * 3GPP TS 33.203 7.4.0: in an authenticated re-registration the protected
+ * server ports (port_us, port_ps) remain unchanged while the protected
+ * client ports (port_uc, port_pc) change.  With a port_pc of its own, the
+ * selectors of the new set differ from the ones of the set that protected
+ * the REGISTER, so both sets can be held in the kernel until the new one is
+ * established.  The default client port is used when it is free; any other
+ * IPSec listener on the same address that is not the server port may serve
+ * as alternative.  A client port passed to ipsec_create() is taken as is.
+ */
+static struct socket_info *ipsec_find_client_socket(struct ipsec_user *user,
+		struct ipsec_ctx *prot, struct ip_addr *ip, int port_pc, int fixed,
+		struct socket_info *ss, sec_agree_body_t *sa)
+{
+	struct socket_info_full *it;
+	struct socket_info *si, *best = NULL;
+	int c, best_c = 0;
+
+	if (fixed)
+		return find_ipsec_socket_info(ip, port_pc, ss->port_no, 0);
+
+	for (it = protos[PROTO_IPSEC].listeners; it; it = it->next) {
+		si = &it->socket_info;
+		if (si->port_no == ss->port_no ||
+				si->port_no == ipsec_default_server_port ||
+				!ip_addr_cmp(ip, &si->address))
+			continue;
+		c = ipsec_ctx_collisions(user, prot, sa->ts3gpp.port_c,
+				sa->ts3gpp.port_s, ss->port_no, si->port_no);
+		if (!best || c < best_c || (c == best_c && si->port_no == port_pc)) {
+			best = si;
+			best_c = c;
+		}
+	}
+	return best;
+}
+
 static int w_ipsec_create(struct sip_msg *msg, int *_port_ps, int *_port_pc,
 		struct ipsec_allowed_algo *algos)
 {
@@ -798,12 +844,11 @@ static int w_ipsec_create(struct sip_msg *msg, int *_port_ps, int *_port_pc,
 	struct authenticate_body *auth = NULL;
 	sec_agree_body_t *sa;
 	struct ipsec_socket *sock;
-	struct ipsec_ctx *ctx;
+	struct ipsec_ctx *ctx, *prot = NULL;
 	struct ipsec_user *user;
 	auth_body_t *a = NULL;
 	str *impu, *impi;
-	int ret = -1;
-	unsigned short prev_port_pc = 0;
+	int ret = -1, mode;
 
 	if (msg->first_line.type != SIP_REPLY || msg->REPLY_STATUS != 401) {
 		LM_ERR("can only be called on 401 Reply\n");
@@ -885,93 +930,6 @@ static int w_ipsec_create(struct sip_msg *msg, int *_port_ps, int *_port_pc,
 	}
 	/* TODO: double check for sec-agree in Required/Supported */
 
-	/* check if the request was secured */
-	si = ipsec_get_socket_info(req->rcv.bind_address);
-	if (si) {
-		/*
-		 * the request came secure, this means that there is an already
-		 * existing SA/ctx for this USER - try to locate it
-		 */
-		ctx = IPSEC_CTX_TM_GET(t);
-		LM_DBG("got ctx %p for t=%p, state %d\n", ctx?ctx:0, t, ctx?ctx->state:-1);
-		if (ctx && ctx->state == IPSEC_STATE_OK && ctx->me.port_c != port_pc)
-			prev_port_pc = ctx->me.port_c;
-		else
-			prev_port_pc = 0;
-		if (ctx && ctx->state == IPSEC_STATE_OK) {
-			LM_DBG("found existing IPSec context %p for user %.*s, marked as temporary, to be deleted\n",
-				ctx, impi->len, impi->s);
-			/*
-			 * Kernel XFRM allows exactly one policy per (selector, dir).
-			 * The UE commonly reuses its port_s across a re-auth so the
-			 * new ctx's install collides with the old policy and silently
-			 * fails (NLM_F_EXCL).  Tear the old kernel SAs down now,
-			 * before ipsec_ctx_new()/ipsec_sa_add_all() runs for the new
-			 * ctx below.  The in-memory ctx still lives in the TMP list
-			 * so any pending transactions can finish; the TMP timer's
-			 * eventual cleanup is made a no-op by ctx->sa_removed.
-			 */
-			{
-				struct ipsec_socket *rm_sock = ipsec_sock_new();
-				if (rm_sock) {
-					ipsec_sa_rm_all(rm_sock, ctx);
-					ipsec_sock_close(rm_sock);
-				}
-			}
-			/* add the context as temporarily, so the "old" context gets removed on timer */
-			ipsec_ctx_add_tmp(ctx);
-		}
-	} else {
-		prev_port_pc = 0;
-		/* message was received unprotected - remove all temporary SAs */
-		ipsec_ctx_release_tmp_user(user);
-		/*
-		 * Unprotected REGISTER means the UE is doing fresh authentication
-		 * (e.g. after airplane-mode toggle or loss of connectivity).  Any
-		 * previous OK context is now orphaned: the UE will never send
-		 * traffic on those selectors again and gets brand-new keys/ports
-		 * in the upcoming 200 OK flow.  If we leave them in place, their
-		 * kernel XFRM policies/states accumulate forever.  Tear down the
-		 * kernel SAs now and move the in-memory ctx onto the TMP list so
-		 * any in-flight transactions holding a ref can finish cleanly.
-		 */
-		{
-			struct list_head *it, *safe;
-			struct ipsec_ctx *old;
-			struct ipsec_socket *rm_sock = ipsec_sock_new();
-			lock_get(&user->lock);
-			list_for_each_safe(it, safe, &user->sas) {
-				old = list_entry(it, struct ipsec_ctx, list);
-				if (old->state != IPSEC_STATE_OK)
-					continue;
-				if (rm_sock)
-					ipsec_sa_rm_all(rm_sock, old);
-				/* +1 ref for the TMP list slot (see ipsec_ctx_attach) */
-				IPSEC_CTX_REF(old);
-				ipsec_ctx_add_tmp(old);
-			}
-			lock_release(&user->lock);
-			if (rm_sock)
-				ipsec_sock_close(rm_sock);
-		}
-	}
-
-	/* locate the received IP */
-	ret = -2;
-	ss = find_ipsec_socket_info(&req->rcv.dst_ip, port_ps, port_pc, prev_port_pc);
-	if (!ss) {
-			LM_INFO("could not find a server listener on %s:%d!\n",
-				ip_addr2a(&req->rcv.dst_ip), port_ps);
-		goto release_user;
-	}
-	/* locate the client IP */
-	sc = find_ipsec_socket_info(&req->rcv.dst_ip, port_pc, ss->port_no, prev_port_pc);
-	if (!sc) {
-		LM_INFO("could not find a client listener on %s:%d!\n",
-				ip_addr2a(&req->rcv.dst_ip), port_pc);
-		goto release_user;
-	}
-
 	sa = ipsec_get_security_client(req, algos);
 	if (!sa) {
 		LM_ERR("could not find a matching Security-Client header\n");
@@ -980,22 +938,58 @@ static int w_ipsec_create(struct sip_msg *msg, int *_port_ps, int *_port_pc,
 	}
 
 	/* Parse IPSec mode from Security-Client (3GPP TS 33.203 Annex M) */
-	{
-		int mode = ipsec_parse_mode(&sa->ts3gpp.mod_str);
-		if (mode < 0) {
-			LM_ERR("unsupported or disabled IPSec mode in Security-Client\n");
-			ret = -2;
-			goto release_user;
-		}
-
-		ret = -5;
-		ctx = ipsec_ctx_new(sa, &req->rcv.src_ip, ss, sc, &auth->ck, &auth->ik, 0, 0,
-				(enum ipsec_mode)mode);
-		if (!ctx) {
-			LM_ERR("could not allocate new IPSec ctx\n");
-			goto release_user;
-		}
+	mode = ipsec_parse_mode(&sa->ts3gpp.mod_str);
+	if (mode < 0) {
+		LM_ERR("unsupported or disabled IPSec mode in Security-Client\n");
+		ret = -2;
+		goto release_user;
 	}
+
+	/*
+	 * check if the request was secured: if so, the transaction holds the
+	 * set of security associations that protected it and that the 401 has
+	 * to be sent on (3GPP TS 24.229 5.2.2.2)
+	 */
+	si = ipsec_get_socket_info(req->rcv.bind_address);
+	if (si) {
+		prot = IPSEC_CTX_TM_GET(t);
+		LM_DBG("got ctx %p for t=%p, state %d\n", prot, t, prot?prot->state:-1);
+		if (prot && !IPSEC_CTX_LIVE(prot))
+			prot = NULL;
+	}
+
+	/* locate the received IP */
+	ret = -2;
+	ss = find_ipsec_socket_info(&req->rcv.dst_ip, port_ps, port_pc, 0);
+	if (!ss) {
+			LM_INFO("could not find a server listener on %s:%d!\n",
+				ip_addr2a(&req->rcv.dst_ip), port_ps);
+		goto release_user;
+	}
+	/* locate the client IP */
+	sc = ipsec_find_client_socket(user, prot, &req->rcv.dst_ip,
+			port_pc, _port_pc != NULL, ss, sa);
+	if (!sc) {
+		LM_INFO("could not find a client listener on %s:%d!\n",
+				ip_addr2a(&req->rcv.dst_ip), port_pc);
+		goto release_user;
+	}
+
+	/*
+	 * Deletes the temporary sets of the user and keeps the others
+	 * (3GPP TS 24.229 5.2.2.2) - unless one uses the ports of the new set.
+	 */
+	ipsec_ctx_challenge_user(user, prot, sa->ts3gpp.port_c, sa->ts3gpp.port_s,
+			ss->port_no, sc->port_no);
+
+	ret = -5;
+	ctx = ipsec_ctx_new(sa, &req->rcv.src_ip, ss, sc, &auth->ck, &auth->ik, 0, 0,
+			(enum ipsec_mode)mode);
+	if (!ctx) {
+		LM_ERR("could not allocate new IPSec ctx\n");
+		goto release_user;
+	}
+	ctx->initial = (si == NULL);
 	ipsec_ctx_push(ctx);
 
 	sock = ipsec_sock_new();
@@ -1249,6 +1243,7 @@ static int ipsec_handle_register(struct sip_msg *msg, struct socket_info *si)
 		goto drop_user;
 	}
 
+	/* referenced: handed to the processing context below, or dropped */
 	ctx = ipsec_get_ctx_user(user, &msg->rcv);
 	if (!ctx) {
 		LM_ERR("could not find any IPSec context!\n");
@@ -1338,10 +1333,10 @@ NOTE 13: According to clause 7.4 on SA handling, at most six SAs per direction p
 a P-CSCF for one IMPI at any one time.
 */
 
-	/* pushing in global context */
-	IPSEC_CTX_REF_UNSAFE(ctx);
+	/* pushing in global context, together with the reference of the lookup */
 	ipsec_ctx_push(ctx);
 	lock_release(&ctx->lock);
+	ipsec_release_user(user);
 
 	if (extend_tmp)
 		ipsec_ctx_extend_tmp(ctx);
@@ -1374,7 +1369,7 @@ a P-CSCF for one IMPI at any one time.
 	return SCB_RUN_ALL;
 drop_release:
 	lock_release(&ctx->lock);
-	IPSEC_CTX_UNREF(ctx);
+	IPSEC_CTX_UNREF(ctx); /* reference of the lookup */
 drop_user:
 	ipsec_release_user(user);
 drop:
@@ -1601,9 +1596,10 @@ static void ipsec_usrloc_restore(ucontact_t *contact)
 	if (ipsec_sa_add_all(sock, ctx) < 0)
 		goto close;
 
-	/* add the context as temporarily */
+	/* established set: the registration reference is all it needs */
 	ipsec_ctx_push_user(user, ctx, IPSEC_STATE_OK);
 	ipsec_sock_close(sock);
+	ipsec_ctx_release(ctx); /* reference of the creator */
 
 	ipsec_release_user(user);
 	return;
@@ -1619,7 +1615,6 @@ static void ipsec_usrloc_insert(ucontact_t *contact)
 {
 	struct cell *t;
 	struct ipsec_ctx *ctx;
-	int remove_tmp = 0;
 
 	/* if we have a transaction, we need to have a context as well */
 	t = tm_ipsec.t_gett();
@@ -1632,6 +1627,19 @@ static void ipsec_usrloc_insert(ucontact_t *contact)
 	LM_DBG("searched IPSec context %p in t=%p\n", ctx, t);
 	if (!ctx) {
 		LM_DBG("no IPSec context for %.*s (%.*s)\n",
+				contact->aor->len, contact->aor->s,
+				contact->c.len, contact->c.s);
+		return;
+	}
+	/*
+	 * 3GPP TS 24.229 5.2.2.2: the 200 OK changes the temporary set into a
+	 * newly established one.  The set may be gone by now (its lifetime ran
+	 * out while the registration was pending, or a later challenge
+	 * replaced it): its SAs are deleted, so the binding is not tied to it.
+	 */
+	if (ipsec_ctx_confirm(ctx) < 0) {
+		LM_WARN("IPSec context %p of %.*s (%.*s) is not usable any more -"
+				" not binding the contact to it\n", ctx,
 				contact->aor->len, contact->aor->s,
 				contact->c.len, contact->c.s);
 		return;
@@ -1654,14 +1662,6 @@ static void ipsec_usrloc_insert(ucontact_t *contact)
 	ul_ipsec.put_ucontact_key(contact, &ipsec_usrloc_port_us, INT_STR_I(ctx->ue.port_s));
 	/* Store NAT-T mode for restoration */
 	ul_ipsec.put_ucontact_key(contact, &ipsec_usrloc_mode, INT_STR_I((int)ctx->mode));
-	
-	/* all good mark the SA as OK */
-	lock_get(&ctx->lock);
-	remove_tmp = (ctx->state == IPSEC_STATE_TMP);
-	ctx->state = IPSEC_STATE_OK;
-	lock_release(&ctx->lock);
-	if (remove_tmp)
-		ipsec_ctx_remove_tmp(ctx);
 }
 
 static void ipsec_usrloc_update(ucontact_t *contact,
@@ -1672,14 +1672,12 @@ static void ipsec_usrloc_update(ucontact_t *contact,
 			contact->c.len, contact->c.s, prev_port);
 
 	/*
-	 * Old-ctx tear-down is driven from the REGISTER path:
-	 *   - 401 re-auth: the old ctx is torn down immediately in
-	 *     w_ipsec_create() before the new ctx's SAs are installed.
-	 *   - Fresh (unprotected) re-REGISTER after e.g. airplane mode: any
-	 *     still-OK ctx for that user is torn down in the same function.
-	 * For a plain refresh re-REGISTER no new ipsec_ctx is attached to the
-	 * transaction and the existing SA must stay in place - just refresh
-	 * the ucontact keys.
+	 * The sets of security associations are handled on the REGISTER path:
+	 * ipsec_create() sets up the temporary set on the 401 and
+	 * ipsec_ctx_confirm() establishes it on the 200 OK, which also limits
+	 * the lifetime of the set it replaces.  For a plain refresh no new set
+	 * is attached to the transaction and the existing one stays in place -
+	 * just refresh the ucontact keys.
 	 */
 	ipsec_usrloc_insert(contact);
 }
@@ -1689,6 +1687,7 @@ static void ipsec_usrloc_delete(ucontact_t *contact)
 	struct ipsec_user *user;
 	struct ipsec_ctx *ctx;
 	unsigned short port_uc;
+	unsigned int spi_pc;
 
 	LM_DBG("removing IPSec context for %.*s (%.*s)\n",
 			contact->aor->len, contact->aor->s,
@@ -1698,12 +1697,18 @@ static void ipsec_usrloc_delete(ucontact_t *contact)
 		LM_ERR("could not find an IPSec user for this contact!\n");
 		return;
 	}
-	port_uc = UL_GET_I(contact, ipsec_usrloc_port_uc, "port_uc");
-	ctx = ipsec_ctx_find(user, port_uc);
-	if (ctx)
-		ipsec_ctx_release(ctx);
-	else
-		LM_ERR("could not find SA on port %hu\n", port_uc);
+	port_uc = UL_GET_I_RET(contact, ipsec_usrloc_port_uc, "port_uc", goto release);
+	spi_pc = UL_GET_I_RET(contact, ipsec_usrloc_spi_pc, "SPI-PC", goto release);
+	ctx = ipsec_ctx_find(user, port_uc, spi_pc);
+	if (ctx) {
+		/* the binding is gone: the set lives on only as long as a
+		 * transaction (the de-REGISTER) uses it */
+		ipsec_ctx_unregister(ctx);
+		ipsec_ctx_release(ctx); /* reference of the lookup */
+	} else {
+		LM_ERR("could not find SA on port %hu (SPI %u)\n", port_uc, spi_pc);
+	}
+release:
 	ipsec_release_user(user);
 }
 #undef INT_STR_I

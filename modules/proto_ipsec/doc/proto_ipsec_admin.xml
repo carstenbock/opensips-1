@@ -232,6 +232,20 @@ param("proto_ipsec", "temporary_timeout", 10) # number of seconds
 			IPSec communication.
 		</para>
 		<para>
+			It is the preferred client port, not the only one: when the user
+			already has a set of security associations whose ports a new set
+			with this client port would share (the kernel accepts one XFRM
+			policy per selector), <emphasis>ipsec_create()</emphasis> takes
+			another IPSec listener on the same address that is not the server
+			port. This is what happens in an authenticated re-registration,
+			where the protected client ports change (3GPP TS 33.203, clause
+			7.4.0): the set that protected the REGISTER is then kept until the
+			new one is established (3GPP TS 24.229, clause 5.2.2.2). With a
+			single client listener the existing set is removed when the 401
+			is relayed. A client port passed to
+			<emphasis>ipsec_create()</emphasis> is used as it is.
+		</para>
+		<para>
 		<emphasis>
 			Default value is not defined - a random socket is being used,
 			but needs to be different from the server socket.

@@ -61,7 +61,8 @@ static struct ipsec_map *ipsec_map_create(void)
 	return map;
 }
 
-static void ipsec_remove_node_ip(struct ip_addr *ip);
+static int ipsec_remove_node(struct ip_addr *ip, int level,
+		struct ipsec_map_node **nodes_list, unsigned int *size);
 
 static void _ipsec_map_destroy(struct ipsec_map *map)
 {
@@ -120,6 +121,9 @@ void ipsec_dump_users_rec(struct ipsec_map_node *nodes, int size, unsigned char 
 static void ipsec_dump_users(struct ipsec_map *map)
 {
 	unsigned char buf[4];
+	/* walks every user of the map - only worth it when it gets printed */
+	if (!is_printable(L_DBG))
+		return;
 	lock_get(&map->lock);
 	ipsec_dump_users_rec(map->nodes, map->size, buf, 0);
 	lock_release(&map->lock);
@@ -270,7 +274,7 @@ struct ipsec_user *ipsec_get_user(struct ip_addr *ip, str *impi, str *impu)
 		user = ipsec_get_create_user(node, ip, impi, impu);
 		if (!user) {
 			LM_ERR("could not create user!\n");
-			ipsec_remove_node_ip(ip);
+			ipsec_remove_node(ip, 0, &map->nodes, &map->size);
 		}
 	}
 	lock_release(&map->lock);
@@ -306,7 +310,7 @@ struct ipsec_user *ipsec_find_user(struct ip_addr *ip, str *impi, str *impu)
 		map = ipsec_map_ipv6;
 	lock_get(&map->lock);
 	node = ipsec_find_node(ip, 0, map->nodes, map->size);
-	if (node) {
+	if (node && node->users) {
 		uimpi = ipsec_find_user_impi(node->users, impi);
 		if (uimpi) {
 			user = ipsec_find_user_in_impi(&uimpi->users, impu);
@@ -324,19 +328,14 @@ struct ipsec_user *ipsec_find_user(struct ip_addr *ip, str *impi, str *impu)
 	return user;
 }
 
-static void ipsec_destroy_user(struct ipsec_user *user)
+/* removes the user from the map, which has to be locked */
+static void ipsec_unlink_user(struct ipsec_map *map, struct ipsec_user *user)
 {
-	struct ipsec_map *map;
 	struct ipsec_map_node *node;
 	struct ipsec_user_impi *uimpi;
 
-	if (user->ip.af == AF_INET)
-		map = ipsec_map_ipv4;
-	else
-		map = ipsec_map_ipv6;
-	lock_get(&map->lock);
 	node = ipsec_find_node(&user->ip, 0, map->nodes, map->size);
-	if (node) {
+	if (node && node->users) {
 		uimpi = ipsec_find_user_impi(node->users, &user->impi);
 		if (uimpi) {
 			list_del(&user->list);
@@ -354,15 +353,25 @@ static void ipsec_destroy_user(struct ipsec_user *user)
 	} else {
 		LM_ERR("user not found!\n");
 	}
-	lock_release(&map->lock);
-	ipsec_remove_node_ip(&user->ip);
-	lock_destroy(&user->lock);
-	shm_free(user);
+	ipsec_remove_node(&user->ip, 0, &map->nodes, &map->size);
 }
 
+/*
+ * A user is referenced by each ctx linked into user->sas and by whoever got
+ * it from ipsec_get_user()/ipsec_find_user().  The last reference is dropped
+ * with the map locked: the lookups take theirs under the same lock, so they
+ * never return a user that is being destroyed.
+ */
 static void ipsec_release_user_count(struct ipsec_user *user, int count)
 {
+	struct ipsec_map *map;
 	int free = 0;
+
+	if (user->ip.af == AF_INET)
+		map = ipsec_map_ipv4;
+	else
+		map = ipsec_map_ipv6;
+	lock_get(&map->lock);
 	lock_get(&user->lock);
 	if (user->ref < count) {
 		LM_BUG("invalid unref of %d with %d for user %p\n", user->ref, count, user);
@@ -372,7 +381,12 @@ static void ipsec_release_user_count(struct ipsec_user *user, int count)
 	}
 	lock_release(&user->lock);
 	if (free)
-		ipsec_destroy_user(user);
+		ipsec_unlink_user(map, user);
+	lock_release(&map->lock);
+	if (free) {
+		lock_destroy(&user->lock);
+		shm_free(user);
+	}
 }
 
 void ipsec_release_user(struct ipsec_user *user)
@@ -391,10 +405,13 @@ static int ipsec_remove_node(struct ip_addr *ip, int level,
 	nodes = *nodes_list;
 	for (n = 0; n < *size; n++) {
 		if (nodes[n].n == ip->u.addr[level]) {
-			if (leaf)
+			if (leaf) {
 				remove = (nodes[n].users == NULL);
-			else
-				remove = ipsec_remove_node(ip, level + 1, &nodes[n].nodes, &nodes[n].size);
+			} else {
+				/* an inner node goes only when its last child is gone */
+				ipsec_remove_node(ip, level + 1, &nodes[n].nodes, &nodes[n].size);
+				remove = (nodes[n].size == 0);
+			}
 			break;
 		}
 	}
@@ -405,7 +422,7 @@ static int ipsec_remove_node(struct ip_addr *ip, int level,
 			*nodes_list = NULL;
 			*size = 0;
 		} else {
-			memmove(&nodes[n + 1], &nodes[n], ((*size) - n - 1) * sizeof (*nodes));
+			memmove(&nodes[n], &nodes[n + 1], ((*size) - n - 1) * sizeof (*nodes));
 			(*size)--;
 			*nodes_list = nodes;
 		}
@@ -413,64 +430,57 @@ static int ipsec_remove_node(struct ip_addr *ip, int level,
 	return remove;
 }
 
-static void ipsec_remove_node_ip(struct ip_addr *ip)
-{
-	struct ipsec_map *map;
-
-	if (ip->af == AF_INET)
-		map = ipsec_map_ipv4;
-	else
-		map = ipsec_map_ipv6;
-	lock_get(&map->lock);
-	ipsec_remove_node(ip, 0, &map->nodes, &map->size);
-	lock_release(&map->lock);
-	ipsec_dump_users(map);
-}
-
+/*
+ * Returns the (referenced) set a protected message was received over.  Only
+ * sets that have their SAs in the kernel are considered - a UE may reuse its
+ * ports for a later set, and the kernel holds one policy per selector, so
+ * at most one of them matches.
+ */
 struct ipsec_ctx *ipsec_get_ctx_user(struct ipsec_user *user, struct receive_info *ri)
 {
 	struct list_head *it;
 	struct ipsec_ctx *ctx = NULL;
 	lock_get(&user->lock);
-	list_for_each(it, &user->sas) {
+	list_for_each_prev(it, &user->sas) {
 		ctx = list_entry(it, struct ipsec_ctx, list);
 		LM_DBG("checking ctx %p (state %d) for src_port %u, dst_port %u\n", ctx, ctx->state, ri->src_port, ri->dst_port);
-		if (VALID_IPSEC_STATE(ctx->state)) {
-			LM_DBG("ctx %p is valid, state %d\n", ctx, ctx->state);
-			if (ctx->ue.port_c == ri->src_port && ctx->me.port_s == ri->dst_port)
-				break;
-		}
+		if (IPSEC_CTX_LIVE(ctx) && ctx->ue.port_c == ri->src_port &&
+				ctx->me.port_s == ri->dst_port && ipsec_ctx_tryref(ctx))
+			break;
 		ctx = NULL;
 	}
 	lock_release(&user->lock);
 	return ctx;
 }
 
+/*
+ * Returns the (referenced) set to be used for sending to a port of the UE:
+ * the established set that is in use, else an old set that still lives,
+ * else a temporary one; among equals the most recent one.
+ */
 struct ipsec_ctx *ipsec_get_ctx_user_port(struct ipsec_user *user, unsigned short port)
 {
 	struct list_head *it;
-	struct ipsec_ctx *ctx = NULL;
-	struct ipsec_ctx *tmp_ctx = NULL;
+	struct ipsec_ctx *ctx, *best = NULL;
+	int rank, best_rank = 0;
 	lock_get(&user->lock);
-	list_for_each(it, &user->sas) {
+	list_for_each_prev(it, &user->sas) {
 		ctx = list_entry(it, struct ipsec_ctx, list);
 		LM_DBG("checking ctx %p for port %u (ue.port_s=%u ue.port_c=%u state=%d)\n",
 				ctx, port, ctx->ue.port_s, ctx->ue.port_c, ctx->state);
-		if (ctx->ue.port_s == port || ctx->ue.port_c == port) {
-			if (ctx->state == IPSEC_STATE_TMP) {
-				tmp_ctx = ctx;
-			}
-			if (ctx->state == IPSEC_STATE_OK)
-				break;
+		if (!IPSEC_CTX_LIVE(ctx) ||
+				(ctx->ue.port_s != port && ctx->ue.port_c != port))
+			continue;
+		rank = (ctx->state == IPSEC_STATE_TMP?1:(ctx->old?2:3));
+		if (rank > best_rank) {
+			best = ctx;
+			best_rank = rank;
 		}
-		ctx = NULL;
 	}
+	if (best && !ipsec_ctx_tryref(best))
+		best = NULL;
 	lock_release(&user->lock);
-	if (!ctx && tmp_ctx) {
-		/* Just found a temporary context, not an "OK" context, return temporary context */
-		ctx = tmp_ctx;
-	}
-	return ctx;
+	return best;
 }
 
 struct ipsec_ctx *ipsec_get_ctx_ip_port(struct ip_addr *ip, unsigned short port)
@@ -501,9 +511,7 @@ struct ipsec_ctx *ipsec_get_ctx_ip_port(struct ip_addr *ip, unsigned short port)
 		}
 	}
 end:
-	if (ctx) {
-		IPSEC_CTX_REF(ctx);
-	}
+	/* ctx is referenced by ipsec_get_ctx_user_port() */
 	lock_release(&map->lock);
 	return ctx;
 }

@@ -100,21 +100,30 @@ struct ipsec_ctx {
 	struct list_head list;
 	int ref;
 	/*
-	 * Kernel XFRM selector (src_ip, dst_ip, sport, dport) is UNIQUE per
-	 * (dir, type) in the kernel - only ONE policy can exist per selector.
-	 * When a UE re-authenticates while reusing its port_s, the NEW ctx's
-	 * install collides with the OLD ctx's existing kernel policy
-	 * (NLM_F_EXCL fails silently).  We must tear down the OLD ctx's
-	 * kernel SAs BEFORE installing NEW, which happens in
-	 * ipsec_handle_aka_auth() as soon as we detect the 401 re-auth.
-	 *
-	 * Later, when the TMP-timer eventually fires ipsec_ctx_free() on the
-	 * old ctx, it would call ipsec_sa_rm_all() a second time and delete
-	 * the NEW ctx's policies (same selector).  This flag makes the
-	 * second tear-down a no-op.
+	 * Set while no kernel SAs are installed for this ctx: before
+	 * ipsec_sa_add_all() and after ipsec_sa_rm_all().  The kernel keeps
+	 * exactly one XFRM policy per (selector, dir) and policies are deleted by
+	 * selector, so the SAs of a ctx must be removed at most once: a second
+	 * removal would delete the policies of a later ctx that reuses the same
+	 * ports.  A ctx with this flag set is ignored by all lookups.
 	 */
 	int sa_removed;
+	/* the registration reference (see the ownership model in ipsec.c) is held */
+	int reg_ref;
+	/* old set of security associations: superseded by a newer set, kept on
+	 * the lifetime list until it expires (TS 24.229 5.2.2.2) */
+	int old;
+	/* created by a challenge to a REGISTER that was received unprotected */
+	int initial;
+	/* lifetime list (ipsec_tmp_contexts) and the tick the set expires at;
+	 * both protected by ipsec_tmp_contexts_lock */
+	struct list_head tmp;
+	time_t expire;
 };
+
+/* a set that has its SAs in the kernel and may be used for traffic */
+#define IPSEC_CTX_LIVE(_ctx) \
+	(VALID_IPSEC_STATE((_ctx)->state) && !(_ctx)->sa_removed)
 
 #define IPSEC_CTX_REF_COUNT_UNSAFE(_ctx, _c) \
 	do { \
@@ -140,6 +149,9 @@ int ipsec_spi_match(struct ipsec_spi *spi, unsigned int ispi);
 #define IPSEC_DEFAULT_MIN_SPI 65536
 #define IPSEC_DEFAULT_MAX_SPI 262144
 #define IPSEC_DEFAULT_TMP_TOUT 30
+/* SIP level lifetime left to an old set once the new set is in use:
+ * 64*T1 (TS 24.229 5.2.2.2), with T1 = 500 ms */
+#define IPSEC_OLD_SA_LIFETIME 32
 #define IPSEC_DEFAULT_PORT 5062
 
 extern unsigned int ipsec_min_spi;
@@ -163,18 +175,24 @@ void ipsec_sa_rm_all(struct ipsec_socket *sock, struct ipsec_ctx *ctx);
 struct ipsec_ctx *ipsec_ctx_new(sec_agree_body_t *sa, struct ip_addr *ip,
 		struct socket_info *ss, struct socket_info *sc, str *ck, str *ik,
 		unsigned int spi_pc, unsigned int spi_ps, enum ipsec_mode mode);
-struct ipsec_ctx *ipsec_ctx_find(struct ipsec_user *user, unsigned short port);
+struct ipsec_ctx *ipsec_ctx_find(struct ipsec_user *user, unsigned short port,
+		unsigned int spi_pc);
 void ipsec_ctx_push(struct ipsec_ctx *ctx);
 struct ipsec_ctx *ipsec_ctx_get(void);
+int ipsec_ctx_tryref(struct ipsec_ctx *ctx);
 void ipsec_ctx_push_user(struct ipsec_user *user, struct ipsec_ctx *ctx, enum ipsec_state state);
-void ipsec_ctx_push_tmp_user(struct ipsec_user *user, struct ipsec_ctx *ctx);
-void ipsec_ctx_add_tmp(struct ipsec_ctx *ctx);
-void ipsec_ctx_release_tmp_user(struct ipsec_user *user);
+void ipsec_ctx_add_tmp(struct ipsec_ctx *ctx, int lifetime);
+int ipsec_ctx_collisions(struct ipsec_user *user, struct ipsec_ctx *prot,
+		unsigned short ue_port_c, unsigned short ue_port_s,
+		unsigned short port_ps, unsigned short port_pc);
+void ipsec_ctx_challenge_user(struct ipsec_user *user, struct ipsec_ctx *prot,
+		unsigned short ue_port_c, unsigned short ue_port_s,
+		unsigned short port_ps, unsigned short port_pc);
+int ipsec_ctx_confirm(struct ipsec_ctx *ctx);
+void ipsec_ctx_unregister(struct ipsec_ctx *ctx);
 void ipsec_ctx_release_user(struct ipsec_ctx *ctx);
 void ipsec_ctx_release(struct ipsec_ctx *ctx);
 int ipsec_ctx_release_unsafe(struct ipsec_ctx *ctx);
-void ipsec_ctx_remove_tmp(struct ipsec_ctx *ctx);
-void ipsec_ctx_remove_free_tmp(struct ipsec_ctx *ctx, int _free);
 void ipsec_ctx_extend_tmp(struct ipsec_ctx *ctx);
 
 /*
