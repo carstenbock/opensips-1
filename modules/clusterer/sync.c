@@ -27,6 +27,10 @@
 #include "clusterer.h"
 #include "sync.h"
 
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
 int sync_packet_size = DEFAULT_SYNC_PACKET_SIZE;
 int _sync_from_id = 0;
 
@@ -169,6 +173,8 @@ int cl_request_sync(str *capability, int cluster_id, int from_cb)
 
 	lcap->sync_total_chunks_cnt = 0;
 	lcap->sync_cur_chunks_cnt = 0;
+	/* start of the interval after which sync_check_timer() asks again */
+	lcap->last_sync_pkt = get_ticks();
 
 	/* node is no longer OK for this capability if it previously were */
 	if (lcap->flags & CAP_STATE_OK) {
@@ -335,7 +341,7 @@ void send_sync_repl(int sender, void *param)
 	bin_packet_t sync_end_pkt, *pkt, *next_pkt;
 	str bin_buffer;
 	struct local_cap *cap;
-	int rc, cluster_id, pkt_no = 0;
+	int rc, cluster_id, pkt_no = 0, failed = 0;
 	struct reply_rpc_params *p = (struct reply_rpc_params *)param;
 
 	for (cap = p->cluster->capabilities; cap; cap = cap->next)
@@ -363,19 +369,39 @@ void send_sync_repl(int sender, void *param)
 		for (pkt = sync_packets; pkt; pkt = next_pkt) {
 			next_pkt = pkt->next;
 
-			if ((rc = clusterer_send_msg(pkt, p->cluster->cluster_id,
-				p->node_id, 0, 1))<0)
-				LM_ERR("Failed to send sync packet, rc=%d\n", rc);
+			/* once a packet is lost the receiver cannot complete this
+			 * sync any more, so do not push the rest (and no sync end):
+			 * the receiver times out and requests a new sync */
+			if (!failed && (rc = clusterer_send_msg(pkt,
+				p->cluster->cluster_id, p->node_id, 0, 1))<0) {
+				LM_ERR("Failed to send sync packet %d/%u to node %d, "
+					"rc=%d, aborting sync\n", pkt_no + 1,
+					sync_packets_cnt, p->node_id, rc);
+				failed = 1;
+			}
+			if (!failed)
+				pkt_no++;
 
 			bin_free_packet(pkt);
 			free(pkt);
 		}
 
 		sync_packets = NULL;
-		pkt_no = sync_packets_cnt;
 		sync_packets_cnt = 0;
 		sync_packet_last = NULL;
 		sync_last_chunk_sz = NULL;
+
+#ifdef __GLIBC__
+		/* the packets live in the system heap of this process (the whole
+		 * data set at once): hand the freed pages back to the OS, or each
+		 * process which ever answered a sync keeps them resident */
+		malloc_trim(0);
+#endif
+
+		if (failed) {
+			lock_stop_read(cl_list_lock);
+			goto out_free;
+		}
 	}
 
 	/* send indication that all sync packets were sent */

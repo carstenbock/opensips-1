@@ -75,6 +75,7 @@ void sync_check_timer(utime_t ticks, void *param)
 	cluster_info_t *cl;
 	struct local_cap *cap;
 	struct timeval now;
+	int resync;
 
 	if (sr_get_core_status() != STATE_RUNNING) {
 		LM_DBG("opensips is not operational (state: %d), nothing "
@@ -95,6 +96,7 @@ void sync_check_timer(utime_t ticks, void *param)
 		lock_release(cl->current_node->lock);
 
 		for (cap = cl->capabilities; cap; cap = cap->next) {
+			resync = 0;
 			lock_get(cl->lock);
 
 			if ((cap->flags & CAP_STATE_ENABLED) &&
@@ -129,10 +131,35 @@ void sync_check_timer(utime_t ticks, void *param)
 							cap->sync_cur_chunks_cnt);
 						LM_INFO("Sync timeout for capability [%.*s], reverting to "
 							"not synced state\n", cap->reg.name.len, cap->reg.name.s);
+
+						cap->last_sync_pkt = get_ticks();
+						resync = 1;
+					} else if (!(cap->flags &
+						(CAP_SYNC_PENDING|CAP_SYNC_IN_PROGRESS)) &&
+						(get_ticks() - cap->last_sync_pkt >= sync_timeout)) {
+						/* neither synced nor waiting for a donor nor
+						 * receiving: the sync timed out above, or the request
+						 * went out and no sync packet ever arrived (donor
+						 * restarted, link lost, packets dropped) */
+						resync = 1;
 					}
 			}
 
 			lock_release(cl->lock);
+
+			/* a node must not stay "not synced" for good: ask again, a
+			 * donor is picked anew (or the request is queued until a node
+			 * turns up in the synced state) */
+			if (resync) {
+				LM_WARN("Sync of capability [%.*s] in cluster %d did not "
+					"complete (no sync packet for %d s, %d chunks received), "
+					"requesting it again\n", cap->reg.name.len,
+					cap->reg.name.s, cl->cluster_id, sync_timeout,
+					cap->sync_cur_chunks_cnt);
+				if (cl_request_sync(&cap->reg.name, cl->cluster_id, 1) < 0)
+					LM_ERR("Failed to request sync for capability [%.*s]\n",
+						cap->reg.name.len, cap->reg.name.s);
+			}
 		}
 	}
 
@@ -1017,6 +1044,7 @@ static void handle_cap_update(bin_packet_t *packet, node_info_t *source)
 						if (rc == CLUSTERER_SEND_SUCCESS) {
 							lock_get(source->cluster->lock);
 							lcap->flags &= ~(CAP_SYNC_PENDING|CAP_SYNC_STARTUP);
+							lcap->last_sync_pkt = get_ticks();
 							lock_release(source->cluster->lock);
 						} else if (rc == CLUSTERER_SEND_ERR)
 							LM_ERR("Failed to send sync request to node: %d\n",
@@ -1872,6 +1900,7 @@ void do_actions_node_ev(cluster_info_t *clusters, int *select_cluster,
 					if (rst_sync_pending) {
 						lock_get(cl->lock);
 						cap_it->flags &= ~(CAP_SYNC_PENDING|CAP_SYNC_STARTUP);
+						cap_it->last_sync_pkt = get_ticks();
 						lock_release(cl->lock);
 					}
 				}

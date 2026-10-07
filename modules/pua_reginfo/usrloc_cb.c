@@ -699,7 +699,7 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 	int count = 0, i = 0;
 	str aorlist[20];
 	unsigned int aor_count = 0;
-	csv_record *pai_list = NULL;
+	csv_record *pai_list = NULL, *pai_head = NULL;
 	str s, str_dup;
 
 	/* Get the URecord for the contact */
@@ -741,7 +741,9 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 		key_value = ul.get_urecord_key(record, &ul_identities_key);
 		if (key_value && key_value->is_str) {
 			LM_DBG("Got associated identities: %.*s\n", key_value->s.len, key_value->s.s);
-			pai_list = parse_csv_record(&key_value->s);
+			/* keep the head: the loop advances @pai_list, and the list was
+			 * never freed (one leaked list per reg-event update) */
+			pai_head = pai_list = parse_csv_record(&key_value->s);
 			while(pai_list) {
 				str_dup = pai_list->s;
 				trim(&str_dup);
@@ -752,6 +754,7 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 				}
 				if (pkg_nt_str_dup(&s, &str_dup) < 0) {
 					LM_ERR("Out of memory\n");
+					free_csv_record(pai_head);
 					goto error;
 				}				
 				LM_DBG("  Identity %.*s\n", s.len, s.s);
@@ -760,6 +763,7 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 				pai_list = pai_list->next;
 				if (aor_count >= 20) break;
 			}
+			free_csv_record(pai_head);
 		} else {
 			LM_INFO("Looking for identities, but no info found in usrloc - not updating presence\n");
 			return;
