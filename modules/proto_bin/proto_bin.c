@@ -142,6 +142,50 @@ static int proto_bin_init_listener(struct socket_info *si)
 	return tcp_init_listener(si);
 }
 
+/* Back-pressure for the async write queue: a sender that produces faster
+ * than the peer reads (a full cluster sync, typically) fills the queue of
+ * postponed chunks, and the next write then fails, which drops the connection
+ * together with everything still queued on it. So while the queue is full,
+ * wait up to bin_send_timeout milliseconds for room in it.
+ * With a usable fd the queued chunks are flushed right here, in order and
+ * under the write lock, as soon as the socket takes data again: relying on
+ * the TCP main process to hand the connection to a TCP worker is not enough,
+ * since the waiting process may be that very worker. A connection which is
+ * still connecting (no fd) can only be waited for.
+ * The queue is peeked at without the write lock: a stale value costs one more
+ * round or falls through to the regular write. */
+static void bin_async_wait_room(struct tcp_connection *c, int fd)
+{
+	struct pollfd pf;
+	int waited, n;
+
+	if (!c->async)
+		return;
+
+	for (waited = 0; waited < bin_send_timeout &&
+		c->async->pending == c->async->allocated &&
+		c->state != S_CONN_BAD; waited++) {
+		if (fd < 0) {
+			usleep(1000);
+			continue;
+		}
+
+		pf.fd = fd;
+		pf.events = POLLOUT;
+		n = poll(&pf, 1, 1);
+		if (n < 0 && errno != EINTR)
+			return;
+		if (n <= 0)
+			continue;
+
+		lock_get(&c->write_lock);
+		n = tcp_async_write(c, fd);
+		lock_release(&c->write_lock);
+		if (n < 0)
+			return;
+	}
+}
+
 static int proto_bin_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
 		unsigned int id)
@@ -231,6 +275,7 @@ static int proto_bin_send(const struct socket_info* send_sock,
 			 * case we ever manage to get through */
 			LM_DBG("We have acquired a TCP connection which is still "
 				"pending to connect - delaying write \n");
+			bin_async_wait_room(c, -1);
 			n = tcp_async_add_chunk(c,buf,len,1);
 			if (n < 0) {
 				LM_ERR("Failed to add another write chunk to %p\n",c);
@@ -259,6 +304,7 @@ static int proto_bin_send(const struct socket_info* send_sock,
 send_it:
 	LM_DBG("sending via fd %d...\n",fd);
 
+	bin_async_wait_room(c, fd);
 	n = tcp_write_on_socket(c, fd, buf, len,
 			bin_send_timeout, bin_async_local_write_timeout);
 
