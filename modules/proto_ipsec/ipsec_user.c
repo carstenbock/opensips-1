@@ -515,12 +515,3 @@ end:
 	lock_release(&map->lock);
 	return ctx;
 }
-
-int ipsec_users_claim_port(struct ip_addr *ip, unsigned short port)
-{
-	struct ipsec_ctx *ctx = ipsec_get_ctx_ip_port(ip, port);
-	if (!ctx)
-		return 0;
-	IPSEC_CTX_UNREF(ctx);
-	return 1;
-}

@@ -174,6 +174,7 @@ static const param_export_t params[] = {
 	{ "temporary_timeout",				INT_PARAM, &ipsec_tmp_timeout },
 	{ "reconcile_interval",				INT_PARAM, &ipsec_reconcile_interval },
 	{ "reconcile_grace",				INT_PARAM, &ipsec_reconcile_grace },
+	{ "reconcile_rate",					INT_PARAM, &ipsec_reconcile_rate },
 	{ "default_client_port",			INT_PARAM, &ipsec_default_client_port },
 	{ "default_server_port",			INT_PARAM, &ipsec_default_server_port },
 	{ "allowed_algorithms",				STR_PARAM, &ipsec_allowed_algorithms.s },
@@ -207,6 +208,20 @@ static const pv_export_t pvars[] = {
 	{ {0, 0}, 0, 0, 0, 0, 0, 0, 0 }
 };
 
+static const stat_export_t mod_stats[] = {
+	{ "reconcile_passes",	0, &ipsec_reconcile_passes },
+	{ "reconcile_sas",		0, &ipsec_reconcile_sas },
+	{ "reconcile_orphans",	0, &ipsec_reconcile_orphans },
+	{ "reconcile_ms",		0, &ipsec_reconcile_ms },
+	{0, 0, 0}
+};
+
+/* not started with reconcile_interval 0 (see mod_init()) */
+static proc_export_t procs[] = {
+	{ "IPSec reconcile", 0, 0, ipsec_reconcile_proc, 1, 0 },
+	{0, 0, 0, 0, 0, 0}
+};
+
 static const dep_export_t deps = {
 	{ /* OpenSIPS module dependencies */
 		{ MOD_TYPE_DEFAULT, "tm", DEP_ABORT },
@@ -232,11 +247,11 @@ struct module_exports exports = {
 	cmds,       /* exported functions */
 	0,          /* exported async functions */
 	params,     /* module parameters */
-	0,          /* exported statistics */
+	mod_stats,  /* exported statistics */
 	0,          /* exported MI functions */
 	pvars,      /* exported pseudo-variables */
 	0,          /* exported transformations */
-	0,          /* extra processes */
+	procs,      /* extra processes */
 	0,          /* module pre-initialization function */
 	mod_init,   /* module initialization function */
 	0,          /* response function */
@@ -337,6 +352,9 @@ static int mod_init(void)
 				ipsec_tmp_timeout);
 		return -1;
 	}
+
+	if (!ipsec_reconcile_interval)
+		procs[0].no = 0;
 
 	if (ipsec_sockets_init() < 0)
 		return -1;

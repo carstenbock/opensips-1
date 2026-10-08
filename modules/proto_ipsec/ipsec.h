@@ -75,12 +75,20 @@ int ipsec_hw_offload_init(const char *ifname);
 #include "../../str.h"
 #include "../../socket_info.h"
 #include "../../lib/list.h"
+#include "../../statistics.h"
 
 struct ipsec_spi;
+struct ipsec_ctx;
 struct ipsec_endpoint {
 	struct ip_addr ip;
 	unsigned int spi_s, spi_c;
 	unsigned short port_s, port_c;
+};
+
+/* entry of the SA index (see ipsec.c) */
+struct ipsec_sa_link {
+	struct ipsec_sa_link *next;
+	struct ipsec_ctx *ctx;
 };
 
 struct ipsec_ctx {
@@ -119,6 +127,9 @@ struct ipsec_ctx {
 	 * both protected by ipsec_tmp_contexts_lock */
 	struct list_head tmp;
 	time_t expire;
+	/* SA index: linked while the SAs of the set are in the kernel, once per
+	 * (UE port, own port) pair; protected by the lock of the bucket */
+	struct ipsec_sa_link sa_links[2];
 };
 
 /* a set that has its SAs in the kernel and may be used for traffic */
@@ -149,6 +160,8 @@ int ipsec_spi_match(struct ipsec_spi *spi, unsigned int ispi);
 #define IPSEC_DEFAULT_MIN_SPI 65536
 #define IPSEC_DEFAULT_MAX_SPI 262144
 #define IPSEC_DEFAULT_TMP_TOUT 30
+/* kernel SAs the reconciliation examines per second */
+#define IPSEC_DEFAULT_RECONCILE_RATE 100000
 /* SIP level lifetime left to an old set once the new set is in use:
  * 64*T1 (TS 24.229 5.2.2.2), with T1 = 500 ms */
 #define IPSEC_OLD_SA_LIFETIME 32
@@ -159,6 +172,16 @@ extern unsigned int ipsec_max_spi;
 extern int ipsec_tmp_timeout;
 extern unsigned int ipsec_reconcile_interval;
 extern unsigned int ipsec_reconcile_grace;
+extern unsigned int ipsec_reconcile_rate;
+extern stat_var *ipsec_reconcile_passes;
+extern stat_var *ipsec_reconcile_sas;
+extern stat_var *ipsec_reconcile_orphans;
+extern stat_var *ipsec_reconcile_ms;
+
+/* what the SA index knows about a kernel SA */
+#define IPSEC_SA_UNKNOWN  0 /* no set uses its selector */
+#define IPSEC_SA_SELECTOR 1 /* a set uses its selector, with another SPI */
+#define IPSEC_SA_OWNED    2 /* it is the SA of a set */
 
 int ipsec_init(void);
 void ipsec_destroy(void);
@@ -194,6 +217,10 @@ void ipsec_ctx_release_user(struct ipsec_ctx *ctx);
 void ipsec_ctx_release(struct ipsec_ctx *ctx);
 int ipsec_ctx_release_unsafe(struct ipsec_ctx *ctx);
 void ipsec_ctx_extend_tmp(struct ipsec_ctx *ctx);
+int ipsec_sa_owner(struct ip_addr *ue_ip, unsigned short ue_port,
+		struct ip_addr *ip, unsigned short port, int out, unsigned int spi);
+void ipsec_xfrm_reconcile(void);
+void ipsec_reconcile_proc(int rank);
 
 /*
  * NAT-T UDP Encapsulation Socket Management

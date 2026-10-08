@@ -99,7 +99,11 @@ unsigned int ipsec_min_spi = IPSEC_DEFAULT_MIN_SPI;
 unsigned int ipsec_max_spi = IPSEC_DEFAULT_MAX_SPI;
 unsigned int ipsec_reconcile_interval = 30;
 unsigned int ipsec_reconcile_grace = 30;
-static unsigned int ipsec_reconcile_tick;
+unsigned int ipsec_reconcile_rate = IPSEC_DEFAULT_RECONCILE_RATE;
+stat_var *ipsec_reconcile_passes;
+stat_var *ipsec_reconcile_sas;
+stat_var *ipsec_reconcile_orphans;
+stat_var *ipsec_reconcile_ms;
 
 static int ipsec_ctx_idx = -1;
 
@@ -249,6 +253,161 @@ static void ipsec_spi_release(struct ipsec_spi *spi)
 }
 
 /*
+ * SA index - tells in O(1) whether a kernel SA belongs to a set
+ *
+ * A set that has its SAs in the kernel is linked twice, once per (UE port,
+ * own port) pair: each pair is the selector of one SA towards the gateway
+ * and, reversed, of one SA towards the UE.
+ *   link 0: UE port_c <-> own port_s (SPIs: own spi_s in, UE spi_c out)
+ *   link 1: UE port_s <-> own port_c (SPIs: own spi_c in, UE spi_s out)
+ * The bucket locks are taken last (see the lock order below) and only the
+ * read-only values of a ctx are used with them: a ctx is unlinked before it
+ * is freed.
+ */
+
+#define IPSEC_SA_INDEX_MIN_SIZE (1U << 10)
+#define IPSEC_SA_INDEX_MAX_SIZE (1U << 24)
+#define IPSEC_SA_INDEX_LOCKS (1U << 10)
+
+static struct ipsec_sa_link **ipsec_sa_idx;
+static unsigned int ipsec_sa_idx_size;
+static gen_lock_set_t *ipsec_sa_idx_locks;
+
+#define IPSEC_SA_LINK_UE_PORT(_ctx, _l) \
+	((_l)?(_ctx)->ue.port_s:(_ctx)->ue.port_c)
+#define IPSEC_SA_LINK_PORT(_ctx, _l) \
+	((_l)?(_ctx)->me.port_c:(_ctx)->me.port_s)
+#define IPSEC_SA_IDX_LOCK(_hash) \
+	lock_set_get(ipsec_sa_idx_locks, (_hash) & (IPSEC_SA_INDEX_LOCKS - 1))
+#define IPSEC_SA_IDX_UNLOCK(_hash) \
+	lock_set_release(ipsec_sa_idx_locks, (_hash) & (IPSEC_SA_INDEX_LOCKS - 1))
+
+static int ipsec_init_sa_index(void)
+{
+	/* a set takes two SPIs of the range and two links */
+	for (ipsec_sa_idx_size = IPSEC_SA_INDEX_MIN_SIZE;
+			ipsec_sa_idx_size < ipsec_spi_no / 4 &&
+			ipsec_sa_idx_size < IPSEC_SA_INDEX_MAX_SIZE;
+			ipsec_sa_idx_size <<= 1);
+	ipsec_sa_idx = shm_malloc(ipsec_sa_idx_size * sizeof (*ipsec_sa_idx));
+	if (!ipsec_sa_idx) {
+		LM_ERR("oom for IPSec SA index\n");
+		return -1;
+	}
+	memset(ipsec_sa_idx, 0, ipsec_sa_idx_size * sizeof (*ipsec_sa_idx));
+	ipsec_sa_idx_locks = lock_set_alloc(IPSEC_SA_INDEX_LOCKS);
+	if (!ipsec_sa_idx_locks || !lock_set_init(ipsec_sa_idx_locks)) {
+		LM_ERR("could not allocate IPSec SA index locks\n");
+		return -1;
+	}
+	return 0;
+}
+
+static unsigned int ipsec_sa_hash(struct ip_addr *ue_ip,
+		unsigned short ue_port, unsigned short port)
+{
+	unsigned int h = ((unsigned int)ue_port << 16) | port;
+	unsigned int i;
+
+	for (i = 0; i < ue_ip->len / 4; i++)
+		h = (h ^ ue_ip->u.addr32[i]) * 0x9e3779b1U;
+	h ^= h >> 15;
+	h *= 0x85ebca6bU;
+	h ^= h >> 13;
+	return h & (ipsec_sa_idx_size - 1);
+}
+
+static void ipsec_sa_index(struct ipsec_ctx *ctx)
+{
+	struct ipsec_sa_link *link;
+	unsigned int hash;
+	int l;
+
+	for (l = 0; l < 2; l++) {
+		link = &ctx->sa_links[l];
+		hash = ipsec_sa_hash(&ctx->ue.ip, IPSEC_SA_LINK_UE_PORT(ctx, l),
+				IPSEC_SA_LINK_PORT(ctx, l));
+		IPSEC_SA_IDX_LOCK(hash);
+		if (!link->ctx) {
+			link->ctx = ctx;
+			link->next = ipsec_sa_idx[hash];
+			ipsec_sa_idx[hash] = link;
+		}
+		IPSEC_SA_IDX_UNLOCK(hash);
+	}
+}
+
+static void ipsec_sa_unindex(struct ipsec_ctx *ctx)
+{
+	struct ipsec_sa_link *link, **it;
+	unsigned int hash;
+	int l;
+
+	for (l = 0; l < 2; l++) {
+		link = &ctx->sa_links[l];
+		hash = ipsec_sa_hash(&ctx->ue.ip, IPSEC_SA_LINK_UE_PORT(ctx, l),
+				IPSEC_SA_LINK_PORT(ctx, l));
+		IPSEC_SA_IDX_LOCK(hash);
+		if (link->ctx) {
+			for (it = &ipsec_sa_idx[hash]; *it; it = &(*it)->next)
+				if (*it == link) {
+					*it = link->next;
+					break;
+				}
+			link->next = NULL;
+			link->ctx = NULL;
+		}
+		IPSEC_SA_IDX_UNLOCK(hash);
+	}
+}
+
+/* the bucket has to be locked */
+static int ipsec_sa_owner_unsafe(unsigned int hash, struct ip_addr *ue_ip,
+		unsigned short ue_port, struct ip_addr *ip, unsigned short port,
+		int out, unsigned int spi)
+{
+	struct ipsec_sa_link *link;
+	struct ipsec_ctx *ctx;
+	unsigned int ctx_spi;
+	int l, ret = IPSEC_SA_UNKNOWN;
+
+	for (link = ipsec_sa_idx[hash]; link; link = link->next) {
+		ctx = link->ctx;
+		l = link - ctx->sa_links;
+		if (IPSEC_SA_LINK_UE_PORT(ctx, l) != ue_port ||
+				IPSEC_SA_LINK_PORT(ctx, l) != port ||
+				!ip_addr_cmp(&ctx->ue.ip, ue_ip) ||
+				!ip_addr_cmp(&ctx->me.ip, ip))
+			continue;
+		if (out)
+			ctx_spi = (l?ctx->ue.spi_s:ctx->ue.spi_c);
+		else
+			ctx_spi = (l?ctx->me.spi_c:ctx->me.spi_s);
+		if (ctx_spi == spi)
+			return IPSEC_SA_OWNED;
+		ret = IPSEC_SA_SELECTOR;
+	}
+	return ret;
+}
+
+/*
+ * Tells what the SA index knows about the kernel SA with the given SPI
+ * between a port of the UE and a port of ours, towards the UE (out) or
+ * towards us: one of the IPSEC_SA_* values.
+ */
+int ipsec_sa_owner(struct ip_addr *ue_ip, unsigned short ue_port,
+		struct ip_addr *ip, unsigned short port, int out, unsigned int spi)
+{
+	unsigned int hash = ipsec_sa_hash(ue_ip, ue_port, port);
+	int ret;
+
+	IPSEC_SA_IDX_LOCK(hash);
+	ret = ipsec_sa_owner_unsafe(hash, ue_ip, ue_port, ip, port, out, spi);
+	IPSEC_SA_IDX_UNLOCK(hash);
+	return ret;
+}
+
+/*
  * Hash map
  */
 
@@ -259,6 +418,8 @@ static void ipsec_spi_release(struct ipsec_spi *spi)
 int ipsec_init(void)
 {
 	if (ipsec_init_spi() < 0)
+		return -1;
+	if (ipsec_init_sa_index() < 0)
 		return -1;
 
 	ipsec_seq = rand();
@@ -300,6 +461,12 @@ void ipsec_destroy(void)
 	if (ipsec_spi_lock)
 		lock_destroy(ipsec_spi_lock);
 	shm_free(ipsec_spi_map);
+	if (ipsec_sa_idx_locks) {
+		lock_set_destroy(ipsec_sa_idx_locks);
+		lock_set_dealloc(ipsec_sa_idx_locks);
+	}
+	if (ipsec_sa_idx)
+		shm_free(ipsec_sa_idx);
 	/* Cleanup NAT-T encap sockets */
 	ipsec_encap_destroy();
 }
@@ -1017,7 +1184,10 @@ int ipsec_sa_add(struct mnl_socket *sock, struct ipsec_ctx *ctx,
  * make room for a new set using the same ports, or with the last reference.
  *
  * Lock order: user map -> user -> lifetime list -> ctx.  Nothing is freed
- * and no netlink I/O is done with the lifetime list locked.
+ * and no netlink I/O is done with the lifetime list locked.  The buckets of
+ * the SA index are locked last, with no other lock taken inside; only the
+ * reconciliation holds two of them at once (in the order of their locks),
+ * and does netlink I/O with them when it deletes an orphan.
  */
 
 #define IPSEC_GET_CTX() ((struct ipsec_ctx *)context_get_ptr(CONTEXT_GLOBAL, \
@@ -1041,6 +1211,7 @@ void ipsec_sa_rm_all(struct ipsec_socket *sock, struct ipsec_ctx *ctx)
 	lock_release(&ctx->lock);
 	if (removed)
 		return;
+	ipsec_sa_unindex(ctx);
 	ipsec_sa_rm(sock, ctx, IPSEC_POLICY_IN, 0);
 	ipsec_sa_rm(sock, ctx, IPSEC_POLICY_OUT, 0);
 	ipsec_sa_rm(sock, ctx, IPSEC_POLICY_IN, 1);
@@ -1049,9 +1220,12 @@ void ipsec_sa_rm_all(struct ipsec_socket *sock, struct ipsec_ctx *ctx)
 
 int ipsec_sa_add_all(struct ipsec_socket *sock, struct ipsec_ctx *ctx)
 {
+	/* indexed first: the reconciliation must not take the new SAs (or the
+	 * ones a restored set finds in the kernel) for orphans */
+	ipsec_sa_index(ctx);
 	if (ipsec_sa_add(sock, ctx, IPSEC_POLICY_IN, 0) < 0) {
 		LM_ERR("could not add UE(uc)->P(ps) SA\n");
-		return -5;
+		goto release_sa0;
 	}
 	if (ipsec_sa_add(sock, ctx, IPSEC_POLICY_OUT, 0) < 0) {
 		LM_ERR("could not add P(ps)->UE(uc) SA\n");
@@ -1076,6 +1250,8 @@ release_sa2:
 	ipsec_sa_rm(sock, ctx, IPSEC_POLICY_OUT, 0);
 release_sa1:
 	ipsec_sa_rm(sock, ctx, IPSEC_POLICY_IN, 0);
+release_sa0:
+	ipsec_sa_unindex(ctx);
 	return -5;
 }
 
@@ -1086,6 +1262,7 @@ static void ipsec_ctx_free(struct ipsec_ctx *ctx)
 		ipsec_sa_rm_all(sock, ctx);
 		ipsec_sock_close(sock);
 	}
+	ipsec_sa_unindex(ctx); /* whatever happened to its SAs */
 	if (ctx->user)
 		ipsec_ctx_release_user(ctx);
 	ipsec_spi_release(ctx->spi_s);
@@ -1541,18 +1718,24 @@ void ipsec_ctx_release_user(struct ipsec_ctx *ctx)
 }
 
 /*
- * XFRM reconciliation: kernel SAs tagged with IPSEC_USER_SELECTOR that no
- * live TMP/OK ctx claims are orphans (TMP expiry leak before the refcount
- * fix, leftovers after a hostNetwork restart, or a failed create that left
- * a selector behind). Delete them after reconcile_grace seconds.
+ * XFRM reconciliation: kernel SAs tagged with IPSEC_USER_SELECTOR that are
+ * not in the SA index are orphans (TMP expiry leak before the refcount fix,
+ * leftovers after a hostNetwork restart, or a failed create that left a
+ * selector behind). Delete them after reconcile_grace seconds.
+ *
+ * It runs in a process of its own, a pass every reconcile_interval seconds,
+ * reading the SAD dump in pieces and at most reconcile_rate SAs per second:
+ * neither the timer nor the SIP workers wait for it, whatever the number of
+ * SAs.
  */
-struct ipsec_xfrm_orphan {
-	unsigned int spi;
-	int family;
-	xfrm_address_t daddr;
-	xfrm_address_t saddr;
-	struct xfrm_selector sel;
-	struct ipsec_xfrm_orphan *next;
+#define IPSEC_RECONCILE_BUF_SIZE 32768
+#define IPSEC_RECONCILE_SLOT 100000 /* microseconds */
+
+struct ipsec_reconcile {
+	struct ipsec_socket *sock; /* for the deletes, opened when needed */
+	time_t now;
+	unsigned int examined;
+	unsigned int deleted;
 };
 
 static void xfrm_addr_to_ip(int family, const xfrm_address_t *a, struct ip_addr *ip)
@@ -1569,78 +1752,65 @@ static void xfrm_addr_to_ip(int family, const xfrm_address_t *a, struct ip_addr 
 	}
 }
 
-static int ipsec_xfrm_dump_cb(const struct nlmsghdr *nlh, void *data)
+/*
+ * Sends a request and returns the answer of the kernel: 0 or a negative
+ * errno.  The kernel answers within the send, so nothing is waited for.
+ */
+static int ipsec_xfrm_request(struct ipsec_socket *sock, struct nlmsghdr *nlh)
 {
-	struct xfrm_usersa_info *sa;
-	struct ipsec_xfrm_orphan **head = data;
-	struct ipsec_xfrm_orphan *o;
-	struct ip_addr src, dst;
-	unsigned short sport, dport;
-	time_t now, age;
+	char buf[MNL_SOCKET_BUFFER_SIZE];
+	int ret;
 
-	if (nlh->nlmsg_type != XFRM_MSG_NEWSA)
-		return MNL_CB_OK;
-	sa = mnl_nlmsg_get_payload(nlh);
-	if (sa->sel.user != IPSEC_USER_SELECTOR)
-		return MNL_CB_OK;
-
-	now = time(NULL);
-	age = (sa->curlft.add_time && now > (time_t)sa->curlft.add_time) ?
-		(now - (time_t)sa->curlft.add_time) : (time_t)ipsec_reconcile_grace + 1;
-	if (age < (time_t)ipsec_reconcile_grace)
-		return MNL_CB_OK;
-
-	xfrm_addr_to_ip(sa->sel.family, &sa->sel.saddr, &src);
-	xfrm_addr_to_ip(sa->sel.family, &sa->sel.daddr, &dst);
-	sport = ntohs(sa->sel.sport);
-	dport = ntohs(sa->sel.dport);
-	if (ipsec_users_claim_port(&src, sport) || ipsec_users_claim_port(&src, dport) ||
-			ipsec_users_claim_port(&dst, sport) || ipsec_users_claim_port(&dst, dport))
-		return MNL_CB_OK;
-
-	o = pkg_malloc(sizeof(*o));
-	if (!o) {
-		LM_ERR("oom for XFRM orphan\n");
-		return MNL_CB_OK;
-	}
-	memset(o, 0, sizeof(*o));
-	o->spi = ntohl(sa->id.spi);
-	o->family = sa->sel.family;
-	o->daddr = sa->id.daddr;
-	o->saddr = sa->saddr;
-	o->sel = sa->sel;
-	o->next = *head;
-	*head = o;
-	return MNL_CB_OK;
+	nlh->nlmsg_flags |= NLM_F_ACK;
+	if (mnl_socket_sendto(sock, nlh, nlh->nlmsg_len) < 0)
+		return -errno;
+	ret = recv(mnl_socket_get_fd(sock), buf, sizeof buf, MSG_DONTWAIT);
+	if (ret < 0)
+		return -errno;
+	nlh = (struct nlmsghdr *)buf;
+	if (!mnl_nlmsg_ok(nlh, ret) || nlh->nlmsg_type != NLMSG_ERROR)
+		return -EPROTO;
+	return ((struct nlmsgerr *)mnl_nlmsg_get_payload(nlh))->error;
 }
 
-static void ipsec_xfrm_del_orphan(struct ipsec_socket *sock, struct ipsec_xfrm_orphan *o)
+/*
+ * Returns 1 if the SA was deleted, 0 if not - most likely it is gone
+ * already: the dump is a little behind, and its set may have been removed
+ * since.  Whoever removed the SA takes care of its policies, too.
+ */
+static int ipsec_xfrm_del_orphan(struct ipsec_socket *sock,
+		struct xfrm_usersa_info *sa, int policies)
 {
 	char buf[MNL_SOCKET_BUFFER_SIZE];
 	struct nlmsghdr *nlh;
 	struct xfrm_usersa_id *sa_id;
 	struct xfrm_userpolicy_id *policy_id;
-	int dir;
+	int dir, ret;
 
 	memset(buf, 0, sizeof buf);
 	nlh = mnl_nlmsg_put_header(buf);
-	if (nlh) {
-		nlh->nlmsg_flags = NLM_F_REQUEST;
-		nlh->nlmsg_type = XFRM_MSG_DELSA;
-		nlh->nlmsg_seq = ++ipsec_seq;
-		sa_id = mnl_nlmsg_put_extra_header(nlh, sizeof(*sa_id));
-		if (sa_id) {
-			sa_id->spi = htonl(o->spi);
-			sa_id->proto = IPPROTO_ESP;
-			sa_id->family = o->family;
-			sa_id->daddr = o->daddr;
-			mnl_attr_put(nlh, XFRMA_SRCADDR, sizeof(o->saddr), &o->saddr);
-			if (mnl_socket_sendto(sock, nlh, nlh->nlmsg_len) < 0)
-				LM_ERR("reconcile DELSA spi=%u: %s\n", o->spi, strerror(errno));
-		}
+	if (!nlh)
+		return 0;
+	nlh->nlmsg_flags = NLM_F_REQUEST;
+	nlh->nlmsg_type = XFRM_MSG_DELSA;
+	nlh->nlmsg_seq = ++ipsec_seq;
+	sa_id = mnl_nlmsg_put_extra_header(nlh, sizeof(*sa_id));
+	if (!sa_id)
+		return 0;
+	sa_id->spi = sa->id.spi;
+	sa_id->proto = IPPROTO_ESP;
+	sa_id->family = sa->sel.family;
+	sa_id->daddr = sa->id.daddr;
+	mnl_attr_put(nlh, XFRMA_SRCADDR, sizeof(sa->saddr), &sa->saddr);
+	ret = ipsec_xfrm_request(sock, nlh);
+	if (ret < 0) {
+		if (ret != -ESRCH)
+			LM_ERR("reconcile DELSA spi=%u: %s\n", ntohl(sa->id.spi),
+					strerror(-ret));
+		return 0;
 	}
 
-	for (dir = XFRM_POLICY_IN; dir <= XFRM_POLICY_OUT; dir++) {
+	for (dir = XFRM_POLICY_IN; policies && dir <= XFRM_POLICY_OUT; dir++) {
 		memset(buf, 0, sizeof buf);
 		nlh = mnl_nlmsg_put_header(buf);
 		if (!nlh)
@@ -1652,24 +1822,103 @@ static void ipsec_xfrm_del_orphan(struct ipsec_socket *sock, struct ipsec_xfrm_o
 		if (!policy_id)
 			continue;
 		policy_id->dir = dir;
-		policy_id->sel = o->sel;
-		mnl_socket_sendto(sock, nlh, nlh->nlmsg_len);
+		policy_id->sel = sa->sel;
+		/* the policy exists in one direction only */
+		ipsec_xfrm_request(sock, nlh);
 	}
-	LM_INFO("reconciled orphan XFRM SA spi=%u\n", o->spi);
+	return 1;
 }
 
-static void ipsec_xfrm_reconcile(void)
+static int ipsec_xfrm_dump_cb(const struct nlmsghdr *nlh, void *data)
 {
-	char buf[MNL_SOCKET_BUFFER_SIZE];
+	struct xfrm_usersa_info *sa;
+	struct ipsec_reconcile *r = data;
+	struct ip_addr src, dst;
+	unsigned short sport, dport;
+	unsigned int spi, hash_in, hash_out, lock_in, lock_out;
+	int in, out;
+	time_t age;
+
+	if (nlh->nlmsg_type != XFRM_MSG_NEWSA)
+		return MNL_CB_OK;
+	r->examined++;
+	sa = mnl_nlmsg_get_payload(nlh);
+	if (sa->sel.user != IPSEC_USER_SELECTOR)
+		return MNL_CB_OK;
+
+	age = (sa->curlft.add_time && r->now > (time_t)sa->curlft.add_time) ?
+		(r->now - (time_t)sa->curlft.add_time) : (time_t)ipsec_reconcile_grace + 1;
+	if (age < (time_t)ipsec_reconcile_grace)
+		return MNL_CB_OK;
+
+	xfrm_addr_to_ip(sa->sel.family, &sa->sel.saddr, &src);
+	xfrm_addr_to_ip(sa->sel.family, &sa->sel.daddr, &dst);
+	sport = ntohs(sa->sel.sport);
+	dport = ntohs(sa->sel.dport);
+	spi = ntohl(sa->id.spi);
+
+	/*
+	 * The SA of a set runs from the UE to us or from us to the UE.  Both
+	 * buckets stay locked until the orphan is gone: a set that takes over
+	 * its selector is indexed before its SAs and policies are added (see
+	 * ipsec_sa_add_all()), so it either is seen here or adds them after
+	 * the delete - the policies are deleted by selector.
+	 */
+	hash_in = ipsec_sa_hash(&src, sport, dport);
+	hash_out = ipsec_sa_hash(&dst, dport, sport);
+	lock_in = hash_in & (IPSEC_SA_INDEX_LOCKS - 1);
+	lock_out = hash_out & (IPSEC_SA_INDEX_LOCKS - 1);
+	lock_set_get(ipsec_sa_idx_locks, (lock_in < lock_out?lock_in:lock_out));
+	if (lock_in != lock_out)
+		lock_set_get(ipsec_sa_idx_locks, (lock_in < lock_out?lock_out:lock_in));
+	in = ipsec_sa_owner_unsafe(hash_in, &src, sport, &dst, dport, 0, spi);
+	out = ipsec_sa_owner_unsafe(hash_out, &dst, dport, &src, sport, 1, spi);
+	if (in == IPSEC_SA_OWNED || out == IPSEC_SA_OWNED) {
+		spi = 0;
+	} else {
+		if (!r->sock)
+			r->sock = ipsec_sock_new();
+		/* the policies of a selector that a set uses are the ones of
+		 * that set */
+		if (!r->sock || !ipsec_xfrm_del_orphan(r->sock, sa,
+				in == IPSEC_SA_UNKNOWN && out == IPSEC_SA_UNKNOWN))
+			spi = 0;
+	}
+	if (lock_in != lock_out)
+		lock_set_release(ipsec_sa_idx_locks, (lock_in < lock_out?lock_out:lock_in));
+	lock_set_release(ipsec_sa_idx_locks, (lock_in < lock_out?lock_in:lock_out));
+
+	if (spi) {
+		r->deleted++;
+		LM_INFO("reconciled orphan XFRM SA spi=%u\n", spi);
+	}
+	return MNL_CB_OK;
+}
+
+static unsigned long long ipsec_reconcile_clock(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
+}
+
+/* one pass over the SAD */
+void ipsec_xfrm_reconcile(void)
+{
+	static char buf[IPSEC_RECONCILE_BUF_SIZE];
 	struct nlmsghdr *nlh;
 	struct ipsec_socket *sock;
-	struct ipsec_xfrm_orphan *head = NULL, *o, *next;
-	int ret, deleted = 0;
+	struct ipsec_reconcile r;
+	unsigned long long start, slot, now;
+	unsigned int slot_examined = 0, batch;
+	int ret;
 
 	sock = ipsec_sock_new();
 	if (!sock)
 		return;
 
+	memset(&r, 0, sizeof r);
 	memset(buf, 0, sizeof buf);
 	nlh = mnl_nlmsg_put_header(buf);
 	if (!nlh)
@@ -1681,24 +1930,45 @@ static void ipsec_xfrm_reconcile(void)
 		LM_ERR("reconcile GETSA dump: %s\n", strerror(errno));
 		goto out;
 	}
-	ret = mnl_socket_recvfrom(sock, buf, sizeof buf);
-	while (ret > 0) {
-		ret = mnl_cb_run(buf, ret, 0, 0, ipsec_xfrm_dump_cb, &head);
+	batch = ipsec_reconcile_rate / (1000000 / IPSEC_RECONCILE_SLOT);
+	if (ipsec_reconcile_rate && !batch)
+		batch = 1;
+	start = slot = ipsec_reconcile_clock();
+	/* the kernel walks on in its SAD with each receive, a buffer at a time */
+	while ((ret = mnl_socket_recvfrom(sock, buf, sizeof buf)) > 0) {
+		r.now = time(NULL);
+		ret = mnl_cb_run(buf, ret, 0, 0, ipsec_xfrm_dump_cb, &r);
 		if (ret <= MNL_CB_STOP)
 			break;
-		ret = mnl_socket_recvfrom(sock, buf, sizeof buf);
+		if (batch && r.examined - slot_examined >= batch) {
+			now = ipsec_reconcile_clock();
+			if (now - slot < IPSEC_RECONCILE_SLOT)
+				usleep(IPSEC_RECONCILE_SLOT - (now - slot));
+			slot = ipsec_reconcile_clock();
+			slot_examined = r.examined;
+		}
 	}
+	if (ret < 0)
+		LM_ERR("reconcile GETSA dump: %s\n", strerror(errno));
 
-	for (o = head; o; o = next) {
-		next = o->next;
-		ipsec_xfrm_del_orphan(sock, o);
-		deleted++;
-		pkg_free(o);
-	}
-	if (deleted)
-		LM_INFO("XFRM reconcile removed %d orphan SA(s)\n", deleted);
+	if (r.deleted)
+		LM_INFO("XFRM reconcile removed %u orphan SA(s)\n", r.deleted);
+	update_stat(ipsec_reconcile_passes, 1);
+	update_stat(ipsec_reconcile_sas, r.examined);
+	update_stat(ipsec_reconcile_orphans, r.deleted);
+	update_stat(ipsec_reconcile_ms, (ipsec_reconcile_clock() - start) / 1000);
 out:
+	if (r.sock)
+		ipsec_sock_close(r.sock);
 	ipsec_sock_close(sock);
+}
+
+void ipsec_reconcile_proc(int rank)
+{
+	for (;;) {
+		sleep(ipsec_reconcile_interval);
+		ipsec_xfrm_reconcile();
+	}
 }
 
 #define IPSEC_TIMER_BATCH 256
@@ -1751,12 +2021,6 @@ void ipsec_ctx_timer(unsigned int ticks, void* param)
 		if (sock)
 			ipsec_sock_close(sock);
 	} while (n == IPSEC_TIMER_BATCH);
-
-	if (ipsec_reconcile_interval &&
-			++ipsec_reconcile_tick >= ipsec_reconcile_interval) {
-		ipsec_reconcile_tick = 0;
-		ipsec_xfrm_reconcile();
-	}
 }
 
 void ipsec_ctx_extend_tmp(struct ipsec_ctx *ctx)
