@@ -263,6 +263,13 @@ static void ipsec_spi_release(struct ipsec_spi *spi)
  * The bucket locks are taken last (see the lock order below) and only the
  * read-only values of a ctx are used with them: a ctx is unlinked before it
  * is freed.
+ *
+ * A selector is linked at most once: the kernel holds one XFRM policy per
+ * selector and deletes it by selector, so a second set on the same ports
+ * would neither work nor leave the first one alone when it is removed.  The
+ * sets of one user are sorted out before (ipsec_ctx_challenge_user()); what
+ * is refused here is a set on ports that a set of another user behind the
+ * same address is using (3GPP TS 33.203 7.1, rule 3).
  */
 
 #define IPSEC_SA_INDEX_MIN_SIZE (1U << 10)
@@ -317,24 +324,41 @@ static unsigned int ipsec_sa_hash(struct ip_addr *ue_ip,
 	return h & (ipsec_sa_idx_size - 1);
 }
 
-static void ipsec_sa_index(struct ipsec_ctx *ctx)
+static int ipsec_sa_owner_unsafe(unsigned int hash, struct ip_addr *ue_ip,
+		unsigned short ue_port, struct ip_addr *ip, unsigned short port,
+		int out, unsigned int spi);
+static void ipsec_sa_unindex(struct ipsec_ctx *ctx);
+
+/* returns -1, with nothing linked, if another set uses one of the selectors */
+static int ipsec_sa_index(struct ipsec_ctx *ctx)
 {
 	struct ipsec_sa_link *link;
 	unsigned int hash;
-	int l;
+	int l, used;
 
 	for (l = 0; l < 2; l++) {
 		link = &ctx->sa_links[l];
 		hash = ipsec_sa_hash(&ctx->ue.ip, IPSEC_SA_LINK_UE_PORT(ctx, l),
 				IPSEC_SA_LINK_PORT(ctx, l));
 		IPSEC_SA_IDX_LOCK(hash);
+		used = 0;
 		if (!link->ctx) {
-			link->ctx = ctx;
-			link->next = ipsec_sa_idx[hash];
-			ipsec_sa_idx[hash] = link;
+			used = (ipsec_sa_owner_unsafe(hash, &ctx->ue.ip,
+					IPSEC_SA_LINK_UE_PORT(ctx, l), &ctx->me.ip,
+					IPSEC_SA_LINK_PORT(ctx, l), 0, 0) != IPSEC_SA_UNKNOWN);
+			if (!used) {
+				link->ctx = ctx;
+				link->next = ipsec_sa_idx[hash];
+				ipsec_sa_idx[hash] = link;
+			}
 		}
 		IPSEC_SA_IDX_UNLOCK(hash);
+		if (used) {
+			ipsec_sa_unindex(ctx);
+			return -1;
+		}
 	}
+	return 0;
 }
 
 static void ipsec_sa_unindex(struct ipsec_ctx *ctx)
@@ -1169,7 +1193,8 @@ int ipsec_sa_add(struct mnl_socket *sock, struct ipsec_ctx *ctx,
  *                timer, or ipsec_ctx_confirm() when the 200 OK turns a
  *                temporary set into an established one.
  *  transaction   taken by ipsec_handle_register_req() for the REGISTER that
- *                arrived over the set, dropped by tm with the transaction.
+ *                arrived over the set and by ipsec_create() for the set the
+ *                401 to it created, dropped by tm with the transaction.
  *  processing    the lookups (ipsec_get_ctx_user(), ipsec_ctx_find(),
  *                ipsec_get_ctx_ip_port()) return a referenced ctx; the caller
  *                drops it or hands it over to the processing context.
@@ -1222,7 +1247,12 @@ int ipsec_sa_add_all(struct ipsec_socket *sock, struct ipsec_ctx *ctx)
 {
 	/* indexed first: the reconciliation must not take the new SAs (or the
 	 * ones a restored set finds in the kernel) for orphans */
-	ipsec_sa_index(ctx);
+	if (ipsec_sa_index(ctx) < 0) {
+		LM_ERR("UE ports %hu/%hu of %s are bound to another set of security"
+				" associations\n", ctx->ue.port_c, ctx->ue.port_s,
+				ip_addr2a(&ctx->ue.ip));
+		return -5;
+	}
 	if (ipsec_sa_add(sock, ctx, IPSEC_POLICY_IN, 0) < 0) {
 		LM_ERR("could not add UE(uc)->P(ps) SA\n");
 		goto release_sa0;

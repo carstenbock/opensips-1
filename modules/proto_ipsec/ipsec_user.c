@@ -247,7 +247,8 @@ static struct ipsec_user *ipsec_get_create_user(struct ipsec_map_node *node,
 	list_add(&user->list, &uimpi->users);
 	return user;
 error:
-	if (list_empty(&uimpi->users)) {
+	/* no uimpi if its allocation failed */
+	if (uimpi && list_empty(&uimpi->users)) {
 		list_del(&uimpi->list);
 		shm_free(uimpi);
 	}

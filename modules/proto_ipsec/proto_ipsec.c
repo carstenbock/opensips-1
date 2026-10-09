@@ -46,6 +46,9 @@
 
 #define IPSEC_CTX_TM_GET(t) ((struct ipsec_ctx *) tm_ipsec.t_ctx_get_ptr(t, ipsec_ctx_tm_idx))
 #define IPSEC_CTX_TM_PUT(t, ctx) tm_ipsec.t_ctx_put_ptr(t, ipsec_ctx_tm_idx, ctx)
+/* the set that a 401 to the REGISTER of the transaction created */
+#define IPSEC_CTX_TM_NEW_GET(t) ((struct ipsec_ctx *) tm_ipsec.t_ctx_get_ptr(t, ipsec_ctx_tm_new_idx))
+#define IPSEC_CTX_TM_NEW_PUT(t, ctx) tm_ipsec.t_ctx_put_ptr(t, ipsec_ctx_tm_new_idx, ctx)
 
 
 extern int is_tcp_main;
@@ -55,6 +58,7 @@ static str ipsec_allowed_algorithms;
 static struct tm_binds tm_ipsec;
 static usrloc_api_t ul_ipsec;
 static int ipsec_ctx_tm_idx = -1;
+static int ipsec_ctx_tm_new_idx = -1;
 
 static int ipsec_port = IPSEC_DEFAULT_PORT;
 
@@ -365,6 +369,7 @@ static int mod_init(void)
 	}
 
 	ipsec_ctx_tm_idx = tm_ipsec.t_ctx_register_ptr((context_destroy_f)ipsec_ctx_release);
+	ipsec_ctx_tm_new_idx = tm_ipsec.t_ctx_register_ptr((context_destroy_f)ipsec_ctx_release);
 
 	if (load_ul_api(&ul_ipsec) != 0) {
 		LM_ERR("can't load usrloc API\n");
@@ -795,6 +800,38 @@ static auth_body_t *ipsec_get_auth(struct sip_msg *msg)
 	return NULL;
 }
 
+/*
+ * Returns the AKA credentials of a request that other processes use as well
+ * (the shm clone a transaction keeps of its request), or NULL.  They are
+ * parsed into a copy of the header: parse_credentials() would attach memory
+ * of this process to the shared request, where another process (a further
+ * reply to the same REGISTER, save() on its 200 OK, the failover handling
+ * of tm) follows or frees that pointer in its own private memory.
+ * No further headers are parsed, for the same reason.  The result has to be
+ * released with free_credentials().
+ */
+static auth_body_t *ipsec_get_shared_auth(struct sip_msg *msg)
+{
+	struct hdr_field *hdr, tmp;
+	auth_body_t *auth;
+
+	for (hdr = msg->headers; hdr; hdr = hdr->next) {
+		if (hdr->type != HDR_AUTHORIZATION_T)
+			continue;
+		tmp = *hdr;
+		tmp.parsed = NULL;
+		if (parse_credentials(&tmp) != 0) {
+			LM_ERR("could not parse Authorization header!\n");
+			continue;
+		}
+		auth = tmp.parsed;
+		if (ALG_IS_AKAv1(auth->digest.alg.alg_parsed))
+			return auth;
+		free_credentials(&auth);
+	}
+	return NULL;
+}
+
 /* check if it was received on one of our listening interfaces */
 static struct socket_info *ipsec_get_socket_info(const struct socket_info *bind_address)
 {
@@ -916,23 +953,33 @@ static int w_ipsec_create(struct sip_msg *msg, int *_port_ps, int *_port_pc,
 		return -1;
 	}
 
-	a = ipsec_get_auth(req);
+	/* the request is shared with other processes: nothing is attached to it */
+	a = ipsec_get_shared_auth(req);
 	if (!auth) {
 		LM_DBG("could not find any auth header!\n");
+		if (a)
+			free_credentials(&a);
 		return -1;
 	}
 	impu = aka_get_public_identity(msg, HDR_AUTHORIZATION_T);
 	if (!impu) {
 		LM_DBG("could not get public identity!\n");
+		if (a)
+			free_credentials(&a);
 		return -1;
 	}
 	impi = aka_get_private_identity(msg, a, HDR_AUTHORIZATION_T);
 	if (!impi) {
 		LM_DBG("could not get private identity!\n");
+		if (a)
+			free_credentials(&a);
 		return -1;
 	}
 
 	user = ipsec_get_user(&req->rcv.src_ip, impi, impu);
+	/* impi was part of the credentials */
+	if (a)
+		free_credentials(&a);
 	if (!user) {
 		LM_WARN("could not get a new IPSec user\n");
 		return -1;
@@ -947,6 +994,30 @@ static int w_ipsec_create(struct sip_msg *msg, int *_port_ps, int *_port_pc,
 		goto release_user;
 	}
 	/* TODO: double check for sec-agree in Required/Supported */
+
+	/*
+	 * One set of security associations per REGISTER.  tm runs the reply
+	 * route for every reply of the transaction, also for the ones it does
+	 * not relay: a retransmitted 401, or the 401 of another branch after a
+	 * DNS failover.  Such a reply must not replace the set the first 401
+	 * created (the UE may have established it already) - it gets the same
+	 * Security-Server header if it is the same challenge, nothing otherwise.
+	 * The reply lock of the transaction (tm's onreply_avp_mode) keeps two
+	 * replies from getting here at the same time.
+	 */
+	ctx = IPSEC_CTX_TM_NEW_GET(t);
+	if (ctx) {
+		if (IPSEC_CTX_LIVE(ctx) && str_match(&ctx->ck, &auth->ck) &&
+				str_match(&ctx->ik, &auth->ik) &&
+				ipsec_add_security_server(msg, ctx) == 0) {
+			ret = 1;
+		} else {
+			LM_INFO("401 for a REGISTER that got its set of security"
+					" associations (ctx %p) with an earlier 401 - ignoring\n", ctx);
+			ret = -1;
+		}
+		goto release_user;
+	}
 
 	sa = ipsec_get_security_client(req, algos);
 	if (!sa) {
@@ -1030,6 +1101,9 @@ static int w_ipsec_create(struct sip_msg *msg, int *_port_ps, int *_port_pc,
 	/* add the context as temporarily */
 	ipsec_ctx_push_user(user, ctx, IPSEC_STATE_TMP);
 	ipsec_sock_close(sock);
+	/* the transaction remembers the set it got, with a reference */
+	IPSEC_CTX_REF(ctx);
+	IPSEC_CTX_TM_NEW_PUT(t, ctx);
 
 	ipsec_release_user(user);
 
