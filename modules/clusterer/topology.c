@@ -1403,6 +1403,18 @@ void handle_pong(bin_packet_t *received, node_info_t *src_node,
 		*ev_actions_required = 1;
 
 		LM_INFO("Node [%d] is UP\n", src_node->node_id);
-	} else
+	} else {
+		/* LS_TEMP is only a hand-over to the check above; the heartbeat
+		 * timer has no case for it. A reply that was received before the
+		 * latest ping was sent (it waited in the queue of a busy reader)
+		 * fails that check, and the link would stay in LS_TEMP - shown as
+		 * "Probe" - for good, never pinged again. Start the ping sequence
+		 * over instead. */
+		if (src_node->link_state == LS_TEMP) {
+			LM_INFO("late ping reply from node [%d], restarting the ping "
+				"sequence\n", src_node->node_id);
+			src_node->link_state = LS_RESTART_PINGING;
+		}
 		lock_release(src_node->lock);
+	}
 }
