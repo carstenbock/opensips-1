@@ -195,6 +195,12 @@ static const param_export_t params[] = {
 	 * Falls back to software if hardware offload fails.
 	 */
 	{ "hw_offload_interface",			STR_PARAM, &ipsec_hw_offload_interface },
+	/*
+	 * Static policies (ADR-0032, default on): one XFRM policy per protected
+	 * port and direction instead of four per registration; transport-mode
+	 * sets add SAs only. 0 restores the per-UE policies.
+	 */
+	{ "static_policies",				INT_PARAM, &ipsec_static_policies },
 	{0, 0, 0}
 };
 
@@ -221,6 +227,8 @@ static const stat_export_t mod_stats[] = {
 	{ "sa_errors",			0, &ipsec_sa_errors },
 	{ "reconcile_deferred",	0, &ipsec_reconcile_deferred },
 	{ "restore_failures",	0, &ipsec_restore_failures },
+	{ "static_policies",	0, &ipsec_static_policies_installed },
+	{ "legacy_purged",		0, &ipsec_legacy_purged },
 	{0, 0, 0}
 };
 
@@ -403,6 +411,26 @@ static int mod_init(void)
 	if (ipsec_map_init() < 0) {
 		LM_ERR("could not initiate IPSec map\n");
 		return -1;
+	}
+	if (ipsec_static_policies) {
+		struct socket_info_full *it;
+		struct ipsec_socket *sock = ipsec_sock_new();
+		if (!sock) {
+			LM_ERR("could not open the XFRM socket for the static policies\n");
+			return -1;
+		}
+		/* before the static ones go in: a previous version's per-UE
+		 * policies and SAs (reqid = SPI) must not stay behind */
+		if (ipsec_legacy_purge() < 0)
+			LM_WARN("could not purge per-UE policies of a previous version\n");
+		for (it = protos[PROTO_IPSEC].listeners; it; it = it->next) {
+			if (ipsec_static_policy_add(sock, &it->socket_info.address,
+					it->socket_info.port_no) < 0) {
+				ipsec_sock_close(sock);
+				return -1;
+			}
+		}
+		ipsec_sock_close(sock);
 	}
 	if (register_script_cb(ipsec_pre_script_handler,
 			REQ_TYPE_CB|RPL_TYPE_CB|PRE_SCRIPT_CB, NULL) != 0) {

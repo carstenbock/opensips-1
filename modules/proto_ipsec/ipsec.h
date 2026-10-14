@@ -184,6 +184,14 @@ extern stat_var *ipsec_sa_errors;
  * that could not allocate their security context */
 extern stat_var *ipsec_reconcile_deferred;
 extern stat_var *ipsec_restore_failures;
+extern stat_var *ipsec_static_policies_installed;
+extern stat_var *ipsec_legacy_purged;
+/* static policies (ADR-0032): module parameter, install, purge of the
+ * previous version's per-UE transport-mode policies and SAs */
+extern unsigned int ipsec_static_policies;
+int ipsec_static_policy_add(struct ipsec_socket *sock, struct ip_addr *ip,
+		unsigned short port);
+int ipsec_legacy_purge(void);
 /* a usrloc contact is being restored: holds the reconciler back */
 void ipsec_note_restore(void);
 

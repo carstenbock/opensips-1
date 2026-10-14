@@ -108,6 +108,23 @@ stat_var *ipsec_sa_exists;
 stat_var *ipsec_sa_errors;
 stat_var *ipsec_reconcile_deferred;
 stat_var *ipsec_restore_failures;
+stat_var *ipsec_static_policies_installed;
+stat_var *ipsec_legacy_purged;
+
+/*
+ * Static policies (ADR-0032): one XFRM policy per protected server port and
+ * direction, installed once, with a transport-mode template and reqid 0;
+ * the registrations add only their SAs, whose port selectors pick them.
+ * Per-UE policies cost a route-cache invalidation per insert and a policy
+ * chain per address (KI-31). Sets in UDP-encapsulated tunnel mode keep their
+ * per-UE policies: the kernel resolves a tunnel template by its addresses.
+ */
+unsigned int ipsec_static_policies = 1;
+
+static inline int ipsec_ctx_static(struct ipsec_ctx *ctx)
+{
+	return ipsec_static_policies && ctx->mode == IPSEC_MODE_TRANSPORT;
+}
 
 /* when a usrloc contact was last restored (shared: the restore runs in a
  * SIP worker, the reconciler is its own process); set at start-up so the
@@ -799,6 +816,11 @@ void ipsec_sa_rm(struct ipsec_socket *sock, struct ipsec_ctx *ctx,
 
 	if (mnl_socket_sendto(sock, nlh, nlh->nlmsg_len) < 0)
 		LM_ERR("communicating with kernel for removing SA: %s\n", strerror(errno));
+	if (ipsec_ctx_static(ctx)) {
+		LM_DBG("removed %s:%hu -> %s:%hu SA (SPI %u); policy is static\n",
+				ip_addr2a(&src->ip), src_port, ip_addr2a(&dst->ip), dst_port, spi);
+		return;
+	}
 
 	/* remove policy */
 	memset(buf, 0, sizeof buf);
@@ -1040,7 +1062,9 @@ static int _ipsec_sa_add(struct mnl_socket *sock, struct ipsec_ctx *ctx,
 	sa_info->lft.hard_packet_limit = XFRM_INF;
 
 	sa_info->seq = ipsec_seq;
-	sa_info->reqid = htonl(spi);
+	/* an SA found through a static policy must carry its reqid (0):
+	 * outbound selection compares the two exactly */
+	sa_info->reqid = ipsec_ctx_static(ctx) ? 0 : htonl(spi);
 	sa_info->family = dst->ip.af;
 	sa_info->replay_window = 32;
 
@@ -1118,6 +1142,12 @@ static int _ipsec_sa_add(struct mnl_socket *sock, struct ipsec_ctx *ctx,
 	}
 
 	ipsec_xfrm_add_checked(sock, nlh, "SA", src, src_port, dst, dst_port, spi);
+
+	if (ipsec_ctx_static(ctx)) {
+		LM_DBG("created %s:%hu -> %s:%hu SA (SPI %u) under the static policy\n",
+				ip_addr2a(&src->ip), src_port, ip_addr2a(&dst->ip), dst_port, spi);
+		return 0;
+	}
 
 	/* Policy message */
 	memset(buf, 0, sizeof buf);
@@ -1952,9 +1982,11 @@ static int ipsec_xfrm_dump_cb(const struct nlmsghdr *nlh, void *data)
 		if (!r->sock)
 			r->sock = ipsec_sock_new();
 		/* the policies of a selector that a set uses are the ones of
-		 * that set */
+		 * that set; transport-mode sets have none of their own under
+		 * static policies */
 		if (!r->sock || !ipsec_xfrm_del_orphan(r->sock, sa,
-				in == IPSEC_SA_UNKNOWN && out == IPSEC_SA_UNKNOWN))
+				in == IPSEC_SA_UNKNOWN && out == IPSEC_SA_UNKNOWN &&
+				!(ipsec_static_policies && sa->mode == XFRM_MODE_TRANSPORT)))
 			spi = 0;
 	}
 	if (lock_in != lock_out)
@@ -1966,6 +1998,223 @@ static int ipsec_xfrm_dump_cb(const struct nlmsghdr *nlh, void *data)
 		LM_INFO("reconciled orphan XFRM SA spi=%u\n", spi);
 	}
 	return MNL_CB_OK;
+}
+
+/*
+ * One static policy for a protected server port: dir IN matches everything
+ * to <ip>:<port>, dir OUT everything from <ip>:<port>, any protocol (as the
+ * per-UE selectors did), transport-mode ESP with reqid 0. UPDPOLICY, so a
+ * restart finds its own policy and leaves it as it is.
+ */
+static int ipsec_static_policy_dir(struct ipsec_socket *sock,
+		struct ip_addr *ip, unsigned short port, int dir)
+{
+	char buf[MNL_SOCKET_BUFFER_SIZE];
+	struct nlmsghdr *nlh;
+	struct xfrm_userpolicy_info *pi;
+	struct xfrm_user_tmpl tmpl;
+	int ret;
+
+	memset(buf, 0, sizeof buf);
+	nlh = mnl_nlmsg_put_header(buf);
+	if (!nlh)
+		return -1;
+	nlh->nlmsg_flags = NLM_F_REQUEST|NLM_F_CREATE;
+	nlh->nlmsg_type = XFRM_MSG_UPDPOLICY;
+	nlh->nlmsg_seq = ++ipsec_seq;
+	pi = mnl_nlmsg_put_extra_header(nlh, sizeof *pi);
+	if (!pi)
+		return -1;
+	pi->sel.family = ip->af;
+	pi->sel.user = IPSEC_USER_SELECTOR;
+	pi->sel.proto = 0;
+	if (dir == XFRM_POLICY_IN) {
+		memcpy(&pi->sel.daddr, &ip->u, ip->len);
+		pi->sel.prefixlen_d = ip->len * 8;
+		pi->sel.dport = htons(port);
+		pi->sel.dport_mask = ~0;
+	} else {
+		memcpy(&pi->sel.saddr, &ip->u, ip->len);
+		pi->sel.prefixlen_s = ip->len * 8;
+		pi->sel.sport = htons(port);
+		pi->sel.sport_mask = ~0;
+	}
+	pi->lft.soft_byte_limit = XFRM_INF;
+	pi->lft.hard_byte_limit = XFRM_INF;
+	pi->lft.soft_packet_limit = XFRM_INF;
+	pi->lft.hard_packet_limit = XFRM_INF;
+	pi->priority = IPSEC_POLICY_PRIORITY;
+	pi->index = 0;
+	pi->dir = dir;
+	pi->action = XFRM_POLICY_ALLOW;
+	pi->flags = 0;
+	pi->share = XFRM_SHARE_ANY;
+
+	memset(&tmpl, 0, sizeof tmpl);
+	tmpl.id.proto = IPPROTO_ESP;
+	tmpl.family = ip->af;
+	tmpl.mode = XFRM_MODE_TRANSPORT;
+	tmpl.reqid = 0;
+	tmpl.optional = 0;
+	tmpl.share = XFRM_SHARE_ANY;
+	tmpl.aalgos = 0xffffffff;
+	tmpl.ealgos = 0xffffffff;
+	tmpl.calgos = 0xffffffff;
+	mnl_attr_put(nlh, XFRMA_TMPL, sizeof tmpl, &tmpl);
+
+	ret = ipsec_xfrm_request(sock, nlh);
+	if (ret < 0) {
+		LM_ERR("static %s policy for %s:%hu: %s\n",
+				dir == XFRM_POLICY_IN ? "in" : "out", ip_addr2a(ip), port,
+				strerror(-ret));
+		return -1;
+	}
+	return 0;
+}
+
+int ipsec_static_policy_add(struct ipsec_socket *sock, struct ip_addr *ip,
+		unsigned short port)
+{
+	if (ipsec_static_policy_dir(sock, ip, port, XFRM_POLICY_IN) < 0 ||
+			ipsec_static_policy_dir(sock, ip, port, XFRM_POLICY_OUT) < 0)
+		return -1;
+	update_stat(ipsec_static_policies_installed, 2);
+	LM_INFO("static IPSec policies installed for %s:%hu\n", ip_addr2a(ip), port);
+	return 0;
+}
+
+/*
+ * The per-UE transport-mode policies and SAs of a version before the static
+ * policies survive a restart on hostNetwork. Their policies would leak, and
+ * their SAs carry reqid = SPI, which the static template (reqid 0) does not
+ * select for the outbound direction. Both are removed once at start; the
+ * usrloc restore re-adds the SAs with reqid 0 and fresh replay counters, so
+ * the UEs of those sets register again, as after a node reboot.
+ */
+struct ipsec_purge {
+	struct ipsec_socket *sock;  /* for the deletes, not the dumping socket */
+	unsigned int policies, sas;
+};
+
+static int ipsec_purge_policy_cb(const struct nlmsghdr *nlh, void *data)
+{
+	struct ipsec_purge *p = data;
+	struct xfrm_userpolicy_info *pi;
+	struct xfrm_user_tmpl *tmpl = NULL;
+	struct nlattr *attr;
+	struct xfrm_userpolicy_id *id;
+	struct nlmsghdr *del;
+	char buf[MNL_SOCKET_BUFFER_SIZE];
+	int full, ret;
+
+	if (nlh->nlmsg_type != XFRM_MSG_NEWPOLICY)
+		return MNL_CB_OK;
+	pi = mnl_nlmsg_get_payload(nlh);
+	if (pi->sel.user != IPSEC_USER_SELECTOR)
+		return MNL_CB_OK;
+	full = pi->sel.family == AF_INET ? 32 : 128;
+	if (pi->sel.prefixlen_s != full || pi->sel.prefixlen_d != full)
+		return MNL_CB_OK; /* a static policy has one side open */
+	mnl_attr_for_each(attr, nlh, sizeof *pi)
+		if (mnl_attr_get_type(attr) == XFRMA_TMPL)
+			tmpl = mnl_attr_get_payload(attr);
+	if (!tmpl || tmpl->mode != XFRM_MODE_TRANSPORT)
+		return MNL_CB_OK; /* tunnel-mode sets keep their policies */
+
+	memset(buf, 0, sizeof buf);
+	del = mnl_nlmsg_put_header(buf);
+	if (!del)
+		return MNL_CB_OK;
+	del->nlmsg_flags = NLM_F_REQUEST;
+	del->nlmsg_type = XFRM_MSG_DELPOLICY;
+	del->nlmsg_seq = ++ipsec_seq;
+	id = mnl_nlmsg_put_extra_header(del, sizeof *id);
+	if (!id)
+		return MNL_CB_OK;
+	id->sel = pi->sel;
+	id->dir = pi->dir;
+	id->index = 0;
+	ret = ipsec_xfrm_request(p->sock, del);
+	if (ret < 0 && ret != -ENOENT)
+		LM_ERR("purge of a per-UE policy: %s\n", strerror(-ret));
+	else if (ret == 0)
+		p->policies++;
+	return MNL_CB_OK;
+}
+
+static int ipsec_purge_sa_cb(const struct nlmsghdr *nlh, void *data)
+{
+	struct ipsec_purge *p = data;
+	struct xfrm_usersa_info *sa;
+
+	if (nlh->nlmsg_type != XFRM_MSG_NEWSA)
+		return MNL_CB_OK;
+	sa = mnl_nlmsg_get_payload(nlh);
+	if (sa->sel.user != IPSEC_USER_SELECTOR || sa->mode != XFRM_MODE_TRANSPORT
+			|| sa->reqid == 0)
+		return MNL_CB_OK;
+	if (ipsec_xfrm_del_orphan(p->sock, sa, 0))
+		p->sas++;
+	return MNL_CB_OK;
+}
+
+static int ipsec_purge_dump(struct ipsec_socket *sock, int type,
+		mnl_cb_t cb, struct ipsec_purge *p)
+{
+	static char buf[IPSEC_RECONCILE_BUF_SIZE];
+	struct nlmsghdr *nlh;
+	int ret;
+
+	memset(buf, 0, sizeof buf);
+	nlh = mnl_nlmsg_put_header(buf);
+	if (!nlh)
+		return -1;
+	nlh->nlmsg_type = type;
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	nlh->nlmsg_seq = ++ipsec_seq;
+	if (type == XFRM_MSG_GETPOLICY)
+		mnl_nlmsg_put_extra_header(nlh, sizeof(struct xfrm_userpolicy_id));
+	if (mnl_socket_sendto(sock, nlh, nlh->nlmsg_len) < 0) {
+		LM_ERR("purge dump %d: %s\n", type, strerror(errno));
+		return -1;
+	}
+	while ((ret = mnl_socket_recvfrom(sock, buf, sizeof buf)) > 0) {
+		ret = mnl_cb_run(buf, ret, 0, 0, cb, p);
+		if (ret <= MNL_CB_STOP)
+			break;
+	}
+	if (ret < 0)
+		LM_ERR("purge dump %d: %s\n", type, strerror(errno));
+	return ret < 0 ? -1 : 0;
+}
+
+int ipsec_legacy_purge(void)
+{
+	struct ipsec_purge p;
+	struct ipsec_socket *dump;
+	int ret = 0;
+
+	memset(&p, 0, sizeof p);
+	dump = ipsec_sock_new();
+	p.sock = ipsec_sock_new();
+	if (!dump || !p.sock) {
+		ret = -1;
+		goto out;
+	}
+	if (ipsec_purge_dump(dump, XFRM_MSG_GETPOLICY, ipsec_purge_policy_cb, &p) < 0)
+		ret = -1;
+	if (ipsec_purge_dump(dump, XFRM_MSG_GETSA, ipsec_purge_sa_cb, &p) < 0)
+		ret = -1;
+	if (p.policies || p.sas)
+		LM_NOTICE("removed %u per-UE policies and %u SAs of a version without "
+				"static policies\n", p.policies, p.sas);
+	update_stat(ipsec_legacy_purged, p.policies + p.sas);
+out:
+	if (dump)
+		ipsec_sock_close(dump);
+	if (p.sock)
+		ipsec_sock_close(p.sock);
+	return ret;
 }
 
 static unsigned long long ipsec_reconcile_clock(void)
