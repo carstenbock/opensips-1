@@ -561,6 +561,7 @@ int parse_attr_def(char *line, FILE *fp)
 	unsigned int vendor_id = -1;
 	size_t buflen = strlen(line);
 	int i, len = buflen, attr_len = strlen("ATTRIBUTE"), name_len, avp_code;
+	int mandatory = 1;
 	char *name, *nt_name = NULL, *newp, *p = line, *end = p + len;
 	enum dict_avp_basetype avp_type;
 	enum dict_avp_enc_type enc_type = AVP_ENC_TYPE_NONE;
@@ -644,6 +645,15 @@ int parse_attr_def(char *line, FILE *fp)
 			goto error;
 
 		len -= newp - p;
+		p = newp;
+
+		/* "non-mandatory": the AVP is sent with the M bit cleared, as
+		 * required for AVPs that belong to an optional feature (e.g. 3GPP
+		 * TS 29.229 clause 7.1), so that a peer without the feature can
+		 * ignore them instead of rejecting the request */
+		while (len > 0 && (*p == ' ' || *p == '\t')) { p++; len--; }
+		if (len >= strlen("non-mandatory") && !strncasecmp(p, STR_L("non-mandatory")))
+			mandatory = 0;
 	}
 
 	if (avp_type != AVP_TYPE_GROUPED)
@@ -705,7 +715,7 @@ create_avp:;
 		(vendor_id != -1?vendor_id:0),			/* Vendor */
 		nt_name,	/* Name */
 		AVP_FLAG_VENDOR | AVP_FLAG_MANDATORY, 	/* Fixed flags */
-		(vendor_id != -1?AVP_FLAG_VENDOR:0)|AVP_FLAG_MANDATORY, /* Fixed flag values */
+		(vendor_id != -1?AVP_FLAG_VENDOR:0)|(mandatory?AVP_FLAG_MANDATORY:0), /* Fixed flag values */
 		avp_type 	/* base type of data */
 	};
 
@@ -726,8 +736,8 @@ create_avp:;
 		FD_CHECK_dict_new(DICT_RULE, &data, avp_ref, NULL);
 	}
 
-	LOG_DBG("registered custom AVP (%s, code %d, type %s, enc %s, sub-avps: %d, vendor: %d)\n",
-			nt_name, avp_code, avp_type2str(avp_type), enc_type2str(enc_type), avp_count, vendor_id);
+	LOG_DBG("registered custom AVP (%s, code %d, type %s, enc %s, sub-avps: %d, vendor: %d, M bit: %d)\n",
+			nt_name, avp_code, avp_type2str(avp_type), enc_type2str(enc_type), avp_count, vendor_id, mandatory);
 
 	if (nt_name)
 		free(nt_name);

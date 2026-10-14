@@ -558,7 +558,11 @@ static int dm_send_request_async_reply(int fd,
 		LM_ERR("Diameter request failed\n");
 		ret = -3;
 	}
-	if (ret > 0 && rpl_avps) {
+	/* An error answer (-3) is handed over too, as in the synchronous
+	 * dm_send_request(): it may carry data, e.g. the Cx SAA with
+	 * DIAMETER_ERROR_IN_ASSIGNMENT_TYPE that returns the S-CSCF
+	 * restoration information (3GPP TS 29.228 6.1.2.1). */
+	if (rpl_avps) {
 		val.rs.s = rpl_avps;
 		val.rs.len = strlen(rpl_avps);
 		val.flags = PV_VAL_STR;

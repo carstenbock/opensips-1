@@ -271,7 +271,8 @@ modparam("aaa_diameter", "max_json_log_size", 4096)
 				<emphasis>rpl_avps_pv</emphasis> (var, optional) - output variable which will
 				hold all AVP names from the Diameter Answer along with their values, packed
 				as a JSON Array string.  The "json" module and its <emphasis>$json</emphasis>
-				variable could be used to iterate this array.
+				variable could be used to iterate this array.  It is also set for an
+				Answer with an error result (return code -3).
 			</para></listitem>
 		</itemizedlist>
 
@@ -342,6 +343,11 @@ ATTRIBUTE Cost-Information  423 grouped
 	Currency-Code | REQUIRED | 1
 	Cost-Unit | OPTIONAL | 1
 }
+
+# A vendor-specific AVP is sent with the M bit set, unless the line ends in
+# "non-mandatory" (needed for AVPs of an optional feature, which a peer
+# without the feature has to be able to ignore)
+ATTRIBUTE Feature-List      630 unsigned32 10415 non-mandatory
 
 APPLICATION 42 My Diameter Application
 
