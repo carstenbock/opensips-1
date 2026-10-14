@@ -1213,6 +1213,58 @@ add_sock_hdr("Sock-Info");
 		</example>
 	</section>
 
+	<section id="func_restore_contact" xreflabel="restore_contact()">
+		<title>
+		<function moreinfo="none">restore_contact(domain, aor, contact, path, callid, cseq, expires, [flags])</function>
+		</title>
+		<para>
+		Inserts, or refreshes, the bindings of a stored Contact header field
+		value without a REGISTER request. It is meant for an IMS S-CSCF that
+		lost its registrations and gets them back from the HSS as S-CSCF
+		restoration information (3GPP TS 23.380, TS 29.229 SCSCF-Restoration-Info).
+		<function>save()</function> takes the Call-ID, the CSeq and the Path
+		from the current request, which is not the REGISTER at that point; this
+		function takes them as parameters. The binding is written through
+		usrloc like a saved one, so replication and the usrloc events see a
+		normal binding. The <xref linkend="param_attr_avp"/> is stored as
+		<function>save()</function> stores it.
+		</para>
+		<para>Meaning of the parameters is as follows:</para>
+		<itemizedlist>
+		<listitem><para><emphasis>domain (static string)</emphasis> - usrloc
+		table, as for <function>save()</function>.</para></listitem>
+		<listitem><para><emphasis>aor (string)</emphasis> - URI of the AoR the
+		bindings belong to.</para></listitem>
+		<listitem><para><emphasis>contact (string)</emphasis> - the Contact
+		header field value, with its parameters (+sip.instance, q, methods,
+		feature tags).</para></listitem>
+		<listitem><para><emphasis>path (string)</emphasis> - the Path header
+		field values, comma separated; empty for none.</para></listitem>
+		<listitem><para><emphasis>callid (string)</emphasis> - Call-ID of the
+		registration.</para></listitem>
+		<listitem><para><emphasis>cseq (int)</emphasis> - CSeq number of the
+		registration.</para></listitem>
+		<listitem><para><emphasis>expires (int)</emphasis> - remaining lifetime
+		of the bindings in seconds; must be positive.</para></listitem>
+		<listitem><para><emphasis>flags (string, optional)</emphasis> - the
+		<function>save()</function> flags; only <emphasis>store-gruu</emphasis>
+		and <emphasis>memory</emphasis> are taken into account.</para></listitem>
+		</itemizedlist>
+		<para>
+		Returns 1 on success and -1 on error. This function can be used from
+		REQUEST_ROUTE, ONREPLY_ROUTE and FAILURE_ROUTE.
+		</para>
+		<example>
+		<title><function>restore_contact</function> usage</title>
+		<programlisting format="linespecific">
+...
+restore_contact("location", "sip:alice@example.com", $var(ct), $var(path),
+	$var(callid), $var(cseq), $var(expires), "store-gruu");
+...
+</programlisting>
+		</example>
+	</section>
+
 	<section id="func_gruu_resolve" xreflabel="gruu_resolve()">
 		<title>
 		<function moreinfo="none">gruu_resolve(uri, aor_var)</function>
