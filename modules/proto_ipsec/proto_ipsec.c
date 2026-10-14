@@ -217,6 +217,10 @@ static const stat_export_t mod_stats[] = {
 	{ "reconcile_sas",		0, &ipsec_reconcile_sas },
 	{ "reconcile_orphans",	0, &ipsec_reconcile_orphans },
 	{ "reconcile_ms",		0, &ipsec_reconcile_ms },
+	{ "sa_exists",			0, &ipsec_sa_exists },
+	{ "sa_errors",			0, &ipsec_sa_errors },
+	{ "reconcile_deferred",	0, &ipsec_reconcile_deferred },
+	{ "restore_failures",	0, &ipsec_restore_failures },
 	{0, 0, 0}
 };
 
@@ -1602,6 +1606,7 @@ static void ipsec_usrloc_restore(ucontact_t *contact)
 	LM_DBG("restoring IPSec context for %.*s (%.*s)\n",
 			contact->aor->len, contact->aor->s,
 			contact->c.len, contact->c.s);
+	ipsec_note_restore();
 
 	/* A contact saved from a plain REGISTER has no ipsec.ck. That is
 	 * expected: save() records it for terminating lookup, and there is
@@ -1673,7 +1678,11 @@ static void ipsec_usrloc_restore(ucontact_t *contact)
 
 	ctx = ipsec_ctx_new(&sa, &user->ip, ss, sc, &ck, &ik, spi_pc, spi_ps, mode);
 	if (!ctx) {
-		LM_ERR("could not allocate new IPSec ctx\n");
+		/* with "SPI N is not free" before it: a stored row whose SPI
+		 * another restored contact already holds (KI-23 item 4) */
+		LM_ERR("could not allocate new IPSec ctx for %.*s (SPIs %d/%d)\n",
+				contact->aor->len, contact->aor->s, spi_pc, spi_ps);
+		update_stat(ipsec_restore_failures, 1);
 		goto release_user;
 	}
 

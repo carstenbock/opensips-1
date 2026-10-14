@@ -104,6 +104,15 @@ stat_var *ipsec_reconcile_passes;
 stat_var *ipsec_reconcile_sas;
 stat_var *ipsec_reconcile_orphans;
 stat_var *ipsec_reconcile_ms;
+stat_var *ipsec_sa_exists;
+stat_var *ipsec_sa_errors;
+stat_var *ipsec_reconcile_deferred;
+stat_var *ipsec_restore_failures;
+
+/* when a usrloc contact was last restored (shared: the restore runs in a
+ * SIP worker, the reconciler is its own process); set at start-up so the
+ * first pass waits a grace period as well */
+static time_t *ipsec_last_restore;
 
 static int ipsec_ctx_idx = -1;
 
@@ -194,7 +203,8 @@ static void ipsec_allocate_spi(struct ipsec_spi *spi)
 static struct ipsec_spi *ipsec_alloc_known_spi(unsigned int uspi)
 {
 	struct ipsec_spi *spi;
-	if (uspi < ipsec_min_spi || uspi > ipsec_max_spi + 1) {
+	/* the map has (max - min + 1) entries, indexed by (uspi - min) */
+	if (uspi < ipsec_min_spi || uspi > ipsec_max_spi) {
 		LM_ERR("SPI %u out of range [%u, %u]\n", uspi, ipsec_min_spi, ipsec_max_spi);
 		return NULL;
 	}
@@ -445,6 +455,13 @@ int ipsec_init(void)
 		return -1;
 	if (ipsec_init_sa_index() < 0)
 		return -1;
+
+	ipsec_last_restore = shm_malloc(sizeof *ipsec_last_restore);
+	if (!ipsec_last_restore) {
+		LM_ERR("oom for the restore timestamp\n");
+		return -1;
+	}
+	*ipsec_last_restore = time(NULL);
 
 	ipsec_seq = rand();
 	ipsec_ctx_idx = context_register_ptr(CONTEXT_GLOBAL, (context_destroy_f)ipsec_ctx_release);
@@ -877,6 +894,34 @@ struct xfrm_user_offload_osips {
  * Parameter use_hw_offload: 1 = try hardware offload, 0 = software only
  * Returns: 0 on success, -1 on error
  */
+static int ipsec_xfrm_request(struct ipsec_socket *sock, struct nlmsghdr *nlh);
+
+/*
+ * Sends an SA or policy message and reads the kernel's answer. Until the
+ * answer was read, every kernel error (EEXIST from a stale SA with the
+ * same SPI, ENOMEM, EINVAL from an offload the NIC cannot do) went
+ * unnoticed and the registration continued on a set the kernel did not
+ * have (KI-23). The registration still continues: the counters and log
+ * lines make the condition visible first; failing the registration on a
+ * kernel error is a later step.
+ */
+static void ipsec_xfrm_add_checked(struct mnl_socket *sock, struct nlmsghdr *nlh,
+		const char *what, struct ipsec_endpoint *src, unsigned short src_port,
+		struct ipsec_endpoint *dst, unsigned short dst_port, unsigned int spi)
+{
+	int ret = ipsec_xfrm_request(sock, nlh);
+	if (ret == -EEXIST) {
+		LM_NOTICE("%s %s:%hu -> %s:%hu (SPI %u) already in the kernel\n",
+				what, ip_addr2a(&src->ip), src_port, ip_addr2a(&dst->ip), dst_port, spi);
+		update_stat(ipsec_sa_exists, 1);
+	} else if (ret < 0) {
+		LM_ERR("kernel refused %s %s:%hu -> %s:%hu (SPI %u): %s\n",
+				what, ip_addr2a(&src->ip), src_port, ip_addr2a(&dst->ip), dst_port, spi,
+				strerror(-ret));
+		update_stat(ipsec_sa_errors, 1);
+	}
+}
+
 static int _ipsec_sa_add(struct mnl_socket *sock, struct ipsec_ctx *ctx,
 		enum ipsec_dir dir, int client, int use_hw_offload)
 {
@@ -1072,10 +1117,7 @@ static int _ipsec_sa_add(struct mnl_socket *sock, struct ipsec_ctx *ctx,
 				(dir == IPSEC_POLICY_IN) ? "IN" : "OUT");
 	}
 
-	if (mnl_socket_sendto(sock, nlh, nlh->nlmsg_len) < 0) {
-		LM_ERR("communicating with kernel for new SA: %s\n", strerror(errno));
-		goto error;
-	}
+	ipsec_xfrm_add_checked(sock, nlh, "SA", src, src_port, dst, dst_port, spi);
 
 	/* Policy message */
 	memset(buf, 0, sizeof buf);
@@ -1124,10 +1166,7 @@ static int _ipsec_sa_add(struct mnl_socket *sock, struct ipsec_ctx *ctx,
 
 	mnl_attr_put(nlh, XFRMA_TMPL, sizeof(struct xfrm_user_tmpl), &tmpl);
 
-	if (mnl_socket_sendto(sock, nlh, nlh->nlmsg_len) < 0) {
-		LM_ERR("communicating with kernel for SA policy: %s\n", strerror(errno));
-		goto policy_error;
-	}
+	ipsec_xfrm_add_checked(sock, nlh, "policy", src, src_port, dst, dst_port, spi);
 
 	LM_DBG("created %s:%hu -> %s:%hu SA (SPI %u)%s\n",
 			ip_addr2a(&src->ip), src_port, ip_addr2a(&dst->ip), dst_port, spi,
@@ -1350,11 +1389,16 @@ struct ipsec_ctx *ipsec_ctx_new(sec_agree_body_t *sa, struct ip_addr *ip,
 	ctx = shm_malloc(sizeof(*ctx) + ck->len + ik->len);
 	if (!ctx) {
 		LM_ERR("oom for a new IPSec ctx\n");
+		ipsec_spi_release(spi_s);
+		ipsec_spi_release(spi_c);
 		return NULL;
 	}
 	memset(ctx, 0, sizeof *ctx);
 	ctx->spi_s = spi_s;
 	ctx->spi_c = spi_c;
+	/* set before anything can fail: ipsec_ctx_free() on the error path
+	 * would otherwise send DELSA/DELPOLICY for the zeroed selector */
+	ctx->sa_removed = 1; /* until ipsec_sa_add_all() */
 	if (!lock_init(&ctx->lock)) {
 		LM_ERR("could not init IPSec ctx lock\n");
 		goto error;
@@ -1362,7 +1406,6 @@ struct ipsec_ctx *ipsec_ctx_new(sec_agree_body_t *sa, struct ip_addr *ip,
 	INIT_LIST_HEAD(&ctx->list);
 	INIT_LIST_HEAD(&ctx->tmp);
 	ctx->ref = 1;
-	ctx->sa_removed = 1; /* until ipsec_sa_add_all() */
 	ctx->server = ss;
 	ctx->client = sc;
 	ctx->alg = alg;
@@ -1933,6 +1976,12 @@ static unsigned long long ipsec_reconcile_clock(void)
 	return ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
 }
 
+void ipsec_note_restore(void)
+{
+	if (ipsec_last_restore)
+		*ipsec_last_restore = time(NULL);
+}
+
 /* one pass over the SAD */
 void ipsec_xfrm_reconcile(void)
 {
@@ -1943,6 +1992,23 @@ void ipsec_xfrm_reconcile(void)
 	unsigned long long start, slot, now;
 	unsigned int slot_examined = 0, batch;
 	int ret;
+
+	/*
+	 * The usrloc restore after a restart runs in a SIP worker while this
+	 * process already sweeps. The SAs of a set that is not restored yet
+	 * look like orphans: they survived the restart, so they are older than
+	 * the grace period, and nothing has indexed them. Deleting them made
+	 * the restore re-add them with fresh replay counters (KI-23 item 3).
+	 * usrloc has no end-of-preload event, so quiet time stands in for it:
+	 * no pass while a contact was restored within the grace period.
+	 */
+	if (ipsec_last_restore &&
+			time(NULL) - *ipsec_last_restore < (time_t)ipsec_reconcile_grace) {
+		LM_INFO("XFRM reconcile deferred: a contact was restored less than "
+				"%u s ago\n", ipsec_reconcile_grace);
+		update_stat(ipsec_reconcile_deferred, 1);
+		return;
+	}
 
 	sock = ipsec_sock_new();
 	if (!sock)

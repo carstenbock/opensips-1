@@ -177,6 +177,15 @@ extern stat_var *ipsec_reconcile_passes;
 extern stat_var *ipsec_reconcile_sas;
 extern stat_var *ipsec_reconcile_orphans;
 extern stat_var *ipsec_reconcile_ms;
+/* kernel answers to SA/policy installs: already present, refused */
+extern stat_var *ipsec_sa_exists;
+extern stat_var *ipsec_sa_errors;
+/* reconcile passes skipped while contacts were being restored; restores
+ * that could not allocate their security context */
+extern stat_var *ipsec_reconcile_deferred;
+extern stat_var *ipsec_restore_failures;
+/* a usrloc contact is being restored: holds the reconciler back */
+void ipsec_note_restore(void);
 
 /* what the SA index knows about a kernel SA */
 #define IPSEC_SA_UNKNOWN  0 /* no set uses its selector */
