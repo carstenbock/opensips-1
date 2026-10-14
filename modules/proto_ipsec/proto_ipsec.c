@@ -227,8 +227,10 @@ static const stat_export_t mod_stats[] = {
 	{ "sa_errors",			0, &ipsec_sa_errors },
 	{ "reconcile_deferred",	0, &ipsec_reconcile_deferred },
 	{ "restore_failures",	0, &ipsec_restore_failures },
-	{ "static_policies",	0, &ipsec_static_policies_installed },
-	{ "legacy_purged",		0, &ipsec_legacy_purged },
+	/* function statistics: counted in mod_init(), before the statistics
+	 * variables exist (the core registers them after mod_init) */
+	{ "static_policies",	STAT_IS_FUNC, (stat_var **)ipsec_static_policies_stat },
+	{ "legacy_purged",		STAT_IS_FUNC, (stat_var **)ipsec_legacy_purged_stat },
 	{0, 0, 0}
 };
 

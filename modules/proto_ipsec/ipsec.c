@@ -108,8 +108,20 @@ stat_var *ipsec_sa_exists;
 stat_var *ipsec_sa_errors;
 stat_var *ipsec_reconcile_deferred;
 stat_var *ipsec_restore_failures;
-stat_var *ipsec_static_policies_installed;
-stat_var *ipsec_legacy_purged;
+/* set in mod_init(), before the core registers the module's statistics and
+ * before the fork, so they are read through function statistics */
+static unsigned int ipsec_static_policies_count;
+static unsigned int ipsec_legacy_purged_count;
+
+unsigned long ipsec_static_policies_stat(void *unused)
+{
+	return ipsec_static_policies_count;
+}
+
+unsigned long ipsec_legacy_purged_stat(void *unused)
+{
+	return ipsec_legacy_purged_count;
+}
 
 /*
  * Static policies (ADR-0032): one XFRM policy per protected server port and
@@ -2078,7 +2090,7 @@ int ipsec_static_policy_add(struct ipsec_socket *sock, struct ip_addr *ip,
 	if (ipsec_static_policy_dir(sock, ip, port, XFRM_POLICY_IN) < 0 ||
 			ipsec_static_policy_dir(sock, ip, port, XFRM_POLICY_OUT) < 0)
 		return -1;
-	update_stat(ipsec_static_policies_installed, 2);
+	ipsec_static_policies_count += 2;
 	LM_INFO("static IPSec policies installed for %s:%hu\n", ip_addr2a(ip), port);
 	return 0;
 }
@@ -2208,7 +2220,7 @@ int ipsec_legacy_purge(void)
 	if (p.policies || p.sas)
 		LM_NOTICE("removed %u per-UE policies and %u SAs of a version without "
 				"static policies\n", p.policies, p.sas);
-	update_stat(ipsec_legacy_purged, p.policies + p.sas);
+	ipsec_legacy_purged_count += p.policies + p.sas;
 out:
 	if (dump)
 		ipsec_sock_close(dump);

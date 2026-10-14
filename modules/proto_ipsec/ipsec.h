@@ -184,8 +184,8 @@ extern stat_var *ipsec_sa_errors;
  * that could not allocate their security context */
 extern stat_var *ipsec_reconcile_deferred;
 extern stat_var *ipsec_restore_failures;
-extern stat_var *ipsec_static_policies_installed;
-extern stat_var *ipsec_legacy_purged;
+unsigned long ipsec_static_policies_stat(void *unused);
+unsigned long ipsec_legacy_purged_stat(void *unused);
 /* static policies (ADR-0032): module parameter, install, purge of the
  * previous version's per-UE transport-mode policies and SAs */
 extern unsigned int ipsec_static_policies;
