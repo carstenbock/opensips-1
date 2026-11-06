@@ -614,7 +614,7 @@ static int aka_count_avs(int algmask)
 	for (alg = ALG_AKAv2_FIRST; alg <= ALG_AKAv2_LAST; alg++)
 		if (algmask & ALG2ALGFLG(alg))
 			n++;
-	if (algmask & ALG_MD5)
+	if (algmask & ALGFLG_MD5)
 		n++;			
 	return n;
 }

@@ -705,7 +705,7 @@ static int dm_receive_msg(struct msg **_msg, struct avp * avp, struct session * 
 	struct msg *msg = *_msg;
 	struct avp *a = NULL;
 	struct avp_hdr * h = NULL;
-	int rc;
+	int rc, conv_failed = 0;
 	struct dm_cond *rpl_cond;
 
 	FD_CHECK(fd_msg_hdr(msg, &hdr));
@@ -724,8 +724,16 @@ static int dm_receive_msg(struct msg **_msg, struct avp * avp, struct session * 
 	}
 
 	if (dm_avps2json(msg, avps) != 0) {
+		/* Still resume the waiting request, as an error: dropping the answer
+		 * would leave it waiting until it times out. */
 		LM_ERR("failed to pack Message AVPs as JSON string\n");
-		goto out;
+		cJSON_Delete(avps);
+		avps = cJSON_CreateArray();
+		if (!avps) {
+			LM_ERR("oom 2\n");
+			goto out;
+		}
+		conv_failed = 1;
 	}
 
 	/* Find the waiting request through the query freeDiameter matched this
@@ -751,7 +759,7 @@ static int dm_receive_msg(struct msg **_msg, struct avp * avp, struct session * 
 	rpl_cond->rpl.json = avps;
 	avps = NULL; /* owned by the waiting request now */
 
-	rpl_cond->rpl.is_error = 0;
+	rpl_cond->rpl.is_error = conv_failed;
 
 	rc = fd_msg_search_avp(msg, dm_dict.Result_Code, &a);
 	if (rc == 0 && a) {
@@ -2496,7 +2504,16 @@ static cJSON *dict_avp_dec_ip(struct avp_hdr * h, struct dict_avp_data *avp)
 		return NULL;
 	}
 
-	af = (h->avp_value->os.len == INET6_ADDRSTRLEN?AF_INET6:AF_INET);
+	/* raw address octets: 4 for IPv4, 16 for IPv6 */
+	if (h->avp_value->os.len == 4) {
+		af = AF_INET;
+	} else if (h->avp_value->os.len == 16) {
+		af = AF_INET6;
+	} else {
+		LM_WARN("IP AVP %u with %zu octets, decoded as empty\n",
+			h->avp_code, h->avp_value->os.len);
+		return cJSON_CreateString("");
+	}
 	if (inet_ntop(af, h->avp_value->os.data, buf, INET6_ADDRSTRLEN) == NULL) {
 		LM_ERR("cannot convert to an IP\n");
 		return NULL;
@@ -2543,6 +2560,8 @@ static cJSON *dict_avp_dec_hex(struct avp_hdr * h, struct dict_avp_data *avp)
 	 * at a time, and the pkg allocator of the process is not thread-safe.
 	 * Two MAAs decoded together corrupted it ("freeing already freed
 	 * pointer", S-CSCF abort). */
+	if (h->avp_value->os.len == 0)
+		return cJSON_CreateString(""); /* string2hex() would write "0" */
 	buf = malloc(h->avp_value->os.len * 2 + 1);
 	if (!buf) {
 		LM_ERR("oom for hex buffer\n");
@@ -2588,6 +2607,11 @@ static cJSON *dict_avp_dec_time(struct avp_hdr * h, struct dict_avp_data *avp)
 	if (avp->avp_basetype != AVP_TYPE_OCTETSTRING) {
 		LM_ERR("invalid base type for TIME: %d\n", avp->avp_basetype);
 		return NULL;
+	}
+	if (h->avp_value->os.len != 4) {
+		LM_WARN("Time AVP %u with %zu octets, decoded as empty\n",
+			h->avp_code, h->avp_value->os.len);
+		return cJSON_CreateString("");
 	}
 	bytes = h->avp_value->os.data;
 	dt = ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |

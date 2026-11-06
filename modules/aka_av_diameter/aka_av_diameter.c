@@ -35,6 +35,7 @@
 #include "../../map.h"
 #include "../../lib/cond.h"
 #include "../../str_list.h"
+#include "../../ut.h"
 #include "../../parser/digest/digest_parser.h"
 
 #include "../auth_aka/aka_av_mgm.h"
@@ -440,11 +441,21 @@ end:
 static int aka_av_diameter_print_alg(cJSON *alg_arr, alg_t alg)
 {
 	const str *algs = print_digest_algorithm(alg);
+	cJSON *it;
 	char *p;
-	int ret = -1;
+	int ret = -1, i;
 
 	if (!algs)
 		return -1;
+	/* replace the scheme of the previous algorithm; the item may also carry
+	 * the SIP-Authorization of a resync, which must stay */
+	for (i = 0, it = alg_arr->child; it; it = it->next, i++) {
+		if (it->child && it->child->string &&
+				strcmp(it->child->string, AKA_AV_DM_AUTH_SCHEME) == 0) {
+			cJSON_DeleteItemFromArray(alg_arr, i);
+			break;
+		}
+	}
 	/* append Digest at the end */
 	p = pkg_malloc(algs->len + 7 /* 'Digest-' */ + 1 /* '\0' */);
 	if (!p) {
@@ -454,7 +465,6 @@ static int aka_av_diameter_print_alg(cJSON *alg_arr, alg_t alg)
 	memcpy(p, "Digest-", 7);
 	memcpy(p + 7, algs->s, algs->len);
 	p[algs->len + 7] = '\0';
-	cJSON_DeleteItemFromArray(alg_arr, 0); /* remove whatever was there */
 	cJSON_ADD_OBJ(alg_arr, AKA_AV_DM_AUTH_SCHEME, cJSON_CreateString(p));
 	ret = 0;
 end:
@@ -516,6 +526,7 @@ static int aka_av_diameter_fetch(str *realm, str *impu, str *impi,
 	cJSON *req = NULL, *tmp = NULL, *alg_arr, *sess_obj;
 	int ret = -2;
 	char *sess = NULL;
+	char resync_hex[64];
 	alg_t alg;
 	struct aka_av_param *param = NULL;
 
@@ -565,8 +576,19 @@ static int aka_av_diameter_fetch(str *realm, str *impu, str *impi,
 	alg_arr = tmp;
 	tmp = NULL;
 
-	if (resync)
-		cJSON_ADD_OBJ(req, AKA_AV_DM_AUTH_ITEM_AUTHORIZE, cJSON_CreateStr(resync->s, resync->len));
+	if (resync) {
+		/* TS 29.228 Table 6.3.2: on a resync, SIP-Authorization (RAND || AUTS)
+		 * goes inside the SIP-Auth-Data-Item. The dictionary types it as
+		 * hexstring, so it is passed hex-encoded and the encoder turns it
+		 * back into octets. */
+		if (resync->len * 2 >= (int)sizeof resync_hex) {
+			LM_ERR("resync data too long (%d bytes)\n", resync->len);
+			goto end;
+		}
+		string2hex(resync->s, resync->len, resync_hex);
+		resync_hex[resync->len * 2] = '\0';
+		cJSON_ADD_OBJ(alg_arr, AKA_AV_DM_AUTH_ITEM_AUTHORIZE, cJSON_CreateString(resync_hex));
+	}
 
 	ret = -1;
 	/* we send a diameter request for each algorithm used */
