@@ -2329,10 +2329,12 @@ terminate:
 	delete_entry = deleted;
 	while (delete_entry) {
 		/* in a clustered setup only the node owning the dialog's sharing
-		 * tag may emit the BYEs, to avoid duplicate teardown */
+		 * tag may emit the BYEs, to avoid duplicate teardown. A dialog
+		 * without a sharing tag (-2) belongs to the node holding it, as
+		 * in the MI dlg_end_dlg command */
 		if (dialog_repl_cluster) {
 			shtag_state = get_shtag_state(delete_entry->dlg);
-			if (shtag_state < 0) {
+			if (shtag_state == -1) {
 				LM_ERR("error checking replication tag for dlg %.*s\n",
 					delete_entry->dlg->callid.len,
 					delete_entry->dlg->callid.s);
