@@ -2649,6 +2649,11 @@ end:
 	return ret;
 }
 
+static void rtpe_pkg_free(void *p)
+{
+	pkg_free(p);
+}
+
 static int rtpe_function_call_prepare(bencode_buffer_t *bencbuf, struct sip_msg *msg, enum rtpe_operation op,
          struct ng_flags_parse *ng_flags, str *flags_str, str *body_in, bencode_item_t *extra_dict, char **err)
 {
@@ -2656,6 +2661,8 @@ static int rtpe_function_call_prepare(bencode_buffer_t *bencbuf, struct sip_msg 
 	str viabranch;
 	int ret, flags_exist = 0, callid_exist = 0, from_tag_exist = 0, to_tag_exist = 0;
 	str flags_nt = {0,0};
+	char *flags_c = NULL;
+	struct __bencode_free_list *free_head;
 
 	if (bencode_buffer_init(bencbuf)) {
 		LM_ERR("could not initialize bencode_buffer_t\n");
@@ -2701,7 +2708,23 @@ static int rtpe_function_call_prepare(bencode_buffer_t *bencbuf, struct sip_msg 
 		goto error;
 	}
 
-	if (parse_flags(ng_flags, msg, &op, flags_nt.s)) {
+	/* parse_flags() stores pointers into this copy (bencode_str() does not
+	 * copy), so it must live until the request is encoded and sent. The
+	 * bencode buffer frees it together with the request. Freeing it at the
+	 * end of this function sent freed memory to RTPEngine: empty flags and
+	 * a garbled address-family value. */
+	if (flags_nt.s) {
+		free_head = bencbuf->free_list;
+		bencode_buffer_destroy_add(bencbuf, rtpe_pkg_free, flags_nt.s);
+		if (bencbuf->free_list == free_head) {
+			*err = "No more pkg mem";
+			goto error;
+		}
+		flags_c = flags_nt.s;
+		flags_nt.s = NULL;
+	}
+
+	if (parse_flags(ng_flags, msg, &op, flags_c)) {
 		*err = "could not parse flags";
 		goto error;
 	}

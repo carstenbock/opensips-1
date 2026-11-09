@@ -289,6 +289,52 @@ static inline int add_dlg_rr_param(struct sip_msg *req, struct dlg_cell *dlg)
 	return 0;
 }
 
+/* Record-Route entries of a reply that print_rr_body() has to skip so that
+ * the callee leg's route set holds only the hops above this proxy: the
+ * entries from the bottom up to and including our own one, which carries
+ * the dialog's rr_param (";did=..."). Counting the entries the request had
+ * (from_rr_nb + added_rr) breaks when the callee drops or merges entries
+ * below ours; a UE that left out one of two identical S-CSCF entries made
+ * the P-CSCF send its PRACK to the IPsec gateway's UE-facing IPv6 address.
+ * Returns 0 when our entry is not found, so the caller keeps its count. */
+static unsigned int dlg_rr_skip_to_own(struct sip_msg *rpl, struct dlg_cell *dlg)
+{
+	char buf[RR_DLG_PARAM_SIZE];
+	struct hdr_field *hdr;
+	rr_t *rr;
+	str needle, *did;
+	char *m, *end;
+	int total = 0, own = -1;
+
+	did = dlg_get_did(dlg);
+	if (!did || rr_param.len + 2 + did->len > RR_DLG_PARAM_SIZE)
+		return 0;
+	buf[0] = ';';
+	memcpy(buf + 1, rr_param.s, rr_param.len);
+	buf[rr_param.len + 1] = '=';
+	memcpy(buf + rr_param.len + 2, did->s, did->len);
+	needle.s = buf;
+	needle.len = rr_param.len + 2 + did->len;
+
+	if (parse_headers(rpl, HDR_EOH_F, 0) < 0)
+		return 0;
+	for (hdr = rpl->record_route; hdr; hdr = hdr->sibling) {
+		if (parse_rr(hdr) < 0)
+			return 0;
+		for (rr = (rr_t *)hdr->parsed; rr; rr = rr->next) {
+			if (own < 0 && (m = str_strstr(&rr->nameaddr.uri, &needle))) {
+				end = rr->nameaddr.uri.s + rr->nameaddr.uri.len;
+				if (m + needle.len == end || m[needle.len] == ';')
+					own = total;
+			}
+			total++;
+		}
+	}
+	if (own < 0)
+		return 0;
+	return total - own;
+}
+
 static void tmcb_remove_cseq_map(struct cell* t, int type,
 		struct tmcb_params *param)
 {
@@ -590,7 +636,7 @@ static inline void push_reply_in_dialog(struct sip_msg *req, struct sip_msg *rpl
 				struct dlg_cell *dlg,str *mangled_from,str *mangled_to, long *leg_idx)
 {
 	str tag,contact,rr_set;
-	unsigned int skip_rrs, cseq_no;
+	unsigned int skip_rrs, own_skip, cseq_no;
 	int leg;
 
 	get_totag(rpl, &tag);
@@ -663,6 +709,9 @@ routing_info:
 	!(dlg->mod_flags & TOPOH_ONGOING)) {
 		skip_rrs = dlg->from_rr_nb +
 				TM_BRANCH(t, d_tmb.get_branch_index()).added_rr;
+		own_skip = dlg_rr_skip_to_own(rpl, dlg);
+		if (own_skip)
+			skip_rrs = own_skip;
 		get_routing_info(rpl, 0, &skip_rrs, &contact, &rr_set);
 		dlg_update_routing(dlg, leg, &rr_set, &contact);
 		if (rr_set.s)
@@ -689,10 +738,14 @@ routing_info:
 		/* update routing info */
 		if(dlg->mod_flags & TOPOH_ONGOING)
 			skip_rrs = 0; /* changed here for contact - it was 1 */
-		else
+		else {
 			skip_rrs = dlg->from_rr_nb +
 					((t->relaied_reply_branch>=0)?
 					(TM_BRANCH(t,t->relaied_reply_branch).added_rr):0);
+			own_skip = dlg_rr_skip_to_own(rpl, dlg);
+			if (own_skip)
+				skip_rrs = own_skip;
+		}
 
 		LM_DBG("Skipping %d ,%d, %d, %d \n",skip_rrs, dlg->from_rr_nb,t->relaied_reply_branch,TM_BRANCH(t,t->relaied_reply_branch).added_rr);
 		get_routing_info(rpl, 0, &skip_rrs, &contact, &rr_set);
