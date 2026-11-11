@@ -758,7 +758,9 @@ int swap_msg_branches(struct sip_msg *msg, int src_idx, int dst_idx)
 		/* detach the attrs */
 		bk_attrs = dsct->ruri_attrs;
 		dsct->ruri_attrs = NULL;
-		/* backup the msg branch */
+		/* backup the msg branch; _set_msg_branch() starts by destroying
+		 * the target's attrs, so bk must not hold stack garbage */
+		memset( &bk, 0, sizeof bk);
 		if (_msg_2_branch(dsct, msg, &bk)<0)
 			return -1;
 	}
@@ -769,6 +771,9 @@ int swap_msg_branches(struct sip_msg *msg, int src_idx, int dst_idx)
 
 	/* now copy the original dst (from bk) into src */
 	if (src_idx>=0) {
+		/* the copy above only cloned the attrs of src, free the originals
+		 * before overwriting src */
+		destroy_avp_list( &brs[src_idx].branch.attrs );
 		/* copy bk into a branch */
 		brs[src_idx] = bk;
 		_post_copy_branch_update( brs+src_idx );
