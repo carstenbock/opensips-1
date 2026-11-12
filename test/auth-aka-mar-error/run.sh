@@ -38,7 +38,7 @@ for mode in 0 1; do
     docker rm -f "$name" >/dev/null 2>&1 || true
     docker run -d --name "$name" --network host --entrypoint opensips \
         -v "$work:/etc/opensips:ro" "$image" -F -f /etc/opensips/opensips.cfg >/dev/null
-    python3 -I "$dir/check.py" "$mode" || {
+    python3 -I "$dir/check.py" "$mode" "$work/hss.log" || {
         rc=1
         docker logs "$name" 2>&1 | grep -iE "error|diameter" | tail -10
     }

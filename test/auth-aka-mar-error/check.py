@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """UE side of test/auth-aka-mar-error/run.sh. argv[1] is the auth_aka
-av_failure_reply mode under test.
+av_failure_reply mode under test, argv[2] the fake HSS log.
 
 Mode 0 lets the S-CSCF script answer a failed MAR itself, so it can answer
 DIAMETER_ERROR_USER_UNKNOWN with 403 (TS 24.229 5.4.1.2, TS 29.228 6.3) and
 add its own headers (P-Charging-Vector, KI-21); mode 1 must keep the module's
 own 500/504 exactly as before.
 """
+import re
 import socket
 import sys
 import time
@@ -49,14 +50,23 @@ def main():
     s.bind(("127.0.0.1", 5178))
     s.settimeout(0.2)
     n = 0
-    # wait until the Diameter connection to the fake HSS is up
+    # Wait until the Diameter connection to the fake HSS is up: a warm-up MAR
+    # must have reached the fake HSS (its log, argv[2]). Any final reply is
+    # not enough: before the peer is open freeDiameter answers the MAR itself
+    # with 3002 (DIAMETER_UNABLE_TO_DELIVER), and the first case raced the
+    # connection (KI-169).
+    hss_log = sys.argv[2]
     deadline = time.time() + 40
     while time.time() < deadline:
         n += 1
-        code, reason = register(s, "other-warmup%d" % n, n)
-        if code and "Early" not in reason:
-            break
+        register(s, "other-warmup%d" % n, n)
+        with open(hss_log, errors="replace") as f:
+            if re.search(r"MAR for other-warmup%d\b(?!\d)" % n, f.read()):
+                break
         time.sleep(1)
+    else:
+        print("FAIL mode %s: no warm-up MAR reached the fake HSS within 40 s" % mode)
+        sys.exit(1)
     ok = True
     for user, (want_code, want_text) in WANT[mode].items():
         n += 1
