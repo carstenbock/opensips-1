@@ -155,8 +155,8 @@ def main():
         cs, ids = contacts(notifies[-1])
         check(cs.get("sip:alice@127.0.0.1:6001") == ("terminated", "unregistered"),
               f"old contact terminated in the NOTIFY ({cs.get('sip:alice@127.0.0.1:6001')})")
-        check(cs.get("sip:alice@127.0.0.1:6002", ("",))[0] == "active",
-              f"new contact active in the same NOTIFY ({cs.get('sip:alice@127.0.0.1:6002')})")
+        check(cs.get("sip:alice@127.0.0.1:6002") == ("active", "registered"),
+              f"new contact active/registered in the same NOTIFY ({cs.get('sip:alice@127.0.0.1:6002')})")
         check(len(ids) == len(set(ids)), f"contact ids unique ({ids})")
 
     # Refresh of the same binding: one NOTIFY, no terminated contact left over.
@@ -168,6 +168,11 @@ def main():
         check(list(cs) == ["sip:alice@127.0.0.1:6002"]
               and cs["sip:alice@127.0.0.1:6002"][0] == "active",
               f"refresh lists only the active contact ({cs})")
+        # KI-162: a watcher must tell a refresh from a new binding (RFC 3680
+        # §5.2, TS 24.229 5.4.2.1.2 III); "registered" would announce a new
+        # contact of a single-contact AoR on every re-REGISTER.
+        check(cs.get("sip:alice@127.0.0.1:6002") == ("active", "refreshed"),
+              f"refreshed contact has event=refreshed ({cs.get('sip:alice@127.0.0.1:6002')})")
 
     # The watcher's flow is gone: its NOTIFYs end in 477 (as from an IPsec GW
     # without an SA). The subscription must be removed.

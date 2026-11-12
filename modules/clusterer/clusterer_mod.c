@@ -147,6 +147,8 @@ static const param_export_t params[] = {
 	{"ping_timeout",		INT_PARAM,	&ping_timeout		},
 	{"seed_fallback_interval", INT_PARAM, &seed_fb_interval	},
 	{"sync_timeout",		INT_PARAM,	&sync_timeout		},
+	{"resync_after_link_down", INT_PARAM, &resync_after_link_down	},
+	{"link_resync_capabilities", STR_PARAM, &link_resync_caps.s	},
 	{"id_col",				STR_PARAM,	&id_col.s			},
 	{"cluster_id_col",		STR_PARAM,	&cluster_id_col.s	},
 	{"node_id_col",			STR_PARAM,	&node_id_col.s		},
@@ -410,6 +412,12 @@ static int mod_init(void)
 	}
 	ping_timeout_us = ping_timeout * 1000;
 	ping_interval_us = ping_interval * 1000000;
+
+	link_resync_caps.len = link_resync_caps.s ? strlen(link_resync_caps.s) : 0;
+	if (resync_after_link_down < 0) {
+		LM_WARN("Invalid resync_after_link_down parameter, disabling\n");
+		resync_after_link_down = 0;
+	}
 
 	if (seed_fb_interval < 0) {
 		LM_WARN("Invalid seed_fallback_interval parameter, using default value\n");

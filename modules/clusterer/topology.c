@@ -25,6 +25,7 @@
 #include "node_info.h"
 #include "clusterer.h"
 #include "topology.h"
+#include "sync.h"
 
 extern int ping_interval;
 extern int node_timeout;
@@ -866,6 +867,8 @@ static int set_link(clusterer_link_state new_ls, node_info_t *node_a,
 
 static int set_link_w_neigh_up(node_info_t *neigh, int nr_nodes, int *node_list)
 {
+	int resync;
+
 	if (set_link_w_neigh(LS_UP, neigh) < 0)
 		return -1;
 
@@ -877,12 +880,21 @@ static int set_link_w_neigh_up(node_info_t *neigh, int nr_nodes, int *node_list)
 	/* send capabilities update to neighbour */
 	send_cap_update(neigh, 1);
 
+	/* the link was down long enough to have lost replicated data (KI-14) */
+	lock_get(neigh->lock);
+	resync = neigh->flags & NODE_LINK_RESYNC;
+	neigh->flags &= ~NODE_LINK_RESYNC;
+	lock_release(neigh->lock);
+	if (resync)
+		cl_resync_from_node(neigh);
+
 	return 0;
 }
 
 int set_link_w_neigh(clusterer_link_state new_ls, node_info_t *neigh)
 {
 	node_info_t *nhop;
+	struct timeval now;
 
 	LM_DBG("setting link with neighbour [%d] to state <%d>\n",
 		neigh->node_id, new_ls);
@@ -910,6 +922,8 @@ int set_link_w_neigh(clusterer_link_state new_ls, node_info_t *neigh)
 
 		if (!nhop)
 			neigh->flags |= NODE_EVENT_DOWN;
+
+		gettimeofday(&neigh->link_down_since, NULL);
 
 	} else if (new_ls == LS_UP && neigh->link_state != LS_UP) {
 		lock_release(neigh->lock);
@@ -939,6 +953,15 @@ int set_link_w_neigh(clusterer_link_state new_ls, node_info_t *neigh)
 		if (clusterer_enable_rerouting) {
 			neigh->next_hop = neigh;
 		}
+
+		/* an outage, not the first link-up after a start (KI-14) */
+		gettimeofday(&now, NULL);
+		if (resync_after_link_down > 0 && neigh->link_down_since.tv_sec &&
+			TIME_DIFF(neigh->link_down_since, now) >=
+				(long long)resync_after_link_down * 1000)
+			neigh->flags |= NODE_LINK_RESYNC;
+		neigh->link_down_since.tv_sec = 0;
+		neigh->link_down_since.tv_usec = 0;
 
 	}
 

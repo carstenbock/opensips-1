@@ -667,6 +667,23 @@ static int proto_ipsec_send(const struct socket_info* source,
 	ret = protos[source->proto].tran.send(source, buf, len, to, id);
 	if (ret >= 0)
 		return ret;
+	if (fl.type == SIP_REQUEST && source->proto == PROTO_TCP) {
+		/* KI-150: the connect from the fixed protected client port
+		 * (TS 33.203 7.1) fails while the kernel still holds a socket of
+		 * the same address pair, e.g. the TIME_WAIT of the connection the
+		 * gateway closed, if the UE does not use TCP timestamps
+		 * (EADDRNOTAVAIL). A request sent over UDP from here has a TCP Via,
+		 * and tm, which took the branch for TCP, never retransmits it
+		 * (RFC 3261 17.1.1.2): one lost datagram and the transaction times
+		 * out. Report the failure instead, so tm fails the branch at once
+		 * and the script can retry it over UDP (RFC 3261 18.1.1). */
+		LM_WARN("TCP send of %.*s to %s:%hu from %.*s:%hu failed, not falling "
+				"back to UDP behind tm\n", fl.u.request.method.len,
+				fl.u.request.method.s, ip_addr2a(&ip), su_getport(to),
+				source->address_str.len, source->address_str.s,
+				source->port_no);
+		return -1;
+	}
 	/* TODO: handle protocol fallback! - need to update via? */
 	/* grab the new pair */
 	ipsec_si = find_ipsec_socket_info((struct ip_addr *)&source->address, source->port_no, 0, 0);

@@ -4,7 +4,8 @@
 # and a 477 to a NOTIFY ends the subscription. Runs the OpenSIPS image with
 # opensips.cfg against the UE and watcher in check.py (host network,
 # 127.0.0.1). OpenSIPS 0.1.48 and older send two NOTIFYs and keep the
-# subscription after a 477.
+# subscription after a 477. KI-162: a refresh of the single contact is
+# reported as event="refreshed" (0.1.49 and older: "registered").
 #
 #   test/reginfo-replace-notify/run.sh [image]   (default: the image of ../../VERSION)
 #

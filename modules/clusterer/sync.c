@@ -20,6 +20,7 @@
 #include "../../rw_locking.h"
 #include "../../ipc.h"
 #include "../../status_report.h"
+#include "../../trim.h"
 
 #include "api.h"
 #include "node_info.h"
@@ -32,6 +33,36 @@
 #endif
 
 int sync_packet_size = DEFAULT_SYNC_PACKET_SIZE;
+/* minimum outage of a link, in ms, after which the capabilities resync from
+ * the node when the link is up again; 0 disables (KI-14) */
+int resync_after_link_down = 1000;
+/* the capabilities resynced after a link outage, comma-separated: only ones
+ * whose sync merges into the local data. The dialog module, for one, drops
+ * every local dialog that a sync did not confirm (SYNC_DONE), which would
+ * lose the dialogs created on this side during the outage. */
+str link_resync_caps = str_init("usrloc-contact-repl");
+
+static int link_resync_listed(str *cap)
+{
+	char *p = link_resync_caps.s, *end, *e;
+	str tok;
+
+	if (!p)
+		return 0;
+	end = p + link_resync_caps.len;
+	while (p < end) {
+		e = q_memchr(p, ',', end - p);
+		if (!e)
+			e = end;
+		tok.s = p;
+		tok.len = e - p;
+		trim(&tok);
+		if (!str_strcmp(&tok, cap))
+			return 1;
+		p = e + 1;
+	}
+	return 0;
+}
 int _sync_from_id = 0;
 
 static bin_packet_t *sync_packet_last;
@@ -122,11 +153,13 @@ int queue_sync_request(cluster_info_t *cluster, struct local_cap *lcap)
 	return 0;
 }
 
+static int request_sync(cluster_info_t *cluster, struct local_cap *lcap,
+                        int source_id);
+
 int cl_request_sync(str *capability, int cluster_id, int from_cb)
 {
 	cluster_info_t *cluster;
 	struct local_cap *lcap;
-	int source_id;
 	int rc = -1;
 
 	LM_DBG("requesting %.*s sync in cluster %d\n",
@@ -149,6 +182,23 @@ int cl_request_sync(str *capability, int cluster_id, int from_cb)
 			capability->len, capability->s);
 		goto end;
 	}
+
+	rc = request_sync(cluster, lcap, 0);
+end:
+	if (!from_cb)
+		lock_stop_read(cl_list_lock);
+	return rc;
+}
+
+/* Starts a sync of lcap from source_id, or from any donor for 0. Called
+ * with cl_list_lock held. Returns 1 if a sync is already in progress, 0 if
+ * a sync was requested or queued or nothing was to be done, -1 on error. */
+static int request_sync(cluster_info_t *cluster, struct local_cap *lcap,
+                        int source_id)
+{
+	str *capability = &lcap->reg.name;
+	int cluster_id = cluster->cluster_id;
+	int rc = -1;
 
 	lock_get(cluster->lock);
 	if (lcap->flags & CAP_SYNC_PENDING) {
@@ -184,7 +234,8 @@ int cl_request_sync(str *capability, int cluster_id, int from_cb)
 	} else
 		lock_release(cluster->lock);
 
-	source_id = get_sync_source(cluster, capability, lcap->reg.sync_cond);
+	if (source_id == 0)
+		source_id = get_sync_source(cluster, capability, lcap->reg.sync_cond);
 	if (source_id == 0) {	/* we didn't find any node ready to sync from */
 		LM_DBG("donor node not found\n");
 		/* send requst later */
@@ -206,9 +257,58 @@ int cl_request_sync(str *capability, int cluster_id, int from_cb)
 
 	rc = 0;
 end:
-	if (!from_cb)
-		lock_stop_read(cl_list_lock);
 	return rc;
+}
+
+/* KI-14: while a link is down, the nodes on either side miss each other's
+ * replicated changes unless another path carries them, and the changes sent
+ * before the outage was detected are lost. Nothing brought them back; a
+ * contact that a node missed stayed missing until the registration ended.
+ * Called when the link with node is up again after an outage of at least
+ * resync_after_link_down ms (set_link_w_neigh()): each capability listed in
+ * link_resync_capabilities asks node for its data, through the normal sync
+ * procedure. node holds its own
+ * changes of the outage, which another donor may lack. A sync only adds and
+ * updates data (usrloc keeps the newer copy of a contact by CSeq); removals
+ * missed during the outage still end only with the expiry. The node on the
+ * other side of the link does the same, so both directions are covered.
+ * Called with cl_list_lock held and no node lock. */
+void cl_resync_from_node(node_info_t *node)
+{
+	cluster_info_t *cluster = node->cluster;
+	struct local_cap *lcap;
+	struct remote_cap *rcap;
+
+	for (lcap = cluster->capabilities; lcap; lcap = lcap->next) {
+		/* without an event callback nothing serves the sync request */
+		if (!lcap->reg.event_cb || !link_resync_listed(&lcap->reg.name))
+			continue;
+
+		lock_get(cluster->lock);
+		if (!(lcap->flags & CAP_STATE_ENABLED) ||
+			(lcap->flags & (CAP_SYNC_PENDING|CAP_SYNC_IN_PROGRESS))) {
+			/* disabled, or a sync is under way anyway */
+			lock_release(cluster->lock);
+			continue;
+		}
+		lock_release(cluster->lock);
+
+		if (!match_node(cluster->current_node, node, lcap->reg.sync_cond))
+			continue;
+
+		lock_get(node->lock);
+		for (rcap = node->capabilities; rcap; rcap = rcap->next)
+			if (!str_strcmp(&lcap->reg.name, &rcap->name))
+				break;
+		lock_release(node->lock);
+		if (!rcap)
+			continue;
+
+		LM_INFO("link with node [%d] is up again after an outage, "
+			"resyncing capability '%.*s' from it\n", node->node_id,
+			lcap->reg.name.len, lcap->reg.name.s);
+		request_sync(cluster, lcap, node->node_id);
+	}
 }
 
 static int no_sync_chunks_sent;

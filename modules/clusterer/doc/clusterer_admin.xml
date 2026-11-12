@@ -472,6 +472,60 @@ modparam("clusterer", "sync_timeout", 5)
 		</example>
         </section>
 
+        <section id="param_resync_after_link_down" xreflabel="resync_after_link_down">
+            <title><varname>resync_after_link_down</varname></title>
+            <para>
+                The minimum duration, in milliseconds, of an outage of the link
+                with a neighbour after which the capabilities that support data
+                synchronization request a sync from that neighbour when the link
+                is up again. Replicated data sent while the link was down, or
+                before the outage was detected, is otherwise lost for good. The
+                first link-up after a start does not trigger a sync. A sync only
+                adds and updates data; removals missed during the outage are not
+                recovered. Only the capabilities listed in
+                <xref linkend="param_link_resync_capabilities"/> resync.
+                Set it to <quote>0</quote> to disable the resync.
+            </para>
+            <para>
+		<emphasis>
+			Default value is <quote>1000</quote>.
+		</emphasis>
+            </para>
+            <example>
+		<title>Set <varname>resync_after_link_down</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("clusterer", "resync_after_link_down", 3000)
+...
+		</programlisting>
+		</example>
+        </section>
+
+        <section id="param_link_resync_capabilities" xreflabel="link_resync_capabilities">
+            <title><varname>link_resync_capabilities</varname></title>
+            <para>
+                Comma-separated list of the capabilities that resync after a
+                link outage (see <xref linkend="param_resync_after_link_down"/>).
+                List only capabilities whose sync merges into the local data.
+                The dialog capability, for example, drops at the end of a sync
+                every local dialog the sync did not contain, so it would lose
+                the dialogs created on this node during the outage.
+            </para>
+            <para>
+		<emphasis>
+			Default value is <quote>usrloc-contact-repl</quote>.
+		</emphasis>
+            </para>
+            <example>
+		<title>Set <varname>link_resync_capabilities</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("clusterer", "link_resync_capabilities", "")
+...
+		</programlisting>
+		</example>
+        </section>
+
         <section id="param_sync_packet_size" xreflabel="sync_packet_size">
             <title><varname>sync_packet_size</varname></title>
             <para>

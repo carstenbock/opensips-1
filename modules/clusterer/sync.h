@@ -26,6 +26,8 @@
 #define SYNC_CHUNK_START_MARKER 101010101
 
 extern int sync_packet_size;
+extern int resync_after_link_down;
+extern str link_resync_caps;
 
 struct reply_rpc_params {
 	cluster_info_t *cluster;
@@ -34,6 +36,7 @@ struct reply_rpc_params {
 };
 
 int cl_request_sync(str *capability, int cluster_id, int from_cb);
+void cl_resync_from_node(node_info_t *node);
 bin_packet_t *cl_sync_chunk_start(str *capability, int cluster_id, int dst_id,
                                   short data_version);
 int cl_sync_chunk_iter(bin_packet_t *packet);

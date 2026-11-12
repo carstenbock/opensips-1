@@ -73,6 +73,7 @@ Call-ID: 9ad9f89f-164d-bb86-1072-52e7e9eb5025.
 static int _pua_reginfo_self_op = 0;
 static int reginfo_deferred = 0;
 static void flush_removed(void);
+static void drop_touched(void);
 static int reginfo_publish_aor(str *aor);
 
 int w_reginfo_defer(struct sip_msg *msg)
@@ -89,6 +90,7 @@ int reginfo_clear_defer(struct sip_msg *msg, void *param)
 {
 	reginfo_deferred = 0;
 	flush_removed();
+	drop_touched();
 	return SCB_RUN_ALL;
 }
 
@@ -503,6 +505,81 @@ static int drop_removed(const str *aor)
 	return n;
 }
 
+/* Contacts that the request inserted or updated while reginfo_defer() holds
+ * the publishes back. reginfo_update() learns from them which contacts are
+ * new and which were refreshed (KI-162): TS 24.229 5.4.2.1.2 III) "for
+ * contact addresses to be registered: ... set the event attribute within the
+ * <contact> element to "registered"; for contact addresses to be
+ * re-registered, ... set the event attribute within the <contact> element to
+ * "refreshed" or "shortened" according to RFC 3680", and RFC 3680 5.2 "When
+ * a contact is refreshed through a REGISTER request, the FSM stays in the
+ * same state, but a refreshed event is generated." Kept per request
+ * (reginfo_clear_defer()). */
+struct touched_contact {
+	str aor;
+	str c;
+	int type;			/* UL_CONTACT_INSERT and/or UL_CONTACT_UPDATE */
+	struct touched_contact *next;
+};
+static struct touched_contact *touched_contacts = NULL;
+
+static struct touched_contact *find_touched(const str *aor, const str *c)
+{
+	struct touched_contact *t;
+
+	for(t = touched_contacts; t; t = t->next)
+		if(str_match(&t->aor, aor) && str_match(&t->c, c))
+			return t;
+	return NULL;
+}
+
+static void keep_touched_contact(ucontact_t *c, int type)
+{
+	struct touched_contact *t;
+
+	if((t = find_touched(c->aor, &c->c))) {
+		t->type |= type;
+		return;
+	}
+	t = pkg_malloc(sizeof *t + c->aor->len + c->c.len);
+	if(!t) {
+		LM_ERR("no more pkg memory\n");
+		return;
+	}
+	t->aor.s = (char *)(t + 1);
+	t->aor.len = c->aor->len;
+	memcpy(t->aor.s, c->aor->s, c->aor->len);
+	t->c.s = t->aor.s + t->aor.len;
+	t->c.len = c->c.len;
+	memcpy(t->c.s, c->c.s, c->c.len);
+	t->type = type;
+	t->next = touched_contacts;
+	touched_contacts = t;
+}
+
+static void drop_touched(void)
+{
+	struct touched_contact *t;
+
+	while((t = touched_contacts)) {
+		touched_contacts = t->next;
+		pkg_free(t);
+	}
+}
+
+/* UL_CONTACT_INSERT for a contact this request bound anew (also when it was
+ * updated afterwards, e.g. by a second save() of the same AoR), else
+ * UL_CONTACT_UPDATE for a refreshed one, 0 when the request did not touch
+ * it. */
+static int touched_type(const str *aor, const str *c)
+{
+	struct touched_contact *t = find_touched(aor, c);
+
+	if(!t)
+		return 0;
+	return (t->type & UL_CONTACT_INSERT) ? UL_CONTACT_INSERT : UL_CONTACT_UPDATE;
+}
+
 /* A removed binding keeps its id unless the binding that replaced it was
  * given the same address, which would duplicate the id (RFC 3680 5.2). */
 static const void *removed_id(struct removed_contact *r, urecord_t *record)
@@ -774,7 +851,9 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 			} else {
 				if (VALID_CONTACT(ptr, cur_time)) {
 					state = r_active;
-					event = r_registered;
+					/* refreshed by this request (KI-162), else as before */
+					event = touched_type(&record->aor, &ptr->c)
+							== UL_CONTACT_UPDATE ? r_refreshed : r_registered;
 				} else {
 					state = r_terminated;
 					event = r_expired;
@@ -863,8 +942,11 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 	 * record publishes nothing anyway or it cannot be kept; then it is
 	 * handled here as before. */
 	if(reginfo_deferred && !_pua_reginfo_self_op) {
-		if(!(type & (UL_CONTACT_DELETE|UL_CONTACT_EXPIRE)))
+		if(!(type & (UL_CONTACT_DELETE|UL_CONTACT_EXPIRE))) {
+			if(type & (UL_CONTACT_INSERT|UL_CONTACT_UPDATE))
+				keep_touched_contact(contact, type);
 			return;
+		}
 		if((ul_identities_key.len <= 0
 					|| ((key_value = ul.get_urecord_key(record, &ul_identities_key))
 						&& key_value->is_str))
@@ -1223,10 +1305,13 @@ static int reginfo_publish_aor(str *aor) {
 	for (r = removed_contacts; r && !str_match(&r->aor, aor); r = r->next)
 		;
 	if (record->contacts) {
-		if (record->contacts->next)
-			reginfo_usrloc_cb((void*)record->contacts, UL_CONTACT_UPDATE, NULL);
-		else
-			reginfo_usrloc_cb((void*)record->contacts, UL_CONTACT_INSERT, NULL);
+		/* the event of the first contact as the request set it (KI-162);
+		 * without a deferred save() the guess of before: a refresh when the
+		 * record has more than one contact */
+		n = touched_type(aor, &record->contacts->c);
+		if (!n)
+			n = record->contacts->next ? UL_CONTACT_UPDATE : UL_CONTACT_INSERT;
+		reginfo_usrloc_cb((void*)record->contacts, n, NULL);
 	} else if (r) {
 		/* Only removed bindings left: published as a removal, as without
 		 * reginfo_defer(). */

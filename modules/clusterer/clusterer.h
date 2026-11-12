@@ -53,6 +53,9 @@
 #define NODE_EVENT_DOWN		(1<<1)
 #define NODE_EVENT_UP		(1<<2)
 #define NODE_IS_SEED		(1<<3)
+/* the link came back after an outage of at least resync_after_link_down ms:
+ * the capabilities resync from this node (KI-14) */
+#define NODE_LINK_RESYNC	(1<<4)
 
 /* capability flags */
 #define CAP_STATE_OK         (1<<0)
