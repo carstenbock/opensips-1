@@ -289,6 +289,57 @@ modparam("auth_aka", "async_timeout", 2000)
 		</programlisting>
 		</example>
 	</section>
+	<section id="param_av_failure_reply" xreflabel="av_failure_reply">
+		<title><varname>av_failure_reply</varname> (integer)</title>
+		<para>
+			Controls who answers the request when the challenge functions
+			cannot get any authentication vector. With <emphasis>1</emphasis>
+			the module replies itself: <emphasis>500</emphasis> when the AV
+			manager reported a failure (for example an error answer to the
+			Cx MAR) and <emphasis>504</emphasis> when no vector arrived in time.
+		</para>
+		<para>
+			With <emphasis>0</emphasis> the module does not reply. The
+			challenge function returns <emphasis>-7</emphasis> when the AV
+			manager reported a failure with a Diameter result (an error
+			answer) and <emphasis>-8</emphasis> when there was no usable answer
+			(no vector in time, a Diameter timeout, or a failure without any
+			result code); with
+			<function moreinfo="none">async()</function> the resume route
+			gets this value in <emphasis>$rc</emphasis>. The
+			<emphasis>$aka_mar_rc</emphasis> and
+			<emphasis>$aka_mar_exp_rc</emphasis> variables then hold the
+			Result-Code and the Experimental-Result-Code (0 when absent) of the
+			failed request, so the script can choose the reply (for example 403
+			for DIAMETER_ERROR_USER_UNKNOWN, 3GPP TS 29.228) and add its own
+			headers. The variables are only set for these two return codes and
+			only the <emphasis>diameter</emphasis> AV manager fills them, when
+			the challenge function runs with
+			<function moreinfo="none">async()</function>.
+		</para>
+		<para>
+			Default value is <emphasis>1</emphasis>.
+		</para>
+		<example>
+		<title><varname>av_failure_reply</varname> parameter usage</title>
+		<programlisting format="linespecific">
+
+modparam("auth_aka", "av_failure_reply", 0)
+...
+if (!async(aka_www_challenge(), aka_mar_done))
+	t_reply(500, "Server Internal Error");
+...
+route[aka_mar_done] {
+	if ($rc == -7 &amp;&amp; $aka_mar_exp_rc == 5001)
+		t_reply(403, "Forbidden");
+	else if ($rc == -8)
+		t_reply(504, "Server Time-out");
+	else if ($rc == -7)
+		t_reply(500, "Server Internal Error");
+}
+		</programlisting>
+		</example>
+	</section>
 	<section id="param_unused_timeout" xreflabel="unused_timeout">
 		<title><varname>unused_timeout</varname> (integer)</title>
 		<para>

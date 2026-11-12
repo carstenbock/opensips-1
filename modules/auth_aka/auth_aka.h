@@ -70,6 +70,7 @@ struct aka_user {
 	unsigned int ref;
 	str impu;
 	int error_count;
+	int fail_rc, fail_exp_rc;	/* result of the last failed fetch */
 	struct aka_user_impi *impi;
 	struct list_head avs;
 	struct list_head list;
@@ -108,6 +109,7 @@ int aka_av_add(str *pub_id, str *priv_id, int algmask, str *authenticate,
 		str *authorize, str *ck, str *ik);
 int aka_av_drop(str *pub_id, str *priv_id, str *nonce);
 int aka_av_fail(str *pub_id, str *priv_id, int no);
+int aka_av_fail_rc(str *pub_id, str *priv_id, int no, int rc, int exp_rc);
 int aka_av_drop_all(str *pub_id, str *priv_id);
 int aka_av_drop_all_user(struct aka_user *user);
 

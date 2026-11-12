@@ -182,6 +182,9 @@ void remove_node_list(cluster_info_t *cl, node_info_t *node);
 int provision_neighbor(modparam_t type, void* val);
 int provision_current(modparam_t type, void *val);
 
+int cl_learn_node_addr(node_info_t *node, union sockaddr_union *src_su);
+int cl_resolve_node_addr(node_info_t *node);
+
 int cl_get_my_id(void);
 int cl_get_my_sip_addr(int cluster_id, str *out_addr);
 int cl_get_my_index(int cluster_id, str *capability, int *nr_nodes);

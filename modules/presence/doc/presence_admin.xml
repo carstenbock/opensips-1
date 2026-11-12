@@ -559,6 +559,31 @@ modparam("presence", "end_sub_on_timeout", 0)
 		</example>
 	</section>
 
+	<section id="param_end_sub_on_failure" xreflabel="end_sub_on_failure">
+		<title><varname>end_sub_on_failure</varname> (int)</title>
+		<para>
+			If a presence subscription should be terminated (destroyed)
+			when a sent NOTIFY request gets a final response that
+			RFC 6665 section 4.2.2 lists (404, 405, 410, 416, 480-485,
+			489, 501, 604), or 477 (Send Failed, answered by an OpenSIPS
+			hop that could not forward the NOTIFY). A 481 always ends
+			the subscription, a 408 depends on
+			<xref linkend="param_end_sub_on_timeout"/>.
+		</para>
+		<para>
+			<emphasis>Default value is <quote>1</quote> (enabled).
+		</emphasis>
+		</para>
+		<example>
+		<title>Set <varname>end_sub_on_failure</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("presence", "end_sub_on_failure", 0)
+...
+	</programlisting>
+		</example>
+	</section>
+
 	<section id="param_clean_period" xreflabel="clean_period">
 		<title><varname>clean_period</varname> (int)</title>
 		<para>

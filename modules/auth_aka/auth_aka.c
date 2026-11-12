@@ -103,6 +103,16 @@ static intptr_t aka_algs_mask = ALGFLG_UNSPEC;
 static int aka_hash_size = 4096;
 static int aka_sync_timeout = 100; /* ms */
 static int aka_async_timeout = 1000; /* ms */
+/* 1: when no vector could be fetched, the module answers 500 (the AV manager
+ * reported a failure) or 504 (no answer in time); 0: it does not answer and
+ * returns AKA_RC_FETCH_FAILED (an error answer with a result code) or
+ * AKA_RC_FETCH_TIMEOUT (no usable answer), so the script can choose the reply
+ * and add its own headers to it */
+static int aka_av_failure_reply = 1;
+/* result of the last failed fetch, for $aka_mar_rc and $aka_mar_exp_rc */
+static int aka_mar_rc, aka_mar_exp_rc;
+#define AKA_RC_FETCH_FAILED  -7
+#define AKA_RC_FETCH_TIMEOUT -8
 static int aka_unused_timeout = 60; /* s */
 static int aka_pending_timeout = 30; /* s */
 
@@ -192,6 +202,7 @@ static const param_export_t params[] = {
 	{"hash_size",         INT_PARAM, &aka_hash_size },
 	{"sync_timeout",      INT_PARAM, &aka_sync_timeout },
 	{"async_timeout",     INT_PARAM, &aka_async_timeout },
+	{"av_failure_reply",  INT_PARAM, &aka_av_failure_reply },
 	{"cachedb_url",       STR_PARAM, &aka_cachedb_url.s },
 	{0, 0, 0}
 };
@@ -232,6 +243,26 @@ static const dep_export_t deps = {
 };
 
 
+static int pv_get_aka_mar_rc(struct sip_msg *msg, pv_param_t *param,
+		pv_value_t *val)
+{
+	return pv_get_sintval(msg, param, val, aka_mar_rc);
+}
+
+static int pv_get_aka_mar_exp_rc(struct sip_msg *msg, pv_param_t *param,
+		pv_value_t *val)
+{
+	return pv_get_sintval(msg, param, val, aka_mar_exp_rc);
+}
+
+static const pv_export_t mod_pvars[] = {
+	{ str_const_init("aka_mar_rc"), 2110,
+	  pv_get_aka_mar_rc, 0, 0, 0, 0, 0 },
+	{ str_const_init("aka_mar_exp_rc"), 2111,
+	  pv_get_aka_mar_exp_rc, 0, 0, 0, 0, 0 },
+	{ {0, 0}, 0, 0, 0, 0, 0, 0, 0 }
+};
+
 /*
  * Module interface
  */
@@ -247,7 +278,7 @@ struct module_exports exports = {
 	params,     /* Exported parameters */
 	0,          /* exported statistics */
 	mi_cmds,    /* exported MI functions */
-	0,          /* exported pseudo-variables */
+	mod_pvars,  /* exported pseudo-variables */
 	0,          /* exported transformations */
 	0,          /* extra processes */
 	0,          /* module pre-initialization function */
@@ -803,6 +834,32 @@ end:
 	return c;
 }
 
+/* forgets the result of an earlier failed fetch of the user */
+static inline void aka_fetch_start(struct aka_user *user)
+{
+	aka_mar_rc = aka_mar_exp_rc = 0;
+	cond_lock(&user->cond);
+	user->fail_rc = user->fail_exp_rc = 0;
+	cond_unlock(&user->cond);
+}
+
+/* no vector could be fetched and the script answers: publish the result the
+ * AV manager reported and return the code for the script. A failure without
+ * any Diameter result (e.g. the Diameter request timed out) is reported as
+ * a timeout: there was no answer to act on */
+static int aka_fetch_failed(struct aka_user *user, int failed)
+{
+	cond_lock(&user->cond);
+	aka_mar_rc = user->fail_rc;
+	aka_mar_exp_rc = user->fail_exp_rc;
+	cond_unlock(&user->cond);
+	LM_DBG("no AV for %.*s: %s (rc %d, experimental rc %d)\n",
+			user->impu.len, user->impu.s, failed ? "failed" : "timeout",
+			aka_mar_rc, aka_mar_exp_rc);
+	return (failed && (aka_mar_rc || aka_mar_exp_rc)) ?
+		AKA_RC_FETCH_FAILED : AKA_RC_FETCH_TIMEOUT;
+}
+
 static int aka_challenge(struct sip_msg *_msg, struct aka_av_mgm *mgm, str *_realm,
 		qop_type_t qop, int algmask, int _code, const str_const *_challenge_msg)
 {
@@ -836,6 +893,7 @@ static int aka_challenge(struct sip_msg *_msg, struct aka_av_mgm *mgm, str *_rea
 
 	/* if we need more, fetch them remotely */
 	if (new_count + err_count != count) {
+		aka_fetch_start(user);
 		if (mgm->binds.fetch(&realm, &user->impu, &user->impi->impi,
 				(auts.len?&auts:NULL), algmask, 1, 0) != 0) {
 			LM_INFO("Could not fetch %d authentication vector(s)!\n", count);
@@ -848,6 +906,11 @@ static int aka_challenge(struct sip_msg *_msg, struct aka_av_mgm *mgm, str *_rea
 					count - new_count, count);
 	}
 
+	if (new_count == 0 && !aka_av_failure_reply) {
+		ret = aka_fetch_failed(user, err_count || user->fail_rc ||
+				user->fail_exp_rc);
+		goto release;
+	}
 	ret = aka_send_resp(_msg, &realm, user, avs, new_count, qop,
 			_code, _challenge_msg);
 
@@ -1054,7 +1117,7 @@ static int aka_async_param_unref(struct aka_async_param *param)
 
 static int aka_challenge_async_resume_handle(struct sip_msg *msg, void *_param, int timeout)
 {
-	int left, err_count;
+	int left, err_count, ret;
 	struct aka_async_param *param = _param;
 
 	/* if this handling has already been completed, drop it */
@@ -1081,11 +1144,15 @@ static int aka_challenge_async_resume_handle(struct sip_msg *msg, void *_param, 
 		LM_DBG("fetched all %d out of %d AVs (%d error)\n",
 				param->avs_fetched, param->avs_count, param->avs_error);
 	async_status = ASYNC_DONE_NO_IO;
+	ret = left;
 	if (!param->replied) {
 		if (param->avs_fetched) {
 			/* now send whatever we have fetched so far */
 			aka_send_resp(msg, &param->realm, param->user, param->avs, param->avs_fetched,
 					param->qop, param->code, _cs2cc(&param->challenge_msg));
+		} else if (!aka_av_failure_reply) {
+			/* the resume route sees this as $rc and replies */
+			ret = aka_fetch_failed(param->user, param->avs_error);
 		} else if (param->avs_error) {
 			if (auth_api.send_resp(msg, 500, NULL, NULL, 0) < 0)
 				LM_ERR("could not send error back\n");
@@ -1096,6 +1163,7 @@ static int aka_challenge_async_resume_handle(struct sip_msg *msg, void *_param, 
 	}
 	aka_async_param_remove(param);
 	aka_async_param_unref(param); /* finish everything */
+	left = ret;
 end:
 	if (!aka_async_param_unref(param)) {
 		/* we still have some possible signals in the queue, so let's wait for
@@ -1171,6 +1239,7 @@ static int aka_challenge_async(struct sip_msg *_msg, async_ctx *ctx,
 	LM_DBG("we still need %d out of %d AVs\n", count - c, count);
 
 	/* now that we finished preparing, go fetch the vectors */
+	aka_fetch_start(user);
 	if (mgm->binds.fetch(&realm, &user->impu, &user->impi->impi,
 			 (sync.len?&sync:NULL), algmask, 1, 1) != 0) {
 		LM_INFO("Could not fetch %d authentication vector(s)!\n", count);
@@ -1206,6 +1275,10 @@ static int aka_challenge_async(struct sip_msg *_msg, async_ctx *ctx,
 
 synchronous:
 	async_status = ASYNC_NO_IO;
+	if (c == 0 && !aka_av_failure_reply) {
+		ret = aka_fetch_failed(user, 1);
+		goto error;
+	}
 	/* only the AVs that were fetched: the rest of the array is not set */
 	ret = aka_send_resp(_msg, &realm, user, avs, c, qop,
 			_code, _challenge_msg);
@@ -1458,5 +1531,6 @@ int load_aka_av_api_bind(aka_av_api *api)
 	api->drop = aka_av_drop;
 	api->drop_all = aka_av_drop_all;
 	api->fail = aka_av_fail;
+	api->fail_rc = aka_av_fail_rc;
 	return 1;
 }

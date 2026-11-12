@@ -130,6 +130,9 @@ int mix_dialog_presence= 0;
 int notify_offline_body= 0;
 /* if subscription should be automatically ended on SIP timeout 408 */
 int end_sub_on_timeout= 1;
+/* if subscription should be ended on a NOTIFY failure that a retry on the
+ * same dialog cannot cure (RFC 6665 4.2.2 codes and 477) */
+int end_sub_on_failure= 1;
 /* holder for the pointer to presence event */
 pres_ev_t** pres_event_p= NULL;
 pres_ev_t** dialog_event_p= NULL;
@@ -185,6 +188,7 @@ static const param_export_t params[]={
 	{ "bla_fix_remote_target",  INT_PARAM, &fix_remote_target},
 	{ "notify_offline_body",    INT_PARAM, &notify_offline_body},
 	{ "end_sub_on_timeout",     INT_PARAM, &end_sub_on_timeout},
+	{ "end_sub_on_failure",     INT_PARAM, &end_sub_on_failure},
 	{ "cluster_id",             INT_PARAM, &pres_cluster_id},
 	{ "cluster_federation_mode",STR_PARAM, &federation_mode_str},
 	{ "cluster_be_active_shtag",STR_PARAM, &cluster_active_shtag_str},

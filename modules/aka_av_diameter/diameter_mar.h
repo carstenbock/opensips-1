@@ -48,5 +48,7 @@
 #define AKA_AV_DM_AUTH_ITEM_AUTHORIZE "3GPP-SIP-Authorization"
 #define AKA_AV_DM_AUTH_ITEM_CK "Confidentiality-Key"
 #define AKA_AV_DM_AUTH_ITEM_IK "Integrity-Key"
+#define AKA_AV_DM_EXP_RESULT "Experimental-Result"
+#define AKA_AV_DM_EXP_RESULT_CODE "Experimental-Result-Code"
 
 #endif /* AKA_AV_DIAMETER_MAR_H */

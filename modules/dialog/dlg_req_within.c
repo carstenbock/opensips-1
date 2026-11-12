@@ -488,7 +488,7 @@ int dlg_end_dlg(struct dlg_cell *dlg, str *extra_hdrs, int send_byes)
 			return -1;
 		}
 
-		if (d_tmb.t_cancel_trans(t,NULL) < 0) {
+		if (d_tmb.t_cancel_trans(t,extra_hdrs) < 0) {
 			LM_ERR("Failed to send cancels\n");
 			d_tmb.unref_cell(t);
 			return -1;

@@ -1374,7 +1374,11 @@ void bin_rcv_cl_packets(bin_packet_t *packet, int packet_type,
 			handle_internal_msg_unknown(packet, cl, packet_type, &ri->src_su,
 				ri->proto, source_id);
 	} else {
+		/* pings and pongs are never relayed, so their source IP is the
+		 * node's own address, possibly a new one after a restart */
 		if (!su_ip_cmp(&ri->src_su, &node->addr) &&
+			!((packet_type == CLUSTERER_PING || packet_type == CLUSTERER_PONG) &&
+				cl_learn_node_addr(node, &ri->src_su)) &&
 			!ip_check(cl, &ri->src_su, NULL)) {
 			LM_WARN("Received message from unknown source, addr: %s\n", ip);
 			goto exit;

@@ -31,6 +31,7 @@
 #include "../../rw_locking.h"
 #include "../../resolve.h"
 #include "../../socket_info.h"
+#include "../../net/net_tcp.h"
 #include "../../lib/csv.h"
 
 #include "api.h"
@@ -1117,6 +1118,105 @@ void api_free_next_hop(clusterer_node_t *next_hop)
 {
 	if (next_hop)
 		free_clusterer_node(next_hop);
+}
+
+/* Closes a BIN connection towards @su that is still connecting, typically a
+ * SYN-SENT towards the old address of a restarted node, by forcing its
+ * expiry; TCP main then drops it together with its queued chunks */
+static void drop_connecting_conn(node_info_t *node, union sockaddr_union *su)
+{
+	struct tcp_connection *c;
+	struct ip_addr ip;
+
+	su2ip_addr(&ip, su);
+	if (tcp_conn_get(0, &ip, su_getport(su), node->proto, NULL, &c, NULL,
+		node->cluster->send_sock) <= 0 || !c)
+		return;
+
+	if (c->state == S_CONN_CONNECTING) {
+		LM_NOTICE("closing pending connect to old address %s:%d of node [%d]\n",
+			ip_addr2a(&ip), su_getport(su), node->node_id);
+		c->lifetime = 0;
+	}
+
+	tcp_conn_release(c, 0);
+}
+
+/* Moves the node's BIN address to the IP of @su, keeping the port of the
+ * node's URL. Only done while the link with the node is not up, so that a
+ * working link can not be redirected. Returns 1 if the address was changed */
+static int set_node_ip(node_info_t *node, union sockaddr_union *su,
+	const char *source)
+{
+	union sockaddr_union old;
+	struct ip_addr old_ip, new_ip;
+
+	if (su->s.sa_family != node->addr.s.sa_family)
+		return 0;
+
+	su2ip_addr(&new_ip, su);
+
+	lock_get(node->lock);
+	su2ip_addr(&old_ip, &node->addr);
+	if (node->link_state == LS_UP || ip_addr_cmp(&old_ip, &new_ip)) {
+		lock_release(node->lock);
+		return 0;
+	}
+	old = node->addr;
+	if (su->s.sa_family == AF_INET6)
+		memcpy(&node->addr.sin6.sin6_addr, &su->sin6.sin6_addr, 16);
+	else
+		memcpy(&node->addr.sin.sin_addr, &su->sin.sin_addr, 4);
+	lock_release(node->lock);
+
+	LM_NOTICE("node [%d] in cluster [%d] (%.*s) moved from %s to %s (%s)\n",
+		node->node_id, node->cluster->cluster_id, node->url.len, node->url.s,
+		ip_addr2a(&old_ip), ip_addr2a(&new_ip), source);
+
+	drop_connecting_conn(node, &old);
+
+	return 1;
+}
+
+/* Called for a packet that the node can only have sent directly (ping or
+ * pong), received from an IP other than the node's known address: the node
+ * restarted with a new IP while we still use the one resolved earlier */
+int cl_learn_node_addr(node_info_t *node, union sockaddr_union *src_su)
+{
+	return set_node_ip(node, src_su, "learned from its ping");
+}
+
+/* Resolves the node's URL again, as its host may now point to a new IP */
+int cl_resolve_node_addr(node_info_t *node)
+{
+	union sockaddr_union su;
+	struct hostent *he;
+	unsigned short rport, rproto;
+	char *host;
+	int hlen, port, proto;
+	str st;
+
+	if (parse_phostport(node->url.s, node->url.len, &host, &hlen,
+		&port, &proto) < 0) {
+		LM_ERR("Bad URL for node [%d]\n", node->node_id);
+		return -1;
+	}
+	st.s = host;
+	st.len = hlen;
+	rport = port;
+	rproto = node->proto;
+
+	he = sip_resolvehost(&st, &rport, &rproto, 0, 0);
+	if (!he) {
+		LM_WARN("Cannot resolve host: %.*s of node [%d]\n", hlen, host,
+			node->node_id);
+		return -1;
+	}
+
+	if (hostent2su(&su, he, 0, rport) < 0)
+		return -1;
+
+	return set_node_ip(node, &su, "URL resolved again");
 }
 
 int cl_get_my_id(void)

@@ -2257,6 +2257,32 @@ int notify(subs_t* subs, subs_t * watcher_subs, str* n_body, int force_null_body
 	return 0;
 }
 
+/* RFC 6665 4.2.2: "If the NOTIFY transaction fails due to the receipt of a
+ * 404, 405, 410, 416, 480-485, 489, 501, or 604 response to the NOTIFY
+ * request, the notifier MUST remove the corresponding subscription."
+ * 481 is ended in any case, 408 by end_sub_on_timeout.
+ * 477 (Send Failed) is what an OpenSIPS hop answers when it cannot send the
+ * NOTIFY on, e.g. an IPsec GW without a security association for the
+ * watcher's old flow (KI-152). The subscription then stays until it expires
+ * and every NOTIFY on it fails the same way.
+ * SPEC-DEVIATION: RFC 3261 21.4 / RFC 5057 Table 1 -- 477 is not a
+ * registered code; as an unknown 4xx it would affect the transaction only.
+ * It is treated like the failed delivery of RFC 6665 4.2.2 ("If the NOTIFY
+ * request fails due to expiration of SIP Timer F (transaction timeout), the
+ * notifier SHOULD remove the subscription."): the watcher refreshes or
+ * re-subscribes and gets a new subscription. */
+static int notify_failure_ends_sub(int code)
+{
+	switch (code) {
+	case 404: case 405: case 410: case 416:
+	case 480: case 481: case 482: case 483: case 484: case 485:
+	case 489: case 501: case 604:
+	case 477:
+		return 1;
+	}
+	return 0;
+}
+
 void p_tm_callback( struct cell *t, int type, struct tmcb_params *ps)
 {
 	c_back_param* cb;
@@ -2285,7 +2311,8 @@ void p_tm_callback( struct cell *t, int type, struct tmcb_params *ps)
 			ps->code, cb?cb->to_tag.len:0, cb?cb->to_tag.s:"", t->cseq_n.len, t->cseq_n.s);
 	}
 
-	if(ps->code == 481 || (end_sub_on_timeout && (ps->code==408)) )
+	if(ps->code == 481 || (end_sub_on_timeout && (ps->code==408))
+			|| (end_sub_on_failure && notify_failure_ends_sub(ps->code)) )
 	{
 		unsigned int hash_code;
 

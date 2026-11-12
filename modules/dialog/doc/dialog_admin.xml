@@ -1882,7 +1882,7 @@ if ( get_dialogs_by_profile("caller",$fU,$avp(dlg_jsons),$avp(dlg_no)) ) {
 
 	<section id="func_dlg_end_dlgs_by_val" xreflabel="dlg_end_dlgs_by_val()">
 		<title>
-		<function moreinfo="none">dlg_end_dlgs_by_val(name, value)</function>
+		<function moreinfo="none">dlg_end_dlgs_by_val(name, value, [extra_hdrs])</function>
 		</title>
 		<para>
 		The function looks up through the whole dialog table for active dialogs
@@ -1910,6 +1910,15 @@ if ( get_dialogs_by_profile("caller",$fU,$avp(dlg_jsons),$avp(dlg_no)) ) {
 			<para><emphasis>value (var)</emphasis> - variable holding the dialog value to match
 			</para>
 		</listitem>
+		<listitem>
+			<para><emphasis>extra_hdrs (string, optional)</emphasis> - extra headers
+			(full header lines, each terminated by CRLF) added to the BYEs and, for
+			dialogs that are not confirmed yet, to the CANCELs. For example a
+			Reason header with the protocol RELEASE_CAUSE (3GPP TS 24.229). Without
+			it the requests carry only the headers of the
+			<emphasis>dlg_extra_hdrs</emphasis> parameter, as before.
+			</para>
+		</listitem>
 		</itemizedlist>
 		<para>
 		This function can be used from any type of route, including event routes.
@@ -1922,6 +1931,10 @@ if ( get_dialogs_by_profile("caller",$fU,$avp(dlg_jsons),$avp(dlg_no)) ) {
 event_route[E_UL_AOR_DELETE] {
 	dlg_end_dlgs_by_val("served_aor", $param(aor));
 }
+
+# release the calls of a subscriber after the loss of its media bearer
+dlg_end_dlgs_by_val("served_aor", $var(aor),
+	"Reason: RELEASE_CAUSE;cause=3;text=\"Media bearer loss\"\r\n");
 ...
 </programlisting>
 		</example>
@@ -2907,7 +2920,8 @@ route {
 			<listitem><para>
 				<emphasis>extra_hdrs</emphasis> - (optional) string containg
 				the extra headers (full format) to be added to the BYE
-				requests.
+				requests, or to the CANCEL of a dialog that is not
+				confirmed yet.
 			</para></listitem>
 		</itemizedlist>
 		<para>

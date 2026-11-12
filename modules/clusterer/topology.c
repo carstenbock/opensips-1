@@ -154,6 +154,9 @@ static void do_action_trans_4(node_info_t *node, int *link_state_to_set)
 	LM_INFO("Node timeout passed, restart pinging node [%d]\n",
 		node->node_id);
 
+	/* the node may have come back with a new IP */
+	cl_resolve_node_addr(node);
+
 	if (send_ping(node, 1) < 0) {
 		LM_ERR("Failed to send ping to node [%d]\n", node->node_id);
 		if (node->no_ping_retries != 0) {

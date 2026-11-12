@@ -553,6 +553,19 @@ static int proto_ipsec_bind_listener(struct socket_info *si)
 	return 0;
 }
 
+/* tells whether the transaction was started by a request received on an
+ * IPSec socket, i.e. from a UE through its SAs; such a request is relayed
+ * towards the core, not back to a UE */
+static int ipsec_t_from_ue(struct cell *t)
+{
+	const struct socket_info *si;
+
+	if (!t || t == T_UNDEFINED || !t->uas.request)
+		return 0;
+	si = t->uas.request->rcv.bind_address;
+	return si && si->internal_proto == PROTO_IPSEC;
+}
+
 static int proto_ipsec_send(const struct socket_info* source,
 		char* buf, unsigned int len, const union sockaddr_union* to,
 		unsigned int id)
@@ -631,6 +644,15 @@ static int proto_ipsec_send(const struct socket_info* source,
 			}
 			IPSEC_CTX_UNREF(ctx);
 			ctx = NULL;
+		} else if (fl.type == SIP_REQUEST && !ipsec_t_from_ue(t)) {
+			/* a request that did not come from a UE leaves an IPSec
+			 * socket only towards a UE: without a set of SAs it must not
+			 * be sent unprotected (3GPP TS 33.203 7.1); the send error
+			 * makes tm answer 477 */
+			LM_ERR("no valid IPSec context for %s:%hu - not sending %.*s"
+					" unprotected\n", ip_addr2a(&ip), port,
+					fl.u.request.method.len, fl.u.request.method.s);
+			return -1;
 		} else {
 			LM_WARN("could not find valid ctx for %s:%hu\n", ip_addr2a(&ip), port);
 		}

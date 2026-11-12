@@ -239,6 +239,12 @@ static int mod_init(void)
 		LM_ERR("failed to register the pre-script callback\n");
 		return -1;
 	}
+	/* Publishes the removals a request held back without reaching
+	 * reginfo_update(), when its script ends. */
+	if (register_script_cb(reginfo_clear_defer, POST_SCRIPT_CB|REQ_TYPE_CB, 0) < 0) {
+		LM_ERR("failed to register the post-script callback\n");
+		return -1;
+	}
 
 	/*
 	 * Import use_domain parameter from usrloc

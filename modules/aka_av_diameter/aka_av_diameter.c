@@ -504,6 +504,31 @@ static void aka_av_param_free(struct aka_av_param *param)
 }
 
 
+/* returns the Experimental-Result-Code of an answer, 0 if it has none */
+static int aka_av_diameter_exp_rc(cJSON *rpl)
+{
+	cJSON *it, *el;
+
+	if (!rpl || rpl->type != cJSON_Array)
+		return 0;
+	for (it = rpl->child; it; it = it->next) {
+		el = it->child;
+		if (it->type != cJSON_Object || !el || !el->string ||
+				strcmp(el->string, AKA_AV_DM_EXP_RESULT) ||
+				el->type != cJSON_Array)
+			continue;
+		for (it = el->child; it; it = it->next) {
+			el = it->child;
+			if (it->type == cJSON_Object && el && el->string &&
+					!strcmp(el->string, AKA_AV_DM_EXP_RESULT_CODE) &&
+					el->type == cJSON_Number)
+				return el->valueint;
+		}
+		break;
+	}
+	return 0;
+}
+
 static int aka_av_dm_reply(diameter_conn *conn, diameter_reply *reply, void *param)
 {
 	int ret;
@@ -513,7 +538,9 @@ static int aka_av_dm_reply(diameter_conn *conn, diameter_reply *reply, void *par
 		if (ret < p->count)
 			aka_api.fail(&p->impu, &p->impi, p->count - ret);
 	} else {
-		aka_api.fail(&p->impu, &p->impi, p->count); /* mark all as failed */
+		/* mark all as failed, and tell why (TS 29.228 6.3) */
+		aka_api.fail_rc(&p->impu, &p->impi, p->count, reply->rc,
+				aka_av_diameter_exp_rc(dm_api.get_reply(reply)));
 	}
 	dm_api.free_reply(reply);
 	return -1;

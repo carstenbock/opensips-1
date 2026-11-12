@@ -72,6 +72,8 @@ Call-ID: 9ad9f89f-164d-bb86-1072-52e7e9eb5025.
 
 static int _pua_reginfo_self_op = 0;
 static int reginfo_deferred = 0;
+static void flush_removed(void);
+static int reginfo_publish_aor(str *aor);
 
 int w_reginfo_defer(struct sip_msg *msg)
 {
@@ -80,10 +82,13 @@ int w_reginfo_defer(struct sip_msg *msg)
 }
 
 /* A request that set the flag and never reached reginfo_update() must not
- * hold back the publishes of the next one in this process. */
+ * hold back the publishes of the next one in this process. The removals it
+ * held back are published now, late rather than never. Runs before and
+ * after every request script. */
 int reginfo_clear_defer(struct sip_msg *msg, void *param)
 {
 	reginfo_deferred = 0;
+	flush_removed();
 	return SCB_RUN_ALL;
 }
 
@@ -408,6 +413,123 @@ static void free_id_gruus(void)
 	}
 }
 
+/* Bindings removed while reginfo_defer() holds the publishes back, e.g. the
+ * contact that a re-registration with new IPsec ports replaces (save() with
+ * max-contacts=1). Published on its own, the removal sent every watcher a
+ * second NOTIFY a few milliseconds before the deferred one (KI-152).
+ * reginfo_update() lists them as terminated in its single document instead:
+ * a full-state document carries every contact with its own state (RFC 3680
+ * §5, TS 24.229 5.4.2.1.2). */
+struct removed_contact {
+	ucontact_t c;		/* strings and params point into this block */
+	const void *id;		/* the removed binding, for its contact id */
+	int type;			/* UL_CONTACT_DELETE or UL_CONTACT_EXPIRE */
+	str aor;
+	struct removed_contact *next;
+};
+static struct removed_contact *removed_contacts = NULL;
+
+/* 0 when the removal is kept for the deferred document. */
+static int keep_removed_contact(ucontact_t *c, int type)
+{
+	struct removed_contact *r;
+	param_t *p, *np;
+	int n = 0, len;
+	char *s;
+
+	for(p = c->params; p; p = p->next)
+		n++;
+	len = sizeof *r + n * sizeof(param_t) + c->aor->len + c->c.len
+			+ c->callid.len + c->instance.len;
+	for(p = c->params; p; p = p->next)
+		len += p->name.len + p->body.len;
+	r = pkg_malloc(len);
+	if(!r) {
+		LM_ERR("no more pkg memory\n");
+		return -1;
+	}
+	memset(r, 0, sizeof *r + n * sizeof(param_t));
+	np = (param_t *)(r + 1);
+	s = (char *)(np + n);
+#define REMOVED_COPY(_dst, _src) \
+	do { \
+		(_dst).s = s; \
+		(_dst).len = (_src).len; \
+		memcpy(s, (_src).s, (_src).len); \
+		s += (_src).len; \
+	} while(0)
+	REMOVED_COPY(r->aor, *c->aor);
+	REMOVED_COPY(r->c.c, c->c);
+	REMOVED_COPY(r->c.callid, c->callid);
+	REMOVED_COPY(r->c.instance, c->instance);
+	for(p = c->params; p; p = p->next, np++) {
+		np->type = p->type;
+		REMOVED_COPY(np->name, p->name);
+		REMOVED_COPY(np->body, p->body);
+		np->len = p->len;
+		np->next = p->next ? np + 1 : NULL;
+	}
+#undef REMOVED_COPY
+	r->c.params = n ? (param_t *)(r + 1) : NULL;
+	r->c.aor = &r->aor;
+	r->c.domain = c->domain;
+	r->c.q = c->q;
+	r->c.cseq = c->cseq;
+	r->c.expires = c->expires;
+	r->id = c;
+	r->type = type;
+	r->next = removed_contacts;
+	removed_contacts = r;
+	LM_DBG("removal of %.*s held back for the deferred reginfo document\n",
+			c->c.len, c->c.s);
+	return 0;
+}
+
+/* Drops the held-back removals of aor, or all of them for NULL. */
+static int drop_removed(const str *aor)
+{
+	struct removed_contact **pr = &removed_contacts, *r;
+	int n = 0;
+
+	while((r = *pr)) {
+		if(aor && !str_match(&r->aor, aor)) {
+			pr = &r->next;
+			continue;
+		}
+		*pr = r->next;
+		pkg_free(r);
+		n++;
+	}
+	return n;
+}
+
+/* A removed binding keeps its id unless the binding that replaced it was
+ * given the same address, which would duplicate the id (RFC 3680 5.2). */
+static const void *removed_id(struct removed_contact *r, urecord_t *record)
+{
+	ucontact_t *c;
+
+	for(c = record->contacts; c; c = c->next)
+		if((const void *)c == r->id)
+			return r;
+	return r->id;
+}
+
+static int removed_has_gruu(const str *aor)
+{
+	struct removed_contact *r;
+	param_t *param;
+
+	for(r = removed_contacts; r; r = r->next) {
+		if(!str_match(&r->aor, aor))
+			continue;
+		for(param = r->c.params; param; param = param->next)
+			if(is_gruu_param(&param->name) && param->body.len > 0)
+				return 1;
+	}
+	return 0;
+}
+
 /* usrloc key of a SIP or SIPS identity. tel: identities have no GRUU and
  * return -1. key points into a static buffer. */
 static int identity_ul_key(const str *identity, str *key)
@@ -452,7 +574,8 @@ static void append_gruu(str_buffer *buffer, str *open, str *value, int cseq)
  * index) keeps the contact ids unique within the document (RFC 3680 5.2).
  * copy_pub: the registered identity is listed itself, so its pub-gruu may be
  * repeated under the other identities. */
-static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int expires, str state, str event,
+static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, const void *id,
+		int expires, str state, str event,
 		const str *identity, int own_gruu, int copy_pub, int id_idx)
 {
 	param_t *param;	
@@ -460,11 +583,11 @@ static void process_xml_for_contact(str_buffer *buffer, ucontact_t *ptr, int exp
 	if(ptr->q != -1) {
 		float q = (float)ptr->q / 1000;
 
-		str_buffer_append_str_fmt(buffer, &contact_s_q, ptr, id_idx,
+		str_buffer_append_str_fmt(buffer, &contact_s_q, id, id_idx,
 				STR_FMT(&state), STR_FMT(&event), expires, q, STR_FMT(&ptr->callid));
 	} else {
 		// XXX: before was it contact_s_q but no q so changed to contact_s
-		str_buffer_append_str_fmt(buffer, &contact_s, ptr, id_idx,
+		str_buffer_append_str_fmt(buffer, &contact_s, id, id_idx,
 				STR_FMT(&state), STR_FMT(&event), expires, STR_FMT(&ptr->callid));
 	}
 
@@ -550,6 +673,7 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 	str state = STR_NULL;
 	str event = STR_NULL;
 	ucontact_t *ptr;
+	struct removed_contact *rc;
 	time_t cur_time = time(0);
 	int expires = 0;
 	int i = 0;
@@ -573,7 +697,8 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 	}
 	str_buffer_append_str(buffer, &xml_start);
 	str_buffer_append_str_fmt(buffer,
-			(record_has_gruu(record->contacts) || id_gruus)
+			(record_has_gruu(record->contacts)
+					|| removed_has_gruu(&record->aor) || id_gruus)
 					? &r_reginfo_s_gr : &r_reginfo_s,
 			VERSION_HOLDER, STR_FMT(&r_full));
 
@@ -657,9 +782,20 @@ str build_reginfo_full(urecord_t *record, ucontact_t *contact, str aor[], unsign
 				}
 			}
 
-			process_xml_for_contact(buffer, ptr, expires, state, event,
+			process_xml_for_contact(buffer, ptr, ptr, expires, state, event,
 					&aor[i], own_gruu, copy_pub, i);
 			ptr = ptr->next;
+		}
+
+		/* Bindings removed while the publish was deferred */
+		for(rc = removed_contacts; rc; rc = rc->next) {
+			if(!str_match(&rc->aor, &record->aor))
+				continue;
+			*count = *count + 1;
+			process_xml_for_contact(buffer, &rc->c, removed_id(rc, record), 0,
+					r_terminated,
+					rc->type == UL_CONTACT_EXPIRE ? r_expired : r_unregistered,
+					&aor[i], own_gruu, copy_pub, i);
 		}
 
 		str_buffer_append_str(buffer, &registration_e);
@@ -723,9 +859,17 @@ void reginfo_usrloc_cb(void *binding, ul_cb_type type, ul_cb_extra *_) {
 	}
 	/* The script announced with reginfo_defer() that reginfo_update() follows
 	 * the save(); only that builds the document with every identity's GRUUs.
-	 * Removals are still published here. */
-	if(reginfo_deferred && (type & (UL_CONTACT_INSERT|UL_CONTACT_UPDATE))) {
-		return;
+	 * A removal goes into that document too (removed_contacts), unless this
+	 * record publishes nothing anyway or it cannot be kept; then it is
+	 * handled here as before. */
+	if(reginfo_deferred && !_pua_reginfo_self_op) {
+		if(!(type & (UL_CONTACT_DELETE|UL_CONTACT_EXPIRE)))
+			return;
+		if((ul_identities_key.len <= 0
+					|| ((key_value = ul.get_urecord_key(record, &ul_identities_key))
+						&& key_value->is_str))
+				&& keep_removed_contact(contact, type) == 0)
+			return;
 	}
 	if(_pua_reginfo_self_op == 1) {
 		LM_DBG("operation triggered by own action for aor: %.*s (%d)\n",
@@ -1030,9 +1174,33 @@ static void collect_id_gruus(str *aor)
 }
 
 int w_reginfo_update(struct sip_msg *msg, str * aor) {
-	urecord_t *record = NULL;
-
 	reginfo_deferred = 0;
+	return reginfo_publish_aor(aor);
+}
+
+/* Publishes the removals held back by a request that did not reach
+ * reginfo_update() for their record. */
+static void flush_removed(void)
+{
+	str aor;
+
+	while(removed_contacts) {
+		if(pkg_str_dup(&aor, &removed_contacts->aor) < 0) {
+			LM_ERR("no more pkg memory, %d held-back removals not published\n",
+					drop_removed(NULL));
+			return;
+		}
+		reginfo_publish_aor(&aor);
+		pkg_free(aor.s);
+	}
+}
+
+/* Publishes the document of aor and drops its held-back removals. */
+static int reginfo_publish_aor(str *aor) {
+	urecord_t *record = NULL;
+	struct removed_contact *r;
+	int n;
+
 	collect_id_gruus(aor);
 
 	/* Let's lock that domain for this AOR: */
@@ -1047,13 +1215,22 @@ int w_reginfo_update(struct sip_msg *msg, str * aor) {
 		/* Let's lock that domain for this AOR: */
 		ul.unlock_udomain(ul_domain, aor);
 		free_id_gruus();
+		if ((n = drop_removed(aor)) > 0)
+			LM_WARN("record %.*s is gone, the removal of %d binding(s) "
+				"is not published\n", aor->len, aor->s, n);
 		return -1;
 	}
+	for (r = removed_contacts; r && !str_match(&r->aor, aor); r = r->next)
+		;
 	if (record->contacts) {
 		if (record->contacts->next)
 			reginfo_usrloc_cb((void*)record->contacts, UL_CONTACT_UPDATE, NULL);
 		else
 			reginfo_usrloc_cb((void*)record->contacts, UL_CONTACT_INSERT, NULL);
+	} else if (r) {
+		/* Only removed bindings left: published as a removal, as without
+		 * reginfo_defer(). */
+		reginfo_usrloc_cb((void*)&r->c, r->type, NULL);
 	} else {
 		LM_DBG("Registered, but no contacts. Not updating Reg-Info-State");
 	}
@@ -1061,5 +1238,6 @@ int w_reginfo_update(struct sip_msg *msg, str * aor) {
 	/* Let's lock that domain for this AOR: */
 	ul.unlock_udomain(ul_domain, aor);
 	free_id_gruus();
+	drop_removed(aor);
 	return 1;
 }

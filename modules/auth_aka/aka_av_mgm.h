@@ -81,12 +81,21 @@ typedef int (*aka_av_drop_all_f)(str *pub_id, str *priv_id);
  */
 typedef int (*aka_av_fail_f)(str *pub_id, str *priv_id, int count);
 
+/*
+ * Same as aka_av_fail_f, and also passes the Result-Code and the
+ * Experimental-Result-Code (0 when absent) of the failed request, e.g. a
+ * Cx MAA (3GPP TS 29.228 6.3)
+ */
+typedef int (*aka_av_fail_rc_f)(str *pub_id, str *priv_id, int count,
+		int rc, int exp_rc);
+
 
 typedef struct aka_av_api {
 	aka_av_add_f add;
 	aka_av_drop_f drop;
 	aka_av_drop_all_f drop_all;
 	aka_av_fail_f fail;
+	aka_av_fail_rc_f fail_rc;
 } aka_av_api;
 
 typedef int (*aka_av_api_bind_f)(aka_av_api *api);

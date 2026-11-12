@@ -894,6 +894,11 @@ int aka_av_drop(str *pub_id, str *priv_id, str *nonce)
 
 int aka_av_fail(str *pub_id, str *priv_id, int count)
 {
+	return aka_av_fail_rc(pub_id, priv_id, count, 0, 0);
+}
+
+int aka_av_fail_rc(str *pub_id, str *priv_id, int count, int rc, int exp_rc)
+{
 	struct aka_user *user = aka_user_find(pub_id, priv_id);
 
 	if (!user) {
@@ -903,6 +908,8 @@ int aka_av_fail(str *pub_id, str *priv_id, int count)
 	}
 	cond_lock(&user->cond);
 	user->error_count += count;
+	user->fail_rc = rc;
+	user->fail_exp_rc = exp_rc;
 	if (!list_empty(&user->async))
 		aka_signal_async(user, user->async.next);
 	cond_signal(&user->cond);

@@ -146,7 +146,7 @@ static int w_get_dlg_jsons_by_val(struct sip_msg *msg,
 static int w_get_dlg_jsons_by_profile(struct sip_msg *msg,
 		str *attr, str *attr_val, pv_spec_t *out, pv_spec_t *number_val);
 static int w_dlg_end_dlgs_by_val(struct sip_msg *msg,
-		str *attr, pv_spec_t *attr_val);
+		str *attr, pv_spec_t *attr_val, str *extra_hdrs);
 static int w_get_dlg_vals(struct sip_msg *msg, pv_spec_t *v_name,
 		pv_spec_t *v_val, str *callid);
 static int w_tsl_dlg_flag(struct sip_msg *msg, void *_idx, int *_val);
@@ -259,7 +259,8 @@ static const cmd_export_t cmds[]={
 		ALL_ROUTES},
 	{"dlg_end_dlgs_by_val",(cmd_function)w_dlg_end_dlgs_by_val, {
 		{CMD_PARAM_STR,0,0},
-		{CMD_PARAM_VAR,0,0}, {0,0,0}},
+		{CMD_PARAM_VAR,0,0},
+		{CMD_PARAM_STR|CMD_PARAM_OPT,0,0}, {0,0,0}},
 		ALL_ROUTES},
 	{"match_dialog",  (cmd_function)w_match_dialog, {
 		{CMD_PARAM_STR|CMD_PARAM_OPT,fixup_mmode,0}, {0,0,0}},
@@ -2285,9 +2286,11 @@ static int w_get_dlg_jsons_by_val(struct sip_msg *msg, str *attr, pv_spec_t *att
 
 /* Terminate (BYE both legs) all active dialogs that carry the dialog value
  * @attr equal to @attr_val. Used to release a subscriber's ongoing calls when
- * the registration is torn down (e.g. PCRF-signalled IP-CAN bearer loss). */
+ * the registration is torn down (e.g. PCRF-signalled IP-CAN bearer loss).
+ * @extra_hdrs (optional, full header lines) are added to the BYEs and to the
+ * CANCELs of dialogs that are not confirmed yet. */
 static int w_dlg_end_dlgs_by_val(struct sip_msg *msg, str *attr,
-			pv_spec_t *attr_val)
+			pv_spec_t *attr_val, str *extra_hdrs)
 {
 	struct dlg_cell *dlg;
 	struct dlg_entry *d_entry;
@@ -2295,6 +2298,15 @@ static int w_dlg_end_dlgs_by_val(struct sip_msg *msg, str *attr,
 	unsigned int h;
 	int n = 0;
 	int shtag_state;
+
+	if (extra_hdrs && extra_hdrs->len == 0)
+		extra_hdrs = NULL;
+	if (extra_hdrs && (extra_hdrs->len < 2 ||
+	memcmp(extra_hdrs->s + extra_hdrs->len - 2, CRLF, CRLF_LEN))) {
+		LM_ERR("extra headers must end with CRLF: [%.*s]\n",
+			extra_hdrs->len, extra_hdrs->s);
+		return -1;
+	}
 
 	/* First collect all matching dialogs (referenced) while holding the
 	 * per-entry lock, then terminate them afterwards: dlg_end_dlg() sends
@@ -2347,7 +2359,7 @@ terminate:
 		init_dlg_term_reason(delete_entry->dlg, "Registration Terminated",
 				sizeof("Registration Terminated") - 1);
 
-		if (dlg_end_dlg(delete_entry->dlg, NULL, 1)) {
+		if (dlg_end_dlg(delete_entry->dlg, extra_hdrs, 1)) {
 			LM_ERR("error while terminating dlg %.*s\n",
 				delete_entry->dlg->callid.len,
 				delete_entry->dlg->callid.s);
