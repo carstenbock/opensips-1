@@ -41,6 +41,9 @@
 extern int gruu_legacy_xor;
 extern int gruu_legacy_host;
 extern str gruu_domain;
+/* gruu_domain_avp; name -1 when the parameter is not set */
+extern int gruu_domain_avp_name;
+extern unsigned short gruu_domain_avp_type;
 extern str gruu_cachedb_url;
 extern str gruu_imei_namespace;
 

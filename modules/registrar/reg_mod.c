@@ -135,6 +135,10 @@ str gruu_imei_namespace = {0,0};
 int disable_gruu = 1;
 int gruu_legacy_xor = 0;
 int gruu_legacy_host = 0;
+/* AVP whose value, when set, replaces gruu_domain for the current request */
+char *gruu_domain_avp_param = 0;
+int gruu_domain_avp_name = -1;
+unsigned short gruu_domain_avp_type = 0;
 
 #define RCV_NAME "received"
 str rcv_param = str_init(RCV_NAME);
@@ -238,6 +242,7 @@ static const param_export_t params[] = {
 	{"attr_avp",           STR_PARAM, &attr_avp_param        },
 	{"gruu_secret",        STR_PARAM, &gruu_secret.s         },
 	{"gruu_domain",        STR_PARAM, &gruu_domain.s         },
+	{"gruu_domain_avp",    STR_PARAM, &gruu_domain_avp_param },
 	{"gruu_legacy_xor",    INT_PARAM, &gruu_legacy_xor       },
 	{"gruu_legacy_host",   INT_PARAM, &gruu_legacy_host      },
 	{"gruu_cachedb_url",   STR_PARAM, &gruu_cachedb_url.s    },
@@ -376,6 +381,21 @@ static int mod_init(void)
 	} else {
 		attr_avp_name = -1;
 		attr_avp_type = 0;
+	}
+
+	if (gruu_domain_avp_param && *gruu_domain_avp_param) {
+		s.s = gruu_domain_avp_param; s.len = strlen(s.s);
+		if (pv_parse_spec(&s, &avp_spec)==0
+				|| avp_spec.type!=PVT_AVP) {
+			LM_ERR("malformed or non AVP %s AVP definition\n", gruu_domain_avp_param);
+			return -1;
+		}
+
+		if(pv_get_avp_name(0, &avp_spec.pvp, &gruu_domain_avp_name,
+				&gruu_domain_avp_type)!=0) {
+			LM_ERR("[%s]- invalid AVP definition\n", gruu_domain_avp_param);
+			return -1;
+		}
 	}
 
 	if (load_ul_api(&ul) != 0) {

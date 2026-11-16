@@ -505,6 +505,38 @@ modparam("registrar", "gruu_domain", "ims.mnc001.mcc001.3gppnetwork.org")
 		</programlisting>
 		</example>
 	</section>
+	<section id="param_gruu_domain_avp" xreflabel="gruu_domain_avp">
+		<title><varname>gruu_domain_avp</varname> (string)</title>
+		<para>
+		AVP that holds the GRUU host for the current request. When the AVP
+		has a non-empty string value, it replaces
+		<xref linkend="param_gruu_domain"/> for both the public and the
+		temporary GRUU; otherwise <xref linkend="param_gruu_domain"/> applies.
+		</para>
+		<para>
+		A registrar that serves several domains with usrloc
+		<emphasis>use_domain</emphasis> 0 stores AoRs without a domain. A
+		public GRUU is a public user identity plus the
+		<emphasis>gr</emphasis> parameter (RFC 5627 section 3.1, TS 24.229
+		clause 5.4.7A), so the script sets the domain of the identity before
+		each <function>save()</function>.
+		</para>
+		<para>
+		Default value is empty (no AVP). Ignored when
+		<xref linkend="param_gruu_legacy_host"/> is 1.
+		</para>
+		<example>
+		<title>Set <varname>gruu_domain_avp</varname> parameter</title>
+		<programlisting format="linespecific">
+...
+modparam("registrar", "gruu_domain_avp", "$avp(gruu_domain)")
+...
+$avp(gruu_domain) := $(var(uri){uri.host});
+save("location", "no-reply", $var(uri));
+...
+		</programlisting>
+		</example>
+	</section>
 	<section id="param_gruu_imei_namespace" xreflabel="gruu_imei_namespace">
 		<title><varname>gruu_imei_namespace</varname> (string)</title>
 		<para>

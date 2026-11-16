@@ -32,6 +32,7 @@
 #include "../../sha1.h"
 #include "../../sha256.h"
 #include "../../socket_info.h"
+#include "../../usr_avp.h"
 #include "../../ut.h"
 
 #include "aead.h"
@@ -378,6 +379,23 @@ static int gruu_socket_host(const struct socket_info *sock, str *host)
 	return 0;
 }
 
+/* The gruu_domain_avp value of the current request, if it is a non-empty
+ * string. The AVP value lives as long as the request, which outlives every
+ * caller: ci.c and reply.c copy the host before the request ends. */
+static int gruu_avp_domain(str *host)
+{
+	struct usr_avp *avp;
+	int_str val;
+
+	if (gruu_domain_avp_name < 0)
+		return 0;
+	avp = search_first_avp(gruu_domain_avp_type, gruu_domain_avp_name, &val, 0);
+	if (!avp || !(avp->flags & AVP_VAL_STR) || val.s.len <= 0)
+		return 0;
+	*host = val.s;
+	return 1;
+}
+
 int reg_gruu_target(const str *aor, const struct socket_info *sock,
 		int temporary, str *user, str *host)
 {
@@ -404,7 +422,14 @@ int reg_gruu_target(const str *aor, const struct socket_info *sock,
 
 	/* An explicit domain replaces the socket and the AoR domain for both
 	 * GRUUs. The user part stays the AoR user, so a domain already stored
-	 * in the AoR is not written twice. */
+	 * in the AoR is not written twice. A value in gruu_domain_avp wins over
+	 * gruu_domain: with usrloc use_domain 0 the AoR has no domain, and a
+	 * registrar serving several home domains sets the one of the identity
+	 * being saved (RFC 5627 3.1, TS 24.229 5.4.7A). */
+	if (gruu_avp_domain(host)) {
+		*user = aor_user;
+		return 0;
+	}
 	if (gruu_domain.s && gruu_domain.len > 0) {
 		*user = aor_user;
 		*host = gruu_domain;

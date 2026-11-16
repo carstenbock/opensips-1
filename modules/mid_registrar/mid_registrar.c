@@ -107,6 +107,8 @@ str gruu_imei_namespace = {0,0};
 int disable_gruu = 1;
 int gruu_legacy_xor = 0;
 int gruu_legacy_host = 0;
+int gruu_domain_avp_name = -1;
+unsigned short gruu_domain_avp_type = 0;
 str realm_prefix = str_init("");
 int reg_use_domain = 0;
 
