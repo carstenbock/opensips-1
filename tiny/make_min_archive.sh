@@ -42,11 +42,11 @@ filter_unnecessary_files() {
 	rm -f /tmp/modules.lst.new
 	for f in $(cat /tmp/modules.lst)
     	do
-		f=$(echo $f | sed "s/.so//")
+		f=$(echo $f | sed "s/\\.so$//")
 		echo "$f.so" >> /tmp/modules.lst.new
 	done
 	ls -1 /usr/lib/x86_64-linux-gnu/opensips/modules/ > /tmp/modules.installed
-	for f in $(grep -Fvf /tmp/modules.lst.new /tmp/modules.installed)
+	for f in $(grep -Fxvf /tmp/modules.lst.new /tmp/modules.installed)
 	do
 		echo "Removing module $f..."
 		sed -i \
@@ -67,6 +67,30 @@ filter_unnecessary_files() {
         -e '\|^/usr/sbin/opensipsdbctl|d' \
         -e '\|^/usr/sbin/osipsconsole|d' \
         $FILELIST
+
+    # No command-line tools from libc6 and the OpenSIPS packages: the image
+    # runs opensips and the probe helper only (helm ADR-0051).
+    sed -i \
+        -e '\|^/usr/bin/.|d' \
+        -e '\|^/sbin/.|d' \
+        -e '\|^/bin/.|d' \
+        -e '\|^/usr/sbin/.|{\|^/usr/sbin/opensips$|!d}' \
+        -e '\|^/usr/lib/x86_64-linux-gnu/audit|d' \
+        -e '\|^/usr/libexec|d' \
+        -e '\|^/usr/lib/debug|d' \
+        $FILELIST
+}
+
+# Files OpenSIPS opens at run time that no package file list or ldd names.
+runtime_files_debian() {
+    cat << EOF
+/usr/local/bin/opensips-probe
+/etc/nsswitch.conf
+/etc/protocols
+/etc/services
+/etc/ssl/certs/ca-certificates.crt
+EOF
+    find /usr/lib/x86_64-linux-gnu/libmariadb3/plugin -name '*.so' 2>/dev/null
 }
 
 ldd_helper() {
@@ -94,8 +118,12 @@ find_binaries() {
 
 tar_files() {
     local TARLIST=/tmp/tarlist
-    cat $FILELIST > $TARLIST
-    cat $FILELIST_BINARY >> $TARLIST
+    # Debian has merged /usr: /lib, /lib64, /bin and /sbin are symlinks into
+    # /usr, so the package lists and ldd name the same file twice. Each file
+    # goes into the archive once, under /usr; make_image_tar adds the links.
+    cat $FILELIST $FILELIST_BINARY \
+        | sed -E -e 's#^/(lib|lib64|bin|sbin)/#/usr/\1/#' -e '\#^/(lib|lib64|bin|sbin)$#d' \
+        | sort -u > $TARLIST
     tar -czf $TMP_TAR --no-recursion -T $TARLIST
     rm -f $TARLIST
 }
@@ -104,6 +132,12 @@ make_image_tar() {
     local CURDIR=`pwd`
     cd $BUILD_ROOT
     tar xzf $TMP_TAR
+    for d in lib lib64 bin sbin; do
+        ln -sfn usr/$d $d
+    done
+    # Mount points and the working directories of the charts.
+    mkdir -p etc/opensips run/opensips tmp
+    chmod 1777 tmp
     tar czf $IMG_TAR *
     cd $CURDIR
 }
@@ -113,6 +147,7 @@ fs_files_debian > $FILELIST
 extra_files_debian >> $FILELIST
 sort_filelist
 filter_unnecessary_files
+runtime_files_debian >> $FILELIST
 find_binaries
 tar_files
 make_image_tar

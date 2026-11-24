@@ -1,15 +1,53 @@
 #!/bin/bash
+# Builds and pushes the OpenSIPS images (helm ADR-0019, ADR-0051):
+#
+#   opensips:<version>-<chart>   distroless, the modules of one chart
+#                                (tiny/modules/modules.lst.<chart>); the
+#                                default image of that chart
+#   opensips:<version>-init      init container that renders the config
+#   opensips:<version>-debug     every module and the debug tools; also
+#                                tagged <version> for older charts
+#
+#   ./build [--no-push] [CHART ...]     default: every chart
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 VERSION=$(head -1 < VERSION)
 REGISTRY="${REGISTRY:-harbor.volte.io/cnaas}"
 IMAGE="opensips"
+REPO="${REGISTRY}/${IMAGE}"
+VARIANTS=(pcscf icscf scscf sbc ipsecgw mmtel ecscf ipsmgw srvcc)
+
+PUSH=1
+SELECTED=()
+for arg in "$@"; do
+    case "$arg" in
+        --no-push) PUSH=0 ;;
+        -*)        echo "Usage: $(basename "$0") [--no-push] [CHART ...]"; exit 1 ;;
+        *)         [[ -f "tiny/modules/modules.lst.${arg}" ]] || { echo "unknown chart: ${arg}"; exit 1; }
+                   SELECTED+=("$arg") ;;
+    esac
+done
+[[ ${#SELECTED[@]} -eq 0 ]] && SELECTED=("${VARIANTS[@]}")
 
 echo "Building ${IMAGE} version ${VERSION}"
-docker build -t "${REGISTRY}/${IMAGE}:latest" -f Dockerfile .
-docker tag "${REGISTRY}/${IMAGE}:latest" "${REGISTRY}/${IMAGE}:${VERSION}"
+docker build --target debug -t "${REPO}:${VERSION}-debug" .
+docker tag "${REPO}:${VERSION}-debug" "${REPO}:${VERSION}"
+docker tag "${REPO}:${VERSION}-debug" "${REPO}:latest"
+docker build --target init -t "${REPO}:${VERSION}-init" .
+for v in "${SELECTED[@]}"; do
+    docker build --target tiny --build-arg "VARIANT=${v}" -t "${REPO}:${VERSION}-${v}" .
+done
+
+[[ ${PUSH} -eq 1 ]] || exit 0
 
 # Authenticate to Harbor with the shared cnaas push robot before pushing.
-. "$(dirname "$0")/../harbor-login.sh"
+. "${SCRIPT_DIR}/../harbor-login.sh"
 
-docker push "${REGISTRY}/${IMAGE}:latest"
-docker push "${REGISTRY}/${IMAGE}:${VERSION}"
+for t in latest "${VERSION}" "${VERSION}-debug" "${VERSION}-init"; do
+    docker push "${REPO}:${t}"
+done
+for v in "${SELECTED[@]}"; do
+    docker push "${REPO}:${VERSION}-${v}"
+done

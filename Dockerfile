@@ -1,3 +1,20 @@
+# Stages (helm ADR-0051, ADR-0019):
+#
+#   builder   compiles OpenSIPS into .deb packages.
+#   debug     Debian with every module, opensips-cli and the debug tools.
+#             Tagged <version>-debug (and <version>, for charts older than
+#             the distroless rollout). For troubleshooting only.
+#   init      Debian slim with the tools the charts' entrypoint scripts use
+#             (bash, envsubst, mariadb client, wget, ip). Tagged
+#             <version>-init; the charts run it as the init container that
+#             renders the configuration.
+#   tiny      (last stage) FROM scratch: the opensips binary, the modules of
+#             one chart (tiny/modules/modules.lst.<VARIANT>), their shared
+#             libraries and opensips-probe. Tagged <version>-<variant>; the
+#             default image of the charts.
+#
+# Build with ./build (all variants) or e.g.
+#   docker build --target tiny --build-arg VARIANT=pcscf .
 ARG FD_IMAGE=freediameter-builder:package-bookworm
 FROM ${FD_IMAGE} AS fd-packages
 
@@ -14,7 +31,12 @@ COPY . /tmp/build/opensips/
 COPY build-deb.sh /usr/sbin/build-deb.sh
 RUN /usr/sbin/build-deb.sh
 
-FROM debian:bookworm
+# Probe and hook helper for the shell-less images, statically linked.
+FROM builder AS probe
+COPY docker/opensips-probe.c /tmp/opensips-probe.c
+RUN gcc -O2 -Wall -Wextra -static -o /usr/local/bin/opensips-probe /tmp/opensips-probe.c
+
+FROM debian:bookworm AS debug
 COPY --from=fd-packages /debs/ /tmp/fd-debs/
 COPY --from=builder /tmp/deb/ /tmp/debs/
 RUN export DEBIAN_FRONTEND=noninteractive && \
@@ -30,4 +52,30 @@ apt-get autoremove --purge -y && \
 apt-get clean && \
 rm -rf /var/lib/apt/lists/*
 COPY docker/sip-ping /usr/local/bin/sip-ping
+COPY --from=probe /usr/local/bin/opensips-probe /usr/local/bin/opensips-probe
+ENTRYPOINT ["/usr/sbin/opensips", "-F"]
+
+# Init container of the charts: renders the configuration, waits for the
+# database and sets up addresses, then exits. OpenSIPS never runs here.
+FROM debian:bookworm-slim AS init
+RUN export DEBIAN_FRONTEND=noninteractive && \
+apt-get update && \
+apt-get install -y --no-install-recommends gettext-base mariadb-client-core iproute2 wget ca-certificates && \
+apt-get clean && \
+rm -rf /var/lib/apt/lists/*
+ENTRYPOINT ["/bin/bash"]
+
+# File list of one tiny variant, from the installed packages of the debug
+# stage (tiny/make_min_archive.sh).
+FROM debug AS minimize
+ARG VARIANT=pcscf
+COPY tiny/make_min_archive.sh /tmp/opensips/make_min_archive.sh
+COPY tiny/modules/modules.lst.${VARIANT} /tmp/modules.lst
+# The script leaves opensips_img.tar.gz in the working directory, which
+# must not be /tmp (it cleans /tmp up at the end).
+RUN cd / && /bin/bash /tmp/opensips/make_min_archive.sh && \
+    mkdir /tmp/build_image && tar xzf /opensips_img.tar.gz -C /tmp/build_image
+
+FROM scratch AS tiny
+COPY --from=minimize /tmp/build_image /
 ENTRYPOINT ["/usr/sbin/opensips", "-F"]
