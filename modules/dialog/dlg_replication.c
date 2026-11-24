@@ -141,6 +141,15 @@ int dlg_init_clustering(void)
 	}
 
 	if (dialog_repl_cluster) {
+		/* node id in the low bits of every local dialog id (dlg_hash.h) */
+		dlg_h_id_node = clusterer_api.get_my_id();
+		if (dlg_h_id_node >= (1U << DLG_H_ID_NODE_BITS))
+			LM_WARN("node id %u does not fit into %d bits: dialog ids of "
+				"nodes whose ids differ by a multiple of %u can collide\n",
+				dlg_h_id_node, DLG_H_ID_NODE_BITS, 1U << DLG_H_ID_NODE_BITS);
+		dlg_h_id_node &= (1U << DLG_H_ID_NODE_BITS) - 1;
+		dlg_h_id_shift = DLG_H_ID_NODE_BITS;
+
 		if (clusterer_api.register_capability(&dlg_repl_cap, receive_dlg_repl,
 				rcv_cluster_event, dialog_repl_cluster, 1, NODE_CMP_ANY) < 0) {
 			LM_ERR("Cannot register clusterer callback for dialog replication!\n");
@@ -250,8 +259,8 @@ int dlg_replicated_create(bin_packet_t *packet, struct dlg_cell *cell,
 	dlg->state = state;
 
 	/* next_id follows the max value of all replicated ids */
-	if (d_table->entries[dlg->h_entry].next_id <= dlg->h_id)
-		d_table->entries[dlg->h_entry].next_id = dlg->h_id + 1;
+	if (d_table->entries[dlg->h_entry].next_id <= DLG_H_ID_SEQ(dlg->h_id))
+		d_table->entries[dlg->h_entry].next_id = DLG_H_ID_SEQ(dlg->h_id) + 1;
 
 	DLG_BIN_POP(str, packet, sock, pre_linking_error);
 

@@ -48,6 +48,9 @@
 struct struct_hist_list *dlg_hist;
 
 struct dlg_table *d_table = NULL;
+/* see DLG_H_ID_NODE_BITS in dlg_hash.h; set by dlg_init_clustering() */
+unsigned int dlg_h_id_shift = 0;
+unsigned int dlg_h_id_node = 0;
 int ctx_dlg_idx = 0;
 
 static inline void raise_state_changed_event(struct dlg_cell *dlg,
@@ -152,7 +155,9 @@ int init_dlg_table(unsigned int size)
 
 	for( i=0 ; i<size; i++ ) {
 		memset( &(d_table->entries[i]), 0, sizeof(struct dlg_entry) );
-		d_table->entries[i].next_id = rand();
+		/* keep the counter within the bits left beside the node id, so
+		 * that it compares with DLG_H_ID_SEQ() of loaded or replicated ids */
+		d_table->entries[i].next_id = (unsigned int)rand() >> dlg_h_id_shift;
 		d_table->entries[i].lock_idx = i % d_table->locks_no;
 	}
 

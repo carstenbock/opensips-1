@@ -679,8 +679,8 @@ static int load_dialog_info_from_db(int dlg_hash_size)
 			dlg->h_id = hash_id;
 
 			/* next_id follows the max value of all loaded ids */
-			if (d_table->entries[dlg->h_entry].next_id <= dlg->h_id)
-				d_table->entries[dlg->h_entry].next_id = dlg->h_id + 1;
+			if (d_table->entries[dlg->h_entry].next_id <= DLG_H_ID_SEQ(dlg->h_id))
+				d_table->entries[dlg->h_entry].next_id = DLG_H_ID_SEQ(dlg->h_id) + 1;
 
 			GET_STR_VALUE(to_tag, values, 5, 1, 1);
 
@@ -1966,8 +1966,8 @@ static int sync_dlg_db_mem(void)
 				dlg->h_id = hash_id;
 
 				/* next_id follows the max value of all loaded ids */
-				if (d_table->entries[dlg->h_entry].next_id <= dlg->h_id)
-					d_table->entries[dlg->h_entry].next_id = dlg->h_id + 1;
+				if (d_table->entries[dlg->h_entry].next_id <= DLG_H_ID_SEQ(dlg->h_id))
+					d_table->entries[dlg->h_entry].next_id = DLG_H_ID_SEQ(dlg->h_id) + 1;
 
 				dlg->start_ts	= VAL_INT(values+6);
 

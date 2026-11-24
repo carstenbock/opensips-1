@@ -451,9 +451,23 @@ void link_dlg(struct dlg_cell *dlg, int extra_refs);
 		d_entry->cnt++; \
 	} while (0)
 
+/* Dialog ids of a replication cluster: the low DLG_H_ID_NODE_BITS of h_id
+ * hold the node id, so two nodes never give two dialogs of the same hash
+ * entry the same id. Both legs of an on-net call pass the cluster with the
+ * same Call-ID (same h_entry); with the counters kept in step by replication
+ * ("next_id follows the max value"), two nodes handed out the same id, and
+ * the replication of one leg's dialog, looked up by h_entry/h_id, hit the
+ * other leg's dialog on the other node (helm KI-237). Without replication
+ * dlg_h_id_shift is 0 and the ids are the counter as before. */
+#define DLG_H_ID_NODE_BITS 8
+extern unsigned int dlg_h_id_shift;
+extern unsigned int dlg_h_id_node;
+/* the counter part of an id, to compare with an entry's next_id */
+#define DLG_H_ID_SEQ(_h_id) ((_h_id) >> dlg_h_id_shift)
+
 #define link_dlg_unsafe(d_entry, dlg) \
 	do { \
-		dlg->h_id = d_entry->next_id++; \
+		dlg->h_id = (d_entry->next_id++ << dlg_h_id_shift) | dlg_h_id_node; \
 		_link_dlg_unsafe(d_entry, dlg); \
 	} while (0)
 
