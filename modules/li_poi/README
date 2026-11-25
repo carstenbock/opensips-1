@@ -1,0 +1,89 @@
+li_poi Module
+=============
+
+Lawful interception: the target match of a point of interception (IRI-POI)
+in an IMS signalling function, 3GPP TS 33.128 clause 7.12.
+
+The module does not copy or send messages. It holds a table of digests of
+target identifiers and tells the script whether a request belongs to an
+intercepted communication. The script then copies the transaction with the
+tracer module to the X2/X3 forwarder of the pod, which delivers it as
+IMSMessage xIRI (ETSI TS 103 221-2):
+
+    loadmodule "proto_hep.so"
+    loadmodule "tracer.so"
+    loadmodule "li_poi.so"
+    modparam("li_poi", "socket", "/run/li/poi.sock")
+    modparam("proto_hep", "hep_id", "[li_fwd] 127.0.0.1:9062;transport=udp;version=3")
+    modparam("tracer", "trace_id", "[li_trace] uri=hep:li_fwd")
+
+    route {
+        if (li_match($var(li)))
+            trace("li_trace", "t", "sip", , , $var(li));
+        ...
+    }
+
+Who is intercepted must not be visible to those who operate the platform.
+The module therefore has no MI commands, no statistics and no log line that
+depends on a target, and the table holds digests, never identifiers.
+
+Parameters
+----------
+
+socket (string, required)
+    Unix socket of the X2/X3 forwarder. The module connects to it from a
+    process of its own and receives the task table: after the connection is
+    made and after every change (format in li_table.h). While the forwarder
+    is away the last table stays in use.
+
+call_ttl (integer, default 7200)
+    Seconds an INVITE that matched stays known by its Call-ID. Every later
+    request of the call renews it.
+
+Functions
+---------
+
+li_match(result)
+    Request route. Returns 1 if the request belongs to an intercepted
+    communication, -1 otherwise. With an empty table and no remembered call
+    it returns at once, without parsing anything.
+
+    Match (TS 33.128 clause 7.12.2.8.2), for targets given as IMPU:
+      - From and P-Asserted-Identity: the target is the sender
+      - Request-URI and To: the target is the receiver
+      - the Call-ID of an INVITE that matched before
+
+    An identity is compared in a canonical form (li_identity.h): a tel URI
+    and a SIP URI with the same E.164 number are the same identity.
+
+    On a match, result is set to
+
+        v1;d=<f|t|c|i>;m=<f|t|u>;x=<xid>[,<xid>...]
+
+    d  direction of the session: from the target, to the target, combined,
+       indeterminate (a request in a dialog whose INVITE this instance did
+       not see)
+    m  direction of this request: from the target, to the target, unknown.
+       A request outside a dialog that is known only by its Call-ID has the
+       direction of its session.
+    x  the tasks (XIDs), 32 hex digits each, at most 8
+
+    The value is meant as the correlation_id of trace(); the forwarder reads
+    it from the HEP correlation chunk.
+
+Limits
+------
+
+- Targets given as IMPI or IMEI are not matched yet.
+- The Call-ID memory is per instance: in a cluster, a request in a dialog
+  that reaches another instance is matched by its headers only.
+
+Tests
+-----
+
+    cc -Wall -Wextra -o /tmp/identity_test test/identity_test.c li_identity.c && /tmp/identity_test
+    cc -Wall -Wextra -o /tmp/table_test test/table_test.c li_table.c && /tmp/table_test
+
+The vectors of identity_test.c are shared with the X1 agent of the platform
+(li_x1_identity.erl). End-to-end tests with OpenSIPS are in the helm
+repository: apps/li-x2x3-forwarder/integration/test_opensips.py.

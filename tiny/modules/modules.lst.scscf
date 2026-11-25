@@ -13,6 +13,7 @@ dns_cache
 enum
 httpd
 json
+li_poi
 maxfwd
 mi_fifo
 mi_http
