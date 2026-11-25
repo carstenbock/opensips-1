@@ -40,6 +40,26 @@ call_ttl (integer, default 7200)
     Seconds an INVITE that matched stays known by its Call-ID. Every later
     request of the call renews it.
 
+cluster_id (integer, default 0)
+    Cluster (clusterer module) whose nodes share the memory of matched
+    INVITEs, because a later request of a dialog can arrive at any node. A
+    node that starts does not learn the calls already in progress. The memory
+    and the packets hold a salted digest of the Call-ID, not the Call-ID.
+    0: the memory is local.
+
+usrloc_domain (string, default none)
+    usrloc domain with the registrations. With it, a task for an IMPI or an
+    IMEI matches every request from or to an IMPU registered with that IMPI
+    or from that device: the IMPI is read from the key 'impi_key' of the
+    usrloc record of the IMPU, the IMEI from the +sip.instance
+    (urn:gsma:imei) of its contacts. The record is found by the user part
+    of the URI. Without it such tasks match REGISTER requests only. The
+    lookup is made only while the table holds a task for an IMPI or an IMEI.
+
+impi_key (string, default "impi")
+    Name of the usrloc record key in which the script stores the IMPI at
+    registration, e.g. ul_add_key("location", "$tU", "impi", "$aU").
+
 Functions
 ---------
 
@@ -48,25 +68,36 @@ li_match(result)
     communication, -1 otherwise. With an empty table and no remembered call
     it returns at once, without parsing anything.
 
-    Match (TS 33.128 clause 7.12.2.8.2), for targets given as IMPU:
+    Match (TS 33.128 clause 7.12.2.8.2):
       - From and P-Asserted-Identity: the target is the sender
       - Request-URI and To: the target is the receiver
       - the Call-ID of an INVITE that matched before
+    A target given as IMPU is compared with these identities. A target
+    given as IMPI or IMEI is compared with the IMPI and the devices
+    registered for them (usrloc_domain), and in a REGISTER with the user
+    name of the Authorization header and the +sip.instance of the Contact.
 
     An identity is compared in a canonical form (li_identity.h): a tel URI
     and a SIP URI with the same E.164 number are the same identity.
 
     On a match, result is set to
 
-        v1;d=<f|t|c|i>;m=<f|t|u>;x=<xid>[,<xid>...]
+        v2;x=<xid>:<d><m>[,<xid>:<d><m>...]
 
-    d  direction of the session: from the target, to the target, combined,
-       indeterminate (a request in a dialog whose INVITE this instance did
-       not see)
-    m  direction of this request: from the target, to the target, unknown.
-       A request outside a dialog that is known only by its Call-ID has the
-       direction of its session.
-    x  the tasks (XIDs), 32 hex digits each, at most 8
+    with one entry per task (at most 8):
+    xid  the task, 32 hex digits
+    d    direction of the session as the target of this task sees it: f from
+         the target, t to the target, c combined, i indeterminate (a request
+         in a dialog whose INVITE is not known)
+    m    direction of this request: f from the target, t to the target,
+         u unknown. A request outside a dialog that is known only by its
+         Call-ID has the direction of its session.
+
+    Two tasks can see one call from opposite sides (the caller and the
+    called party are both targets); each has its own directions.
+
+    A call is forgotten 64 seconds after its BYE, so that a Call-ID that is
+    used again is a new call.
 
     The value is meant as the correlation_id of trace(); the forwarder reads
     it from the HEP correlation chunk.

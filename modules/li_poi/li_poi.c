@@ -15,9 +15,16 @@
  *
  * Target match as in 3GPP TS 33.128 clause 7.12.2.8.2: From and
  * P-Asserted-Identity (the target is the sender), Request-URI and To (the
- * target is the receiver). An INVITE that matched is remembered by its
+ * target is the receiver). A task for an IMPI or an IMEI matches through
+ * the registration: the user name of the Authorization header and the
+ * +sip.instance of the Contact of a REGISTER, and for every other request
+ * the IMPI and the instances stored with the usrloc record of the IMPU
+ * ('usrloc_domain'). An INVITE that matched is remembered by its
  * Call-ID, so that later requests of the dialog are recognised when their
- * headers no longer name the target (e.g. an anonymous From).
+ * headers no longer name the target (e.g. an anonymous From). The memory
+ * holds a salted digest of the Call-ID, not the Call-ID, and with
+ * 'cluster_id' set it is shared with the other nodes of the cluster, because
+ * a later request of the dialog can arrive at any of them.
  */
 
 #include <errno.h>
@@ -40,6 +47,11 @@
 #include "../../parser/parse_from.h"
 #include "../../parser/parse_to.h"
 #include "../../parser/parse_pai.h"
+#include "../../parser/digest/digest.h"
+#include "../../parser/contact/parse_contact.h"
+#include "../usrloc/usrloc.h"
+#include "../../bin_interface.h"
+#include "../clusterer/api.h"
 
 #include "li_identity.h"
 #include "li_table.h"
@@ -49,6 +61,15 @@
 #define LI_CALL_BUCKETS 1024
 #define LI_MAX_IDENTITY 512
 #define LI_RECONNECT 2
+/* a longer Call-ID is cut to this length before it is hashed */
+#define LI_MAX_CALLID 1024
+
+/* seconds a call stays known after its BYE (retransmissions, and the passes
+ * of the BYE through the application servers) */
+#define LI_END_TTL 64
+
+#define LI_BIN_VERSION 2
+#define LI_REPL_CALL 1
 
 struct li_shared {
 	rw_lock_t *lock;
@@ -57,21 +78,28 @@ struct li_shared {
 	int salt_len;
 	/* read without the lock for the "nothing to do" test */
 	unsigned int count;
+	/* entries for an IMPI or an IMEI */
+	unsigned int bound;
 	struct li_entry *entries;
 };
+
+#define LI_SIDE_FROM 1
+#define LI_SIDE_TO 2
 
 struct li_xids {
 	int n;
 	unsigned char xid[LI_MAX_XIDS][LI_XID_LEN];
+	/* per task: on which side of this request its target was found, and
+	 * the direction of the session as its target sees it */
+	unsigned char side[LI_MAX_XIDS];
+	char dir[LI_MAX_XIDS];
 };
 
 struct li_call {
 	struct li_call *next;
 	unsigned int expires;
-	char dir;
 	struct li_xids xids;
-	int callid_len;
-	char callid[1];
+	unsigned char key[LI_DIGEST_LEN];
 };
 
 static struct li_shared *tab;
@@ -82,11 +110,21 @@ static int *calls_active;
 
 static str li_socket = {0, 0};
 static int li_call_ttl = 7200;
+static int li_cluster_id = 0;
+static char *li_usrloc_domain = NULL;
+static str li_impi_key = str_init("impi");
+
+static usrloc_api_t ul;
+static udomain_t *li_domain;
+
+static str li_repl_cap = str_init("li-poi-call-repl");
+static struct clusterer_binds c_api;
 
 static int mod_init(void);
 static void mod_destroy(void);
 static void li_table_proc(int rank);
 static int w_li_match(struct sip_msg *msg, pv_spec_t *out);
+static int li_init_cluster(void);
 
 static const cmd_export_t cmds[] = {
 	{"li_match", (cmd_function)w_li_match, {
@@ -97,7 +135,30 @@ static const cmd_export_t cmds[] = {
 static const param_export_t params[] = {
 	{"socket",   STR_PARAM, &li_socket.s},
 	{"call_ttl", INT_PARAM, &li_call_ttl},
+	{"cluster_id", INT_PARAM, &li_cluster_id},
+	{"usrloc_domain", STR_PARAM, &li_usrloc_domain},
+	{"impi_key", STR_PARAM, &li_impi_key.s},
 	{0, 0, 0}
+};
+
+static module_dependency_t *get_deps_usrloc(const param_export_t *param)
+{
+	char *domain = *(char **)param->param_pointer;
+
+	if (!domain || !*domain)
+		return NULL;
+	return alloc_module_dep(MOD_TYPE_DEFAULT, "usrloc", DEP_ABORT);
+}
+
+static const dep_export_t deps = {
+	{ /* OpenSIPS module dependencies */
+		{ MOD_TYPE_NULL, NULL, 0 },
+	},
+	{ /* modparam dependencies */
+		{ "cluster_id", get_deps_clusterer },
+		{ "usrloc_domain", get_deps_usrloc },
+		{ NULL, NULL },
+	},
 };
 
 static const proc_export_t procs[] = {
@@ -111,7 +172,7 @@ struct module_exports exports = {
 	MODULE_VERSION,
 	DEFAULT_DLFLAGS, /* dlopen flags */
 	0,               /* load function */
-	0,               /* OpenSIPS module dependencies */
+	&deps,           /* OpenSIPS module dependencies */
 	cmds,            /* exported functions */
 	0,               /* exported async functions */
 	params,          /* module parameters */
@@ -160,6 +221,20 @@ static int mod_init(void)
 		LM_ERR("failed to create the call locks\n");
 		return -1;
 	}
+	if (li_cluster_id > 0 && li_init_cluster() < 0)
+		return -1;
+	li_impi_key.len = strlen(li_impi_key.s);
+	if (li_usrloc_domain && *li_usrloc_domain) {
+		if (load_ul_api(&ul) < 0) {
+			LM_ERR("failed to find the usrloc API\n");
+			return -1;
+		}
+		if (ul.register_udomain(li_usrloc_domain, &li_domain) < 0) {
+			LM_ERR("failed to register the usrloc domain %s\n",
+				li_usrloc_domain);
+			return -1;
+		}
+	}
 	return 0;
 }
 
@@ -194,7 +269,7 @@ static int read_all(int fd, unsigned char *buf, unsigned int len)
 static int apply_table(const struct li_parsed *parsed)
 {
 	struct li_entry *fresh = NULL, *old;
-	unsigned int i;
+	unsigned int i, bound = 0;
 
 	if (parsed->count) {
 		fresh = shm_malloc(parsed->count * sizeof *fresh);
@@ -202,14 +277,18 @@ static int apply_table(const struct li_parsed *parsed)
 			LM_ERR("no more shm memory for the task table\n");
 			return -1;
 		}
-		for (i = 0; i < parsed->count; i++)
+		for (i = 0; i < parsed->count; i++) {
 			li_parsed_entry(parsed, i, &fresh[i]);
+			if (fresh[i].cls != LI_CLASS_IMPU)
+				bound++;
+		}
 	}
 
 	lock_start_write(tab->lock);
 	old = tab->entries;
 	tab->entries = fresh;
 	tab->count = parsed->count;
+	tab->bound = bound;
 	tab->version = parsed->version;
 	tab->salt_len = parsed->salt_len;
 	memcpy(tab->salt, parsed->salt, parsed->salt_len);
@@ -291,57 +370,203 @@ static void li_table_proc(int rank)
  * Target match
  * ---------------------------------------------------------------------- */
 
-static void add_xid(struct li_xids *set, const unsigned char *xid)
+/* Adds a task, or a side to a task that is in the set. Returns its index,
+ * -1 if the set is full. */
+static int add_xid(struct li_xids *set, const unsigned char *xid, int side)
 {
 	int i;
 
 	for (i = 0; i < set->n; i++)
-		if (memcmp(set->xid[i], xid, LI_XID_LEN) == 0)
-			return;
-	if (set->n < LI_MAX_XIDS)
-		memcpy(set->xid[set->n++], xid, LI_XID_LEN);
+		if (memcmp(set->xid[i], xid, LI_XID_LEN) == 0) {
+			set->side[i] |= side;
+			return i;
+		}
+	if (set->n >= LI_MAX_XIDS)
+		return -1;
+	memcpy(set->xid[set->n], xid, LI_XID_LEN);
+	set->side[set->n] = side;
+	set->dir[set->n] = 0;
+	return set->n++;
 }
 
-/* Adds the tasks whose target is this IMPU. Call with the table lock held. */
-static int match_impu(const str *uri, struct li_xids *set)
+/* Adds the tasks whose target is this identifier of class cls. Call with
+ * the table lock held. */
+static int match_id(int cls, const char *id, int id_len, struct li_xids *set,
+	int side)
 {
 	unsigned char buf[LI_MAX_IDENTITY + LI_MAX_SALT];
 	unsigned char digest[LI_DIGEST_LEN];
 	unsigned int i;
 	int len, found = 0;
 
-	if (!uri || !uri->s || uri->len <= 0)
+	if (!id || id_len <= 0)
 		return 0;
-	len = li_canonical(LI_CLASS_IMPU, uri->s, uri->len, (char *)buf,
-		LI_MAX_IDENTITY);
+	len = li_canonical(cls, id, id_len, (char *)buf, LI_MAX_IDENTITY);
 	if (len <= 0)
 		return 0;
 	memcpy(buf + len, tab->salt, tab->salt_len);
 	sha256(buf, len + tab->salt_len, digest, 0);
 
 	for (i = 0; i < tab->count; i++) {
-		if (tab->entries[i].cls == LI_CLASS_IMPU &&
+		if (tab->entries[i].cls == cls &&
 				memcmp(tab->entries[i].digest, digest, LI_DIGEST_LEN) == 0) {
-			add_xid(set, tab->entries[i].xid);
+			add_xid(set, tab->entries[i].xid, side);
 			found = 1;
 		}
 	}
 	return found;
 }
 
-/*
- * Looks the Call-ID up. If it is remembered, its tasks are added to set and
- * its session direction is returned. Otherwise, with remember != 0, it is
- * stored with set and dir. Returns 0 if the Call-ID is not known.
- */
-static char call_memory(const str *callid, struct li_xids *set, char dir,
-	int remember)
+/* An instance is an IMEI only as urn:gsma:imei (TS 24.229 clause 5.1.1.2.1);
+ * a UUID has digits too. */
+static int match_instance(const str *instance, struct li_xids *set, int side)
 {
-	unsigned int bucket = core_hash(callid, NULL, LI_CALL_BUCKETS);
-	unsigned int now = get_ticks();
-	struct li_call *c, **prev;
-	char found = 0;
+	static const str urn = str_init("urn:gsma:imei:");
 	int i;
+
+	if (!instance || !instance->s)
+		return 0;
+	for (i = 0; i + urn.len < instance->len; i++)
+		if (strncasecmp(instance->s + i, urn.s, urn.len) == 0)
+			return match_id(LI_CLASS_IMEI, instance->s + i + urn.len,
+				instance->len - i - urn.len, set, side);
+	return 0;
+}
+
+/*
+ * Adds the tasks whose target is the IMPI or an IMEI registered for this
+ * IMPU. The usrloc record is found by the user part alone, as the script
+ * stores it. Call with the table lock held.
+ */
+static int match_bound(const str *uri, struct li_xids *set, int side)
+{
+	urecord_t *r = NULL;
+	ucontact_t *c;
+	int_str_t *impi;
+	str aor;
+	time_t now;
+	int i, found = 0;
+
+	if (!li_domain || !tab->bound || !uri || !uri->s || uri->len <= 0)
+		return 0;
+	for (i = 0; i < uri->len && uri->s[i] != ':'; i++);
+	if (i >= uri->len - 1)
+		return 0;
+	aor.s = uri->s + i + 1;
+	for (aor.len = 0; aor.s + aor.len < uri->s + uri->len &&
+			aor.s[aor.len] != '@' && aor.s[aor.len] != ';'; aor.len++);
+	if (aor.len == 0)
+		return 0;
+
+	now = time(NULL);
+	ul.lock_udomain(li_domain, &aor);
+	if (ul.get_urecord(li_domain, &aor, &r) == 0 && r) {
+		impi = ul.get_urecord_key(r, &li_impi_key);
+		if (impi && impi->is_str)
+			found |= match_id(LI_CLASS_IMPI, impi->s.s, impi->s.len, set,
+				side);
+		for (c = r->contacts; c; c = c->next)
+			if (VALID_CONTACT(c, now))
+				found |= match_instance(&c->instance, set, side);
+	}
+	ul.unlock_udomain(li_domain, &aor);
+	return found;
+}
+
+/* The identities a URI stands for: the IMPU itself and what is registered
+ * for it. Call with the table lock held. */
+static int match_impu(const str *uri, struct li_xids *set, int side)
+{
+	int found;
+
+	if (!uri || !uri->s || uri->len <= 0)
+		return 0;
+	found = match_id(LI_CLASS_IMPU, uri->s, uri->len, set, side);
+	found |= match_bound(uri, set, side);
+	return found;
+}
+
+/* The IMPI and the IMEI a REGISTER itself names. Call with the table lock
+ * held. */
+static int match_register(struct sip_msg *msg, struct li_xids *set)
+{
+	struct hdr_field *h;
+	contact_t *c;
+	auth_body_t *auth;
+	int found = 0;
+
+	if (!tab->bound || parse_headers(msg, HDR_EOH_F, 0) < 0)
+		return 0;
+	if (msg->authorization && parse_credentials(msg->authorization) == 0 &&
+			(auth = (auth_body_t *)msg->authorization->parsed) != NULL)
+		found |= match_id(LI_CLASS_IMPI, auth->digest.username.whole.s,
+			auth->digest.username.whole.len, set, LI_SIDE_FROM);
+	for (h = msg->contact; h; h = h->sibling) {
+		if (!h->parsed && parse_contact(h) < 0)
+			continue;
+		for (c = ((contact_body_t *)h->parsed)->contacts; c; c = c->next)
+			if (c->instance)
+				found |= match_instance(&c->instance->body, set,
+					LI_SIDE_FROM);
+	}
+	return found;
+}
+
+/* The key of a Call-ID in the memory. Call with the table lock held. */
+static void call_key(const str *callid, unsigned char *key)
+{
+	unsigned char buf[LI_MAX_CALLID + LI_MAX_SALT];
+	int len = callid->len > LI_MAX_CALLID ? LI_MAX_CALLID : callid->len;
+
+	memcpy(buf, callid->s, len);
+	memcpy(buf + len, tab->salt, tab->salt_len);
+	sha256(buf, len + tab->salt_len, key, 0);
+}
+
+static void push_call(bin_packet_t *packet, const struct li_call *c)
+{
+	str key = {(char *)c->key, LI_DIGEST_LEN};
+	str xids = {(char *)c->xids.xid, c->xids.n * LI_XID_LEN};
+	str dirs = {(char *)c->xids.dir, c->xids.n};
+
+	bin_push_str(packet, &key);
+	bin_push_str(packet, &xids);
+	bin_push_str(packet, &dirs);
+}
+
+/* Tells the other nodes about a remembered call. */
+static void replicate_call(const struct li_call *c, int ending)
+{
+	bin_packet_t packet;
+
+	if (li_cluster_id <= 0)
+		return;
+	if (bin_init(&packet, &li_repl_cap, LI_REPL_CALL, LI_BIN_VERSION, 0) != 0)
+		return;
+	push_call(&packet, c);
+	bin_push_int(&packet, ending);
+	/* not acknowledged: a node that misses it matches by the headers */
+	c_api.send_all(&packet, li_cluster_id);
+	bin_free_packet(&packet);
+}
+
+/*
+ * Looks a call up by its key and brings set and the memory in line: the
+ * tasks of a remembered call are added to set with the session direction
+ * they were stored with, and tasks that set has in addition stay with the
+ * call from now on. A call that is not known is stored with remember != 0.
+ * With ending != 0 (BYE) the call is forgotten LI_END_TTL seconds from now,
+ * so that a Call-ID used again is a new call. Returns 1 if the call is
+ * known. With replicate != 0 changes go to the other nodes.
+ */
+static int call_memory(const unsigned char *key, struct li_xids *set,
+	int remember, int ending, int replicate)
+{
+	unsigned int bucket = (((unsigned int)key[0] << 8) | key[1]) %
+		LI_CALL_BUCKETS;
+	unsigned int now = get_ticks();
+	struct li_call *c, **prev, copy;
+	int found = 0, changed = 0, i, j;
 
 	lock_set_get(calls_lock, bucket);
 	prev = &calls[bucket];
@@ -352,53 +577,132 @@ static char call_memory(const str *callid, struct li_xids *set, char dir,
 			(*calls_active)--;
 			continue;
 		}
-		if (c->callid_len == callid->len &&
-				memcmp(c->callid, callid->s, callid->len) == 0) {
-			for (i = 0; i < c->xids.n; i++)
-				add_xid(set, c->xids.xid[i]);
-			/* tasks that started to match during the call stay with it */
-			c->xids = *set;
-			c->expires = now + li_call_ttl;
-			found = c->dir;
+		if (memcmp(c->key, key, LI_DIGEST_LEN) == 0) {
+			for (i = 0; i < c->xids.n; i++) {
+				j = add_xid(set, c->xids.xid[i], 0);
+				if (j >= 0)
+					set->dir[j] = c->xids.dir[i];
+			}
+			if (set->n != c->xids.n) {
+				c->xids = *set;
+				changed = 1;
+			}
+			if (ending) {
+				if (c->expires > now + LI_END_TTL) {
+					c->expires = now + LI_END_TTL;
+					changed = 1;
+				}
+			} else if (c->expires > now + LI_END_TTL) {
+				/* not for a call that is ending */
+				c->expires = now + li_call_ttl;
+			}
+			found = 1;
+			copy = *c;
 		}
 		prev = &c->next;
 	}
 	if (!found && remember) {
-		c = shm_malloc(sizeof *c + callid->len);
+		c = shm_malloc(sizeof *c);
 		if (c) {
-			c->expires = now + li_call_ttl;
-			c->dir = dir;
+			c->expires = now + (ending ? LI_END_TTL : li_call_ttl);
 			c->xids = *set;
-			c->callid_len = callid->len;
-			memcpy(c->callid, callid->s, callid->len);
+			memcpy(c->key, key, LI_DIGEST_LEN);
 			c->next = calls[bucket];
 			calls[bucket] = c;
 			(*calls_active)++;
+			copy = *c;
+			changed = 1;
 		}
 	}
 	lock_set_release(calls_lock, bucket);
+	if (changed && replicate)
+		replicate_call(&copy, ending);
 	return found;
+}
+
+/* ------------------------------------------------------------------------
+ * Sharing the call memory in the cluster
+ * ---------------------------------------------------------------------- */
+
+static int pop_call(bin_packet_t *packet)
+{
+	struct li_xids set;
+	str key, xids, dirs;
+	int ending;
+
+	if (bin_pop_str(packet, &key) < 0 || bin_pop_str(packet, &xids) < 0 ||
+			bin_pop_str(packet, &dirs) < 0 || bin_pop_int(packet, &ending) < 0)
+		return -1;
+	if (key.len != LI_DIGEST_LEN || xids.len <= 0 ||
+			xids.len % LI_XID_LEN || xids.len > LI_MAX_XIDS * LI_XID_LEN ||
+			dirs.len != xids.len / LI_XID_LEN)
+		return -1;
+	memset(&set, 0, sizeof set);
+	set.n = dirs.len;
+	memcpy(set.xid, xids.s, xids.len);
+	memcpy(set.dir, dirs.s, dirs.len);
+	call_memory((unsigned char *)key.s, &set, 1, ending, 0);
+	return 0;
+}
+
+static void li_receive_packet(bin_packet_t *packet)
+{
+	int rc = 0;
+
+	switch (packet->type) {
+	case LI_REPL_CALL:
+		ensure_bin_version(packet, LI_BIN_VERSION);
+		rc = pop_call(packet);
+		break;
+	default:
+		rc = -1;
+	}
+	if (rc != 0)
+		LM_ERR("invalid packet from node %d\n", packet->src_id);
+}
+
+static void li_cluster_event(enum clusterer_event ev, int node_id)
+{
+}
+
+static int li_init_cluster(void)
+{
+	if (load_clusterer_api(&c_api) != 0) {
+		LM_ERR("failed to find the clusterer API\n");
+		return -1;
+	}
+	if (c_api.register_capability(&li_repl_cap, li_receive_packet,
+			li_cluster_event, li_cluster_id, 0, NODE_CMP_ANY) < 0) {
+		LM_ERR("failed to register with the clusterer\n");
+		return -1;
+	}
+	/* No sync at startup: a node that waits for one is not "synced" for the
+	 * clusterer, and nothing else may depend on this module. A node that
+	 * restarts does not know the calls in progress. */
+	return 0;
 }
 
 /*
  * li_match(result): 1 if the request belongs to an intercepted
  * communication, -1 otherwise. On a match the result variable is
  *
- *   v1;d=<f|t|c|i>;m=<f|t|u>;x=<xid>[,<xid>...]
+ *   v2;x=<xid>:<d><m>[,<xid>:<d><m>...]
  *
- * d: direction of the session (from the target, to the target, combined,
- *    indeterminate); m: direction of this request (from, to, unknown);
- * x: the tasks, each XID as 32 hex digits.
+ * with one entry per task: the XID as 32 hex digits, d the direction of the
+ * session as the target of that task sees it (f from the target, t to the
+ * target, c combined, i indeterminate) and m the direction of this request
+ * (f from, t to, u unknown). Two tasks can see one call from opposite sides.
  */
 static int w_li_match(struct sip_msg *msg, pv_spec_t *out)
 {
-	static char buf[32 + LI_MAX_XIDS * (2 * LI_XID_LEN + 1)];
+	static char buf[8 + LI_MAX_XIDS * (2 * LI_XID_LEN + 4)];
 	static const char hex[] = "0123456789abcdef";
 	struct li_xids set;
 	struct to_body *from, *to;
 	pv_value_t val;
-	char dir, mdir, known;
-	int from_match = 0, to_match = 0, in_dialog, i, j;
+	unsigned char key[LI_DIGEST_LEN];
+	char mdir;
+	int matched = 0, in_dialog, remember, i, j;
 	char *p;
 
 	/* the common case: no task and no remembered call */
@@ -415,63 +719,62 @@ static int w_li_match(struct sip_msg *msg, pv_spec_t *out)
 	if (!from || !to)
 		return -1;
 
-	set.n = 0;
+	memset(&set, 0, sizeof set);
 	lock_start_read(tab->lock);
 	if (tab->count) {
-		from_match = match_impu(&from->uri, &set);
+		matched = match_impu(&from->uri, &set, LI_SIDE_FROM);
 		if (parse_pai_header(msg) == 0 && msg->pai && get_pai(msg))
-			from_match |= match_impu(&get_pai(msg)->uri, &set);
-		to_match = match_impu(&REQ_LINE(msg).uri, &set);
-		to_match |= match_impu(&to->uri, &set);
+			matched |= match_impu(&get_pai(msg)->uri, &set, LI_SIDE_FROM);
+		matched |= match_impu(&REQ_LINE(msg).uri, &set, LI_SIDE_TO);
+		matched |= match_impu(&to->uri, &set, LI_SIDE_TO);
+		if (msg->REQ_METHOD == METHOD_REGISTER)
+			matched |= match_register(msg, &set);
 	}
+	call_key(&msg->callid->body, key);
 	lock_stop_read(tab->lock);
 
 	in_dialog = to->tag_value.len > 0;
-	if (msg->REQ_METHOD == METHOD_REGISTER)
-		dir = 'f';
-	else if (in_dialog)
-		dir = 'i';
-	else if (from_match && to_match)
-		dir = 'c';
-	else
-		dir = from_match ? 'f' : 't';
+	for (i = 0; i < set.n; i++) {
+		if (msg->REQ_METHOD == METHOD_REGISTER)
+			set.dir[i] = 'f';
+		else if (in_dialog)
+			set.dir[i] = 'i';
+		else if (set.side[i] == (LI_SIDE_FROM | LI_SIDE_TO))
+			set.dir[i] = 'c';
+		else
+			set.dir[i] = set.side[i] == LI_SIDE_FROM ? 'f' : 't';
+	}
 
-	known = 0;
-	if (*calls_active || ((from_match || to_match) &&
-			msg->REQ_METHOD == METHOD_INVITE && !in_dialog))
-		known = call_memory(&msg->callid->body, &set, dir,
-			(from_match || to_match) && msg->REQ_METHOD == METHOD_INVITE &&
-			!in_dialog);
-	if (known)
-		dir = known;
+	/* the memory overrides the direction with that of the INVITE */
+	remember = matched && msg->REQ_METHOD == METHOD_INVITE && !in_dialog;
+	if (*calls_active || remember)
+		call_memory(key, &set, remember, msg->REQ_METHOD == METHOD_BYE, 1);
 	if (set.n == 0)
 		return -1;
 
-	if (msg->REQ_METHOD == METHOD_REGISTER || from_match)
-		mdir = 'f';
-	else if (to_match)
-		mdir = 't';
-	else if (!in_dialog && (dir == 'f' || dir == 't'))
-		/* The request that set the session up, on its way again (e.g. back
-		 * from an application server that hid the caller): it still travels
-		 * in the direction of the session. */
-		mdir = dir;
-	else
-		mdir = 'u';
-
 	p = buf;
-	memcpy(p, "v1;d=", 5); p += 5;
-	*p++ = dir;
-	memcpy(p, ";m=", 3); p += 3;
-	*p++ = mdir;
-	memcpy(p, ";x=", 3); p += 3;
+	memcpy(p, "v2;x=", 5); p += 5;
 	for (i = 0; i < set.n; i++) {
+		if (msg->REQ_METHOD == METHOD_REGISTER || (set.side[i] & LI_SIDE_FROM))
+			mdir = 'f';
+		else if (set.side[i] & LI_SIDE_TO)
+			mdir = 't';
+		else if (!in_dialog && (set.dir[i] == 'f' || set.dir[i] == 't'))
+			/* The request that set the session up, on its way again (e.g.
+			 * back from an application server that hid the caller): it
+			 * still travels in the direction of the session. */
+			mdir = set.dir[i];
+		else
+			mdir = 'u';
 		if (i)
 			*p++ = ',';
 		for (j = 0; j < LI_XID_LEN; j++) {
 			*p++ = hex[set.xid[i][j] >> 4];
 			*p++ = hex[set.xid[i][j] & 0x0f];
 		}
+		*p++ = ':';
+		*p++ = set.dir[i];
+		*p++ = mdir;
 	}
 
 	val.rs.s = buf;
