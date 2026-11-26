@@ -22,15 +22,29 @@
 #include "ipsec_user.h"
 #include "../../lib/list.h"
 #include "../../locking.h"
+#include "../../hash_func.h"
 
 struct ipsec_map_node {
 	unsigned char n;
 	unsigned int size;
 	union {
 		struct ipsec_map_node *nodes;
-		struct list_head *users;
+		struct ipsec_user_table *users;
 	};
 };
+
+/*
+ * The users behind one address, hashed by IMPI.  Most addresses have one
+ * user, an address of a NAT or of a load generator has thousands: the table
+ * starts with one bucket and grows with the number of IMPIs.
+ */
+struct ipsec_user_table {
+	unsigned int size;  /* buckets, a power of two */
+	unsigned int count; /* IMPIs */
+	struct list_head buckets[0];
+};
+#define IPSEC_USER_TABLE_LOAD 4
+#define IPSEC_USER_TABLE_GROW 4
 
 struct ipsec_map {
 	unsigned int size;
@@ -40,6 +54,7 @@ struct ipsec_map {
 
 struct ipsec_user_impi {
 	str impi;
+	unsigned int hash;
 	struct list_head list;
 	struct list_head users;
 	char _buf[0];
@@ -94,38 +109,41 @@ void ipsec_map_destroy(void)
 		_ipsec_map_destroy(ipsec_map_ipv6);
 }
 
-void ipsec_dump_users_rec(struct ipsec_map_node *nodes, int size, unsigned char *buf, int level)
+static void ipsec_dump_users_rec(struct ipsec_map_node *nodes, int size, int levels)
 {
 	int n;
+	unsigned int b;
 	struct list_head *it, *it2;
 	struct ipsec_user_impi *impi;
 	struct ipsec_user *user;
-	if (level == 4) {
-		list_for_each(it, (struct list_head *)nodes) {
-			impi = list_entry(it, struct ipsec_user_impi, list);
-			list_for_each(it2, &impi->users) {
-				user = list_entry(it2, struct ipsec_user, list);
-				LM_DBG("print %u.%u.%u.%u - %.*s/%.*s\n",
-					(unsigned)buf[0], (unsigned)buf[1], (unsigned)buf[2], (unsigned)buf[3],
+
+	for (n = 0; n < size; n++) {
+		if (levels > 1) {
+			ipsec_dump_users_rec(nodes[n].nodes, nodes[n].size, levels - 1);
+			continue;
+		}
+		if (!nodes[n].users)
+			continue;
+		for (b = 0; b < nodes[n].users->size; b++) {
+			list_for_each(it, &nodes[n].users->buckets[b]) {
+				impi = list_entry(it, struct ipsec_user_impi, list);
+				list_for_each(it2, &impi->users) {
+					user = list_entry(it2, struct ipsec_user, list);
+					LM_DBG("print %s - %.*s/%.*s\n", ip_addr2a(&user->ip),
 						user->impi.len, user->impi.s, user->impu.len, user->impu.s);
+				}
 			}
 		}
-		return;
-	}
-	for (n = 0; n < size; n++) {
-		buf[level] = nodes[n].n;
-		ipsec_dump_users_rec(nodes[n].nodes, nodes[n].size, buf, level + 1);
 	}
 }
 
 static void ipsec_dump_users(struct ipsec_map *map)
 {
-	unsigned char buf[4];
 	/* walks every user of the map - only worth it when it gets printed */
 	if (!is_printable(L_DBG))
 		return;
 	lock_get(&map->lock);
-	ipsec_dump_users_rec(map->nodes, map->size, buf, 0);
+	ipsec_dump_users_rec(map->nodes, map->size, (map == ipsec_map_ipv4?4:16));
 	lock_release(&map->lock);
 }
 
@@ -172,13 +190,53 @@ static struct ipsec_map_node *ipsec_get_node(struct ip_addr *ip, int level,
 		return ipsec_get_node(ip, level + 1, &nodes[i].nodes, &nodes[i].size);
 }
 
-static struct ipsec_user_impi *ipsec_find_user_impi(struct list_head *list, str *impi)
+static struct ipsec_user_table *ipsec_user_table_new(unsigned int size)
+{
+	unsigned int b;
+	struct ipsec_user_table *table;
+
+	table = shm_malloc(sizeof(*table) + size * sizeof(table->buckets[0]));
+	if (!table)
+		return NULL;
+	table->size = size;
+	table->count = 0;
+	for (b = 0; b < size; b++)
+		INIT_LIST_HEAD(&table->buckets[b]);
+	return table;
+}
+
+/* returns the table to use from now on: the old one if there is no memory */
+static struct ipsec_user_table *ipsec_user_table_grow(struct ipsec_user_table *table)
+{
+	unsigned int b;
+	struct list_head *it, *safe;
+	struct ipsec_user_impi *uimpi;
+	struct ipsec_user_table *grown;
+
+	grown = ipsec_user_table_new(table->size * IPSEC_USER_TABLE_GROW);
+	if (!grown)
+		return table;
+	for (b = 0; b < table->size; b++) {
+		list_for_each_safe(it, safe, &table->buckets[b]) {
+			uimpi = list_entry(it, struct ipsec_user_impi, list);
+			list_del(&uimpi->list);
+			list_add(&uimpi->list,
+					&grown->buckets[uimpi->hash & (grown->size - 1)]);
+		}
+	}
+	grown->count = table->count;
+	shm_free(table);
+	return grown;
+}
+
+static struct ipsec_user_impi *ipsec_find_user_impi(struct ipsec_user_table *table,
+		str *impi, unsigned int hash)
 {
 	struct ipsec_user_impi *uimpi;
 	struct list_head *it;
-	list_for_each(it, list) {
+	list_for_each(it, &table->buckets[hash & (table->size - 1)]) {
 		uimpi = list_entry(it, struct ipsec_user_impi, list);
-		if (str_match(&uimpi->impi, impi))
+		if (uimpi->hash == hash && str_match(&uimpi->impi, impi))
 			return uimpi;
 	}
 	return NULL;
@@ -201,8 +259,9 @@ static struct ipsec_user *ipsec_get_create_user(struct ipsec_map_node *node,
 {
 	struct ipsec_user_impi *uimpi = NULL;
 	struct ipsec_user *user;
+	unsigned int hash = core_hash(impi, NULL, 0);
 	if (node->users) {
-		uimpi = ipsec_find_user_impi(node->users, impi);
+		uimpi = ipsec_find_user_impi(node->users, impi, hash);
 		if (uimpi) {
 			user = ipsec_find_user_in_impi(&uimpi->users, impu);
 			if (user) {
@@ -213,10 +272,9 @@ static struct ipsec_user *ipsec_get_create_user(struct ipsec_map_node *node,
 			}
 		}
 	} else {
-		node->users = shm_malloc(sizeof *node->users);
+		node->users = ipsec_user_table_new(1);
 		if (!node->users)
 			return NULL;
-		INIT_LIST_HEAD(node->users);
 	}
 	if (!uimpi) {
 		uimpi = shm_malloc(sizeof(*uimpi) + impi->len);
@@ -226,8 +284,13 @@ static struct ipsec_user *ipsec_get_create_user(struct ipsec_map_node *node,
 		uimpi->impi.s = uimpi->_buf;
 		memcpy(uimpi->impi.s, impi->s, impi->len);
 		uimpi->impi.len = impi->len;
+		uimpi->hash = hash;
 		INIT_LIST_HEAD(&uimpi->users);
-		list_add(&uimpi->list, node->users);
+		if (node->users->count >= node->users->size * IPSEC_USER_TABLE_LOAD)
+			node->users = ipsec_user_table_grow(node->users);
+		list_add(&uimpi->list,
+				&node->users->buckets[hash & (node->users->size - 1)]);
+		node->users->count++;
 	}
 	user = shm_malloc(sizeof(*user) + impu->len);
 	if (!user) {
@@ -250,9 +313,10 @@ error:
 	/* no uimpi if its allocation failed */
 	if (uimpi && list_empty(&uimpi->users)) {
 		list_del(&uimpi->list);
+		node->users->count--;
 		shm_free(uimpi);
 	}
-	if (list_empty(node->users)) {
+	if (node->users->count == 0) {
 		shm_free(node->users);
 		node->users = NULL;
 	}
@@ -312,7 +376,8 @@ struct ipsec_user *ipsec_find_user(struct ip_addr *ip, str *impi, str *impu)
 	lock_get(&map->lock);
 	node = ipsec_find_node(ip, 0, map->nodes, map->size);
 	if (node && node->users) {
-		uimpi = ipsec_find_user_impi(node->users, impi);
+		uimpi = ipsec_find_user_impi(node->users, impi,
+				core_hash(impi, NULL, 0));
 		if (uimpi) {
 			user = ipsec_find_user_in_impi(&uimpi->users, impu);
 			if (user) {
@@ -337,13 +402,15 @@ static void ipsec_unlink_user(struct ipsec_map *map, struct ipsec_user *user)
 
 	node = ipsec_find_node(&user->ip, 0, map->nodes, map->size);
 	if (node && node->users) {
-		uimpi = ipsec_find_user_impi(node->users, &user->impi);
+		uimpi = ipsec_find_user_impi(node->users, &user->impi,
+				core_hash(&user->impi, NULL, 0));
 		if (uimpi) {
 			list_del(&user->list);
 			if (list_empty(&uimpi->users)) {
 				list_del(&uimpi->list);
+				node->users->count--;
 				shm_free(uimpi);
-				if (list_empty(node->users)) {
+				if (node->users->count == 0) {
 					shm_free(node->users);
 					node->users = NULL;
 				}
@@ -482,37 +549,4 @@ struct ipsec_ctx *ipsec_get_ctx_user_port(struct ipsec_user *user, unsigned shor
 		best = NULL;
 	lock_release(&user->lock);
 	return best;
-}
-
-struct ipsec_ctx *ipsec_get_ctx_ip_port(struct ip_addr *ip, unsigned short port)
-{
-	struct ipsec_ctx *ctx = NULL;
-	struct ipsec_map *map;
-	struct ipsec_map_node *node;
-	struct ipsec_user *user;
-	struct ipsec_user_impi *uimpi;
-	struct list_head *it, *uit;
-
-	if (ip->af == AF_INET)
-		map = ipsec_map_ipv4;
-	else
-		map = ipsec_map_ipv6;
-	lock_get(&map->lock);
-	node = ipsec_find_node(ip, 0, map->nodes, map->size);
-	if (node && node->users) {
-		list_for_each(it, node->users) {
-			uimpi = list_entry(it, struct ipsec_user_impi, list);
-			list_for_each(uit, &uimpi->users) {
-				user = list_entry(uit, struct ipsec_user, list);
-				ctx = ipsec_get_ctx_user_port(user, port);
-				if (ctx)
-					goto end;
-				ctx = NULL;
-			}
-		}
-	}
-end:
-	/* ctx is referenced by ipsec_get_ctx_user_port() */
-	lock_release(&map->lock);
-	return ctx;
 }

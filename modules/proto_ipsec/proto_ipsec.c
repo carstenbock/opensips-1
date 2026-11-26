@@ -619,7 +619,7 @@ static int proto_ipsec_send(const struct socket_info* source,
 		}
 		if (!ctx) {
 			LM_DBG("no valid IPSec context for %s:%hu\n", ip_addr2a(&ip), port);
-			ctx = ipsec_get_ctx_ip_port(&ip, lookup_port);
+			ctx = ipsec_ctx_find_ue_port(&ip, lookup_port);
 			if (ctx) {
 				LM_DBG("Got context %p (state = %d) for %s:%hu\n",
 						ctx, ctx->state, ip_addr2a(&ip), port);

@@ -220,6 +220,8 @@ struct ipsec_ctx *ipsec_ctx_find(struct ipsec_user *user, unsigned short port,
 void ipsec_ctx_push(struct ipsec_ctx *ctx);
 struct ipsec_ctx *ipsec_ctx_get(void);
 int ipsec_ctx_tryref(struct ipsec_ctx *ctx);
+struct ipsec_ctx *ipsec_ctx_find_ue_port(struct ip_addr *ue_ip,
+		unsigned short ue_port);
 void ipsec_ctx_push_user(struct ipsec_user *user, struct ipsec_ctx *ctx, enum ipsec_state state);
 void ipsec_ctx_add_tmp(struct ipsec_ctx *ctx, int lifetime);
 int ipsec_ctx_collisions(struct ipsec_user *user, struct ipsec_ctx *prot,

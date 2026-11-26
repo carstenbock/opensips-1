@@ -471,6 +471,59 @@ int ipsec_sa_owner(struct ip_addr *ue_ip, unsigned short ue_port,
 }
 
 /*
+ * Returns the (referenced) set to be used for sending to a port of the UE:
+ * the established set that is in use, else an old set that still lives,
+ * else a temporary one.
+ *
+ * The SA index has every live set under (UE address, UE port, own port), and
+ * a selector is linked once, so one probe per protected port of ours finds
+ * all candidates - however many UEs are behind the address.
+ */
+struct ipsec_ctx *ipsec_ctx_find_ue_port(struct ip_addr *ue_ip,
+		unsigned short ue_port)
+{
+	struct socket_info_full *si;
+	struct ipsec_sa_link *link;
+	struct ipsec_ctx *ctx, *found, *best = NULL;
+	unsigned int hash;
+	int l, rank, best_rank = 0;
+
+	for (si = protos[PROTO_IPSEC].listeners; si; si = si->next) {
+		if (si->socket_info.address.af != ue_ip->af)
+			continue;
+		hash = ipsec_sa_hash(ue_ip, ue_port, si->socket_info.port_no);
+		found = NULL;
+		IPSEC_SA_IDX_LOCK(hash);
+		for (link = ipsec_sa_idx[hash]; link; link = link->next) {
+			ctx = link->ctx;
+			l = link - ctx->sa_links;
+			if (ctx == best ||
+					IPSEC_SA_LINK_UE_PORT(ctx, l) != ue_port ||
+					IPSEC_SA_LINK_PORT(ctx, l) != si->socket_info.port_no ||
+					!ip_addr_cmp(&ctx->ue.ip, ue_ip) || !IPSEC_CTX_LIVE(ctx))
+				continue;
+			LM_DBG("checking ctx %p for port %u (ue.port_s=%u ue.port_c=%u state=%d)\n",
+					ctx, ue_port, ctx->ue.port_s, ctx->ue.port_c, ctx->state);
+			rank = (ctx->state == IPSEC_STATE_TMP?1:(ctx->old?2:3));
+			/* a linked ctx is not freed yet, so its lock may be taken */
+			if (rank > best_rank && ipsec_ctx_tryref(ctx)) {
+				found = ctx;
+				best_rank = rank;
+				break;
+			}
+		}
+		IPSEC_SA_IDX_UNLOCK(hash);
+		if (found) {
+			/* released without the bucket: it may be the last reference */
+			if (best)
+				ipsec_ctx_release(best);
+			best = found;
+		}
+	}
+	return best;
+}
+
+/*
  * Hash map
  */
 
@@ -1277,7 +1330,7 @@ int ipsec_sa_add(struct mnl_socket *sock, struct ipsec_ctx *ctx,
  *                arrived over the set and by ipsec_create() for the set the
  *                401 to it created, dropped by tm with the transaction.
  *  processing    the lookups (ipsec_get_ctx_user(), ipsec_ctx_find(),
- *                ipsec_get_ctx_ip_port()) return a referenced ctx; the caller
+ *                ipsec_ctx_find_ue_port()) return a referenced ctx; the caller
  *                drops it or hands it over to the processing context.
  *
  * user->sas itself holds no reference: a ctx stays linked there until it is
@@ -1291,9 +1344,11 @@ int ipsec_sa_add(struct mnl_socket *sock, struct ipsec_ctx *ctx,
  *
  * Lock order: user map -> user -> lifetime list -> ctx.  Nothing is freed
  * and no netlink I/O is done with the lifetime list locked.  The buckets of
- * the SA index are locked last, with no other lock taken inside; only the
- * reconciliation holds two of them at once (in the order of their locks),
- * and does netlink I/O with them when it deletes an orphan.
+ * the SA index are locked after the user map, the user and the lifetime
+ * list, and never with a ctx locked: ipsec_ctx_find_ue_port() locks a ctx
+ * inside a bucket.  Only the reconciliation holds two buckets at once (in
+ * the order of their locks), and does netlink I/O with them when it deletes
+ * an orphan.
  */
 
 #define IPSEC_GET_CTX() ((struct ipsec_ctx *)context_get_ptr(CONTEXT_GLOBAL, \
