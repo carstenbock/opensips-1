@@ -469,7 +469,9 @@ static int proto_ipsec_add_listeners(void)
 		/* extract si and duplicate information as internal */
 		si = socket_info2id(&it->socket_info);
 		si->proto = PROTO_UDP;
-		si->flags |= SI_INTERNAL;
+		/* socket_info2id() drops the flags; "frag" has to reach the UDP
+		 * socket, which sends for the IPSec listener (helm KI-291) */
+		si->flags |= SI_INTERNAL | (it->socket_info.flags & SI_FRAG);
 		udp = new_sock_info(si);
 		if (!udp) {
 			LM_ERR("could not add UDP listening sucket for %s:%d\n",
