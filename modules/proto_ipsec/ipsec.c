@@ -1784,6 +1784,83 @@ void ipsec_ctx_challenge_user(struct ipsec_user *user, struct ipsec_ctx *prot,
 	ipsec_sock_close(sock);
 }
 
+/* the (referenced) set that holds the selector between a port of the UE
+ * and a port of ours, if any */
+static struct ipsec_ctx *ipsec_sa_selector_owner(struct ip_addr *ue_ip,
+		unsigned short ue_port, struct ip_addr *ip, unsigned short port)
+{
+	struct ipsec_sa_link *link;
+	struct ipsec_ctx *ctx, *found = NULL;
+	unsigned int hash = ipsec_sa_hash(ue_ip, ue_port, port);
+	int l;
+
+	IPSEC_SA_IDX_LOCK(hash);
+	for (link = ipsec_sa_idx[hash]; link; link = link->next) {
+		ctx = link->ctx;
+		l = link - ctx->sa_links;
+		if (IPSEC_SA_LINK_UE_PORT(ctx, l) != ue_port ||
+				IPSEC_SA_LINK_PORT(ctx, l) != port ||
+				!ip_addr_cmp(&ctx->ue.ip, ue_ip) ||
+				!ip_addr_cmp(&ctx->me.ip, ip))
+			continue;
+		/* a linked ctx is not freed yet, so its lock may be taken */
+		if (ipsec_ctx_tryref(ctx))
+			found = ctx;
+		break;
+	}
+	IPSEC_SA_IDX_UNLOCK(hash);
+	return found;
+}
+
+/*
+ * A 401 is about to set up a new set of security associations between the
+ * given ports of a UE address and of ours.  ipsec_ctx_challenge_user() has
+ * made room among the sets of the same user; whatever still holds one of
+ * the two selectors belongs to another user behind that address: a UE that
+ * left without de-registering, whose address the access network has given
+ * to the next UE (helm KI-248).  Its set is removed, as a set of the same
+ * user would be; its registration ends when the lifetime list drops it.
+ *
+ * SPEC-DEVIATION: TS 33.203 7.1 rule 3 -- the REGISTER is not rejected.  A
+ * binding lives for hours or days, and until it expired the new owner of
+ * the address could not get security associations with these ports.
+ * Refusing protected nothing either: the set of the same user is removed
+ * on an unprotected REGISTER as well (see ipsec_ctx_challenge_user()), and
+ * such a REGISTER can name any user.
+ */
+void ipsec_sa_take_over(struct ip_addr *ue_ip, struct ip_addr *ip,
+		unsigned short ue_port_c, unsigned short ue_port_s,
+		unsigned short port_ps, unsigned short port_pc)
+{
+	struct ipsec_socket *sock = NULL;
+	struct ipsec_ctx *ctx;
+	int l, n;
+
+	for (l = 0; l < 2; l++) {
+		/* a removed set leaves the index, so each turn finds another one;
+		 * the bound is for a set that cannot be referenced any more */
+		for (n = 0; n < 4; n++) {
+			ctx = ipsec_sa_selector_owner(ue_ip, l?ue_port_s:ue_port_c,
+					ip, l?port_pc:port_ps);
+			if (!ctx)
+				break;
+			if (!sock && !(sock = ipsec_sock_new())) {
+				ipsec_ctx_release(ctx);
+				return;
+			}
+			LM_INFO("removing SAs of ctx %p (UE %s ports %hu/%hu, own ports"
+					" %hu/%hu) of another user: new set uses the same"
+					" ports\n", ctx, ip_addr2a(&ctx->ue.ip), ctx->ue.port_c,
+					ctx->ue.port_s, ctx->me.port_c, ctx->me.port_s);
+			ipsec_sa_rm_all(sock, ctx);
+			ipsec_ctx_add_tmp(ctx, 0);
+			ipsec_ctx_release(ctx);
+		}
+	}
+	if (sock)
+		ipsec_sock_close(sock);
+}
+
 /*
  * The 200 OK to a REGISTER received over this set is being processed.
  * Returns:

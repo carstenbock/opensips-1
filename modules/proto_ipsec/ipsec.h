@@ -230,6 +230,9 @@ int ipsec_ctx_collisions(struct ipsec_user *user, struct ipsec_ctx *prot,
 void ipsec_ctx_challenge_user(struct ipsec_user *user, struct ipsec_ctx *prot,
 		unsigned short ue_port_c, unsigned short ue_port_s,
 		unsigned short port_ps, unsigned short port_pc);
+void ipsec_sa_take_over(struct ip_addr *ue_ip, struct ip_addr *ip,
+		unsigned short ue_port_c, unsigned short ue_port_s,
+		unsigned short port_ps, unsigned short port_pc);
 int ipsec_ctx_confirm(struct ipsec_ctx *ctx);
 void ipsec_ctx_unregister(struct ipsec_ctx *ctx);
 void ipsec_ctx_release_user(struct ipsec_ctx *ctx);
