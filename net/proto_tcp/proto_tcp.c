@@ -114,6 +114,8 @@ static const cmd_export_t cmds[] = {
 };
 
 
+static int tcp_async_local_connect_timeout_unused;
+
 static const param_export_t params[] = {
 	{ "tcp_port",                        INT_PARAM, &tcp_port               },
 	{ "tcp_send_timeout",                INT_PARAM, &tcp_send_timeout       },
@@ -121,6 +123,11 @@ static const param_export_t params[] = {
 	{ "tcp_crlf_pingpong",               INT_PARAM, &tcp_crlf_pingpong      },
 	{ "tcp_crlf_drop",                   INT_PARAM, &tcp_crlf_drop          },
 	{ "tcp_async",                       INT_PARAM, &tcp_async              },
+	/* fork: gone upstream with the connect done by the TCP main process;
+	 * accepted and ignored, so that a configuration written for the image
+	 * before the merge still loads */
+	{ "tcp_async_local_connect_timeout", INT_PARAM,
+											&tcp_async_local_connect_timeout_unused },
 	{ "tcp_async_max_postponed_chunks",  INT_PARAM,
 											&tcp_async_max_postponed_chunks },
 	{ "tcp_async_local_write_timeout",   INT_PARAM,

@@ -121,6 +121,11 @@ int trans_load(void)
 				LM_ERR("Protocol ID mismatch %d != %d\n", id, pi.id);
 				return -1;
 			}
+			/* fork: a transport module without a listener is not an error
+			 * (as before upstream 282c424066 moved this below the listener
+			 * check): a cluster seed loads proto_tcp and proto_udp like the
+			 * workers, but only listens on bin */
+			found_proto = 1;
 			/* check if there is any listener for this protocol */
 			if (!proto_has_listeners(pi.id)) {
 				LM_DBG("No listener defined for proto %s\n", pi.name);
