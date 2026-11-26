@@ -123,12 +123,15 @@ static struct clusterer_binds c_api;
 static int mod_init(void);
 static void mod_destroy(void);
 static void li_table_proc(int rank);
-static int w_li_match(struct sip_msg *msg, pv_spec_t *out);
+static int w_li_match(struct sip_msg *msg, pv_spec_t *out, str *caller,
+	str *called);
 static int li_init_cluster(void);
 
 static const cmd_export_t cmds[] = {
 	{"li_match", (cmd_function)w_li_match, {
-		{CMD_PARAM_VAR, 0, 0}, {0, 0, 0}}, REQUEST_ROUTE},
+		{CMD_PARAM_VAR, 0, 0},
+		{CMD_PARAM_STR | CMD_PARAM_OPT, 0, 0},
+		{CMD_PARAM_STR | CMD_PARAM_OPT, 0, 0}, {0, 0, 0}}, REQUEST_ROUTE},
 	{0, 0, {{0, 0, 0}}, 0}
 };
 
@@ -692,8 +695,13 @@ static int li_init_cluster(void)
  * session as the target of that task sees it (f from the target, t to the
  * target, c combined, i indeterminate) and m the direction of this request
  * (f from, t to, u unknown). Two tasks can see one call from opposite sides.
+ *
+ * caller and called are identities the script worked out itself (a border
+ * element that brings a carrier's number into its international form); they
+ * count like From and Request-URI.
  */
-static int w_li_match(struct sip_msg *msg, pv_spec_t *out)
+static int w_li_match(struct sip_msg *msg, pv_spec_t *out, str *caller,
+	str *called)
 {
 	static char buf[8 + LI_MAX_XIDS * (2 * LI_XID_LEN + 4)];
 	static const char hex[] = "0123456789abcdef";
@@ -727,6 +735,8 @@ static int w_li_match(struct sip_msg *msg, pv_spec_t *out)
 			matched |= match_impu(&get_pai(msg)->uri, &set, LI_SIDE_FROM);
 		matched |= match_impu(&REQ_LINE(msg).uri, &set, LI_SIDE_TO);
 		matched |= match_impu(&to->uri, &set, LI_SIDE_TO);
+		matched |= match_impu(caller, &set, LI_SIDE_FROM);
+		matched |= match_impu(called, &set, LI_SIDE_TO);
 		if (msg->REQ_METHOD == METHOD_REGISTER)
 			matched |= match_register(msg, &set);
 	}

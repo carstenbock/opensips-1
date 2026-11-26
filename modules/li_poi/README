@@ -63,7 +63,7 @@ impi_key (string, default "impi")
 Functions
 ---------
 
-li_match(result)
+li_match(result, [caller], [called])
     Request route. Returns 1 if the request belongs to an intercepted
     communication, -1 otherwise. With an empty table and no remembered call
     it returns at once, without parsing anything.
@@ -79,6 +79,13 @@ li_match(result)
 
     An identity is compared in a canonical form (li_identity.h): a tel URI
     and a SIP URI with the same E.164 number are the same identity.
+
+    caller and called are optional identities (tel or SIP URI) that count
+    like From and Request-URI. A border element gives the numbers it
+    brought into their international form, because a carrier may send a
+    national number that no target identifier equals:
+
+        li_match($var(li), "tel:$var(normalized_from)", "tel:+$var(dest)")
 
     On a match, result is set to
 
