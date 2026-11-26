@@ -767,20 +767,22 @@ static const param_export_t params[] = {
 	{0, 0, 0}
 };
 
+/* fork: the aliases are the command names before upstream gave the MI
+ * commands their module prefix; the IMS controller and operators use them */
 static const mi_export_t mi_cmds[] = {
 	{ MI_ENABLE_RTP_ENGINE, 0, 0, 0, {
 		{mi_enable_rtpengine, {"url", "enable", 0}},
 		{mi_enable_rtpengine, {"url", "enable", "setid", 0}},
-		{EMPTY_MI_RECIPE}}, {0}
+		{EMPTY_MI_RECIPE}}, {"rtpengine_enable", 0}
 	},
 	{ MI_SHOW_RTP_ENGINES, 0, 0, 0, {
 		{mi_show_rtpengines, {0}},
-		{EMPTY_MI_RECIPE}}, {0}
+		{EMPTY_MI_RECIPE}}, {"rtpengine_show", 0}
 	},
 	{ MI_RELOAD_RTP_ENGINES, 0, 0, 0, {
 		{mi_reload_rtpengines, {0}},
 		{mi_reload_rtpengines, {"type", 0}},
-		{EMPTY_MI_RECIPE}}, {0}
+		{EMPTY_MI_RECIPE}}, {"rtpengine_reload", 0}
 	},
 	{ "teardown", 0, 0, 0, {
 		{mi_teardown_call, {"callid", 0}},
