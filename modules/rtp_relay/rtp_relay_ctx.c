@@ -341,7 +341,7 @@ static void rtp_relay_b2b_end(void *param)
 	if (!ctx)
 		return;
 	RTP_RELAY_CTX_LOCK(ctx);
-	if (rtp_relay_ctx_established(ctx)) {
+	if (rtp_relay_ctx_established(ctx) && ctx->established) {
 		rtp_relay_delete_ctx(ctx, ctx->established, RTP_RELAY_CALLER);
 		RTP_RELAY_CTX_UNLOCK(ctx);
 		lock_start_write(rtp_relay_contexts_lock);
@@ -1954,6 +1954,16 @@ static int handle_rtp_relay_ctx_leg_reply(struct rtp_relay_ctx *ctx,
 	memset(&info, 0, sizeof info);
 	info.msg = rpl;
 	if (rpl == FAKED_REPLY || rpl->REPLY_STATUS >= 300) {
+		if (rtp_relay_ctx_established(ctx) && ctx->established == sess) {
+			/* A negative reply to an offer inside the dialog (re-INVITE):
+			 * the session stays as it was (RFC 3261 section 14.1). Deleting
+			 * it took the media of the running call away, and freeing it
+			 * left the context "established" without a session, on which
+			 * the end of the call crashed. The next offer starts anew. */
+			rtp_sess_reset_ongoing(sess);
+			rtp_sess_reset_pending(sess);
+			return 2;
+		}
 		if (!rtp_sess_late(sess)) {
 			if (rpl == FAKED_REPLY)
 				info.msg = req;
