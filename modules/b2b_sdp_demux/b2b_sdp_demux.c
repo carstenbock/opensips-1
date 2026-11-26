@@ -28,6 +28,7 @@
 #include "../../lib/list.h"
 #include "../../msg_translator.h"
 #include "../../rw_locking.h"
+#include "../../timer.h"
 
 static const dep_export_t mod_deps = {
 	{ /* OpenSIPS module dependencies */
@@ -43,6 +44,7 @@ static b2b_api_t b2b_api;
 static str b2b_sdp_demux_server_cap = str_init("b2b_sdp_demux_server");
 static str b2b_sdp_demux_client_cap = str_init("b2b_sdp_demux_client");
 static str content_type_sdp_hdr = str_init("Content-Type: application/sdp\r\n");
+static int b2b_sdp_pending_wait_timeout;
 
 static enum {
 	B2B_SDP_BYE_DISABLE_TERMINATE,
@@ -81,6 +83,11 @@ static struct list_head *b2b_sdp_contexts;
 /** Module init function */
 static int mod_init(void)
 {
+	if (b2b_sdp_pending_wait_timeout < 0) {
+		LM_ERR("invalid pending_wait_timeout: %d\n",
+				b2b_sdp_pending_wait_timeout);
+		return -1;
+	}
 
 	b2b_sdp_contexts_lock = lock_init_rw();
 	if (!b2b_sdp_contexts_lock) {
@@ -146,6 +153,7 @@ static int b2b_sdp_parse_bye_mode(unsigned int type, void *val)
 
 static const param_export_t mod_params[]={
 	{ "client_bye_mode", STR_PARAM|USE_FUNC_PARAM, b2b_sdp_parse_bye_mode },
+	{ "pending_wait_timeout", INT_PARAM, &b2b_sdp_pending_wait_timeout },
 	{ 0,                 0,                        0                       }
 };
 
@@ -234,11 +242,37 @@ struct b2b_sdp_ctx {
 	time_t sess_id;
 	str sess_ip;
 	gen_lock_t lock;
+	unsigned int ref;
 	b2b_dlginfo_t *dlginfo;
 	struct list_head clients;
 	struct list_head streams;
 	struct list_head contexts;
 };
+
+static void b2b_sdp_ctx_ref(struct b2b_sdp_ctx *ctx)
+{
+	lock_get(&ctx->lock);
+	ctx->ref++;
+	lock_release(&ctx->lock);
+}
+
+static void b2b_sdp_ctx_unref(struct b2b_sdp_ctx *ctx)
+{
+	int free_ctx;
+
+	lock_get(&ctx->lock);
+	free_ctx = (--ctx->ref == 0);
+	lock_release(&ctx->lock);
+	if (!free_ctx)
+		return;
+
+	if (ctx->b2b_key.s)
+		shm_free(ctx->b2b_key.s);
+	if (ctx->dlginfo)
+		shm_free(ctx->dlginfo);
+	shm_free(ctx->sess_ip.s);
+	shm_free(ctx);
+}
 
 
 
@@ -389,63 +423,140 @@ static struct b2b_sdp_client *b2b_sdp_client_new(struct b2b_sdp_ctx *ctx)
 	memset(client, 0, sizeof *client);
 	INIT_LIST_HEAD(&client->streams);
 	client->ctx = ctx;
+	b2b_sdp_ctx_ref(ctx);
 	list_add_tail(&client->list, &ctx->clients);
 	ctx->clients_no++;
 	return client;
 }
 
-static void b2b_sdp_client_end(struct b2b_sdp_client *client, str *key, int send_cancel)
+struct b2b_sdp_client_end {
+	str key;
+	b2b_dlginfo_t *dlginfo;
+	struct b2b_sdp_ctx *ctx;
+	int send_cancel;
+	int delete_entity;
+	struct b2b_sdp_client_end *next;
+};
+
+/* called with the ctx lock held, while client is guaranteed to be valid */
+static struct b2b_sdp_client_end *b2b_sdp_client_end_prepare(
+		struct b2b_sdp_client *client, str *key, int send_cancel,
+		int delete_entity)
+{
+	struct b2b_sdp_client_end *end;
+
+	end = pkg_malloc(sizeof *end);
+	if (!end) {
+		LM_ERR("no more pkg memory for terminating client\n");
+		return NULL;
+	}
+	memset(end, 0, sizeof *end);
+	if (pkg_str_dup(&end->key, key) < 0) {
+		LM_ERR("could not duplicate client key\n");
+		pkg_free(end);
+		return NULL;
+	}
+	if (client->dlginfo) {
+		end->dlginfo = b2b_dup_dlginfo(client->dlginfo);
+		if (!end->dlginfo) {
+			LM_ERR("could not duplicate client dialog information\n");
+			pkg_free(end->key.s);
+			pkg_free(end);
+			return NULL;
+		}
+	}
+	end->ctx = client->ctx;
+	end->send_cancel = send_cancel;
+	end->delete_entity = delete_entity;
+	return end;
+}
+
+static void b2b_sdp_client_end_free(struct b2b_sdp_client_end *end)
+{
+	if (end->dlginfo)
+		shm_free(end->dlginfo);
+	pkg_free(end->key.s);
+	pkg_free(end);
+}
+
+/* must be called without the ctx lock: send_request() takes the b2b_entities
+ * hash lock, and b2b_entities calls b2b_sdp_client_free() (which takes the
+ * ctx lock) with that hash lock held - holding both in reverse order
+ * deadlocks the two processes */
+static void b2b_sdp_client_end(struct b2b_sdp_client_end *end)
 {
 	str method;
 	b2b_req_data_t req_data;
 
-	if (send_cancel) {
+	if (end->send_cancel)
 		init_str(&method, CANCEL);
-		client->flags |= B2B_SDP_CLIENT_CANCEL;
-	} else {
+	else
 		init_str(&method, BYE);
-	}
 
 	memset(&req_data, 0, sizeof(b2b_req_data_t));
 	req_data.no_cb = 1; /* do not call callback */
 	req_data.et = B2B_CLIENT;
-	req_data.b2b_key = key;
-	req_data.dlginfo = client->dlginfo;
+	req_data.b2b_key = &end->key;
+	req_data.dlginfo = end->dlginfo;
 	req_data.method = &method;
-	b2b_api.send_request(&req_data);
+	run_b2be_api(&b2b_api, send_request, &req_data);
 	LM_INFO("[%.*s][%.*s] client request %.*s sent\n",
-			client->ctx->callid.len, client->ctx->callid.s,
-			key->len, key->s, method.len, method.s);
+			end->ctx->callid.len, end->ctx->callid.s,
+			end->key.len, end->key.s, method.len, method.s);
+	if (end->delete_entity)
+		b2b_api.entity_delete(B2B_CLIENT, &end->key, end->dlginfo, 1, 1);
+	b2b_sdp_client_end_free(end);
+}
+
+/* called with the ctx lock held */
+static struct b2b_sdp_client_end *b2b_sdp_client_terminate_prepare(
+		struct b2b_sdp_client *client, str *key, int del)
+{
+	int send_cancel = 0, started;
+	struct b2b_sdp_client_end *end;
+
+	if (!key || key->len == 0) {
+		LM_WARN("cannot terminate non-started client\n");
+		return NULL;
+	}
+	send_cancel = (client->flags & B2B_SDP_CLIENT_EARLY);
+	started = (client->flags & B2B_SDP_CLIENT_STARTED);
+	end = b2b_sdp_client_end_prepare(client, key, send_cancel,
+			!send_cancel && started && del);
+	if (!end)
+		return NULL;
+	if (send_cancel)
+		client->flags |= B2B_SDP_CLIENT_CANCEL;
+	if (send_cancel || started)
+		client->flags &= ~(B2B_SDP_CLIENT_EARLY|B2B_SDP_CLIENT_STARTED);
+	return end;
 }
 
 static void b2b_sdp_client_terminate(struct b2b_sdp_client *client, str *key, int del)
 {
-	int send_cancel = 0;
-	if (!key || key->len == 0) {
-		LM_WARN("cannot terminate non-started client\n");
+	struct b2b_sdp_client_end *end;
+	struct b2b_sdp_ctx *ctx = client->ctx;
+
+	lock_get(&ctx->lock);
+	end = b2b_sdp_client_terminate_prepare(client, key, del);
+	lock_release(&ctx->lock);
+	if (!end)
 		return;
-	}
-	lock_get(&client->ctx->lock);
-	send_cancel = (client->flags & B2B_SDP_CLIENT_EARLY);
-	b2b_sdp_client_end(client, key, send_cancel);
-	if (!send_cancel && !(client->flags & B2B_SDP_CLIENT_STARTED)) {
-		lock_release(&client->ctx->lock);
-		return;
-	}
-	client->flags &= ~(B2B_SDP_CLIENT_EARLY|B2B_SDP_CLIENT_STARTED);
-	lock_release(&client->ctx->lock);
-	if (!send_cancel && del)
-		b2b_api.entity_delete(B2B_CLIENT, key, client->dlginfo, 1, 1);
+	/* send the BYE/CANCEL outside of the ctx lock */
+	b2b_sdp_client_end(end);
 }
 
 static void b2b_sdp_client_free(void *param)
 {
 	struct list_head *it, *safe;
+	struct b2b_sdp_ctx *ctx;
 
 	struct b2b_sdp_client *client = param;
 
 	if (!param)
 		return;
+
+	ctx = client->ctx;
 
 	if (client->hdrs.s)
 		shm_free(client->hdrs.s);
@@ -456,11 +567,14 @@ static void b2b_sdp_client_free(void *param)
 	if (client->body.s)
 		shm_free(client->body.s);
 
+	lock_get(&ctx->lock);
 	list_for_each_safe(it, safe, &client->streams)
 		b2b_sdp_stream_free(list_entry(it, struct b2b_sdp_stream, list));
+	lock_release(&ctx->lock);
 	if (client->dlginfo)
 		shm_free(client->dlginfo);
 	shm_free(client);
+	b2b_sdp_ctx_unref(ctx);
 }
 
 static int b2b_sdp_client_release(struct b2b_sdp_client *client, int lock)
@@ -495,6 +609,7 @@ static struct b2b_sdp_ctx *b2b_sdp_ctx_new(str *callid)
 	INIT_LIST_HEAD(&ctx->clients);
 	INIT_LIST_HEAD(&ctx->streams);
 	lock_init(&ctx->lock);
+	ctx->ref = 1; /* server entity ownership */
 	time(&ctx->sess_id);
 	ctx->callid.len = callid->len;
 	ctx->callid.s = (char *)(ctx + 1);
@@ -546,15 +661,41 @@ static struct b2b_sdp_client *b2b_sdp_client_get(struct b2b_sdp_ctx *ctx, str *k
 static void b2b_sdp_ctx_release(struct b2b_sdp_ctx *ctx, int replicate)
 {
 	struct list_head *it, *safe;
+	struct b2b_sdp_client *client;
+	struct b2b_sdp_client_end *end;
 
-	list_for_each_safe(it, safe, &ctx->clients)
-		b2b_sdp_client_delete(list_entry(it, struct b2b_sdp_client, list));
+	/* Make the release idempotent: only the caller that removes the context
+	 * from the global list proceeds, the rest bail out. This prevents a
+	 * concurrent/double release (e.g. a BYE arriving from both the upstream
+	 * server and a downstream client) from corrupting the contexts list and
+	 * deleting the server entity twice. */
+	lock_start_write(b2b_sdp_contexts_lock);
+	if (!list_is_valid(&ctx->contexts)) {
+		lock_stop_write(b2b_sdp_contexts_lock);
+		return;
+	}
+	list_del(&ctx->contexts);
+	lock_stop_write(b2b_sdp_contexts_lock);
+
+	/* Drain the clients while holding the lock: list_del() poisons each entry
+	 * before we drop the lock, so a concurrent b2b_sdp_client_bye() sees its
+	 * client already removed (release returns 0) and bails out instead of
+	 * deleting the same client entity twice. */
+	lock_get(&ctx->lock);
+	while (!list_empty(&ctx->clients)) {
+		client = list_entry(ctx->clients.next, struct b2b_sdp_client, list);
+		list_del(&client->list);
+		ctx->clients_no--;
+		end = b2b_sdp_client_terminate_prepare(client, &client->b2b_key, 1);
+		lock_release(&ctx->lock);
+		if (end)
+			b2b_sdp_client_end(end);
+		lock_get(&ctx->lock);
+	}
 	/* free remaining streams */
 	list_for_each_safe(it, safe, &ctx->streams)
 		b2b_sdp_stream_free(list_entry(it, struct b2b_sdp_stream, ordered));
-	lock_start_write(b2b_sdp_contexts_lock);
-	list_del(&ctx->contexts);
-	lock_stop_write(b2b_sdp_contexts_lock);
+	lock_release(&ctx->lock);
 	if (ctx->b2b_key.s)
 		b2b_api.entity_delete(B2B_SERVER, &ctx->b2b_key, ctx->dlginfo, 1, replicate);
 }
@@ -564,12 +705,7 @@ static void b2b_sdp_ctx_free(void *param)
 	struct b2b_sdp_ctx *ctx = param;
 	if (!ctx)
 		return;
-	if (ctx->b2b_key.s)
-		shm_free(ctx->b2b_key.s);
-	if (ctx->dlginfo)
-		shm_free(ctx->dlginfo);
-	shm_free(ctx->sess_ip.s);
-	shm_free(ctx);
+	b2b_sdp_ctx_unref(ctx);
 }
 
 static int b2b_sdp_streams_from_sdp(struct b2b_sdp_ctx *ctx,
@@ -858,14 +994,29 @@ static str *b2b_sdp_mux_body(struct b2b_sdp_ctx *ctx)
 	return &body;
 }
 
-#define B2B_SDP_CLIENT_WAIT_FREE(_ctx) \
-	do { \
-		while ((_ctx)->pending_no) { \
-			lock_release(&(_ctx)->lock); \
-			usleep(50); \
-			lock_get(&(_ctx)->lock); \
-		} \
-	} while (0)
+#define B2B_SDP_CLIENT_WAIT_INC_US 50
+
+/* called with the context lock held; returns with it held */
+static int b2b_sdp_client_wait_free(struct b2b_sdp_ctx *ctx)
+{
+	utime_t deadline = 0;
+
+	if (b2b_sdp_pending_wait_timeout)
+		deadline = get_uticks() + (utime_t)b2b_sdp_pending_wait_timeout * 1000;
+
+	while (ctx->pending_no) {
+		if (deadline && get_uticks() >= deadline) {
+			LM_WARN("[%.*s] timeout while waiting for %d pending SDP negotiation(s)\n",
+					ctx->callid.len, ctx->callid.s, ctx->pending_no);
+			return -1;
+		}
+		lock_release(&ctx->lock);
+		usleep(B2B_SDP_CLIENT_WAIT_INC_US);
+		lock_get(&ctx->lock);
+	}
+
+	return 0;
+}
 
 static int b2b_sdp_client_reinvite(struct sip_msg *msg, struct b2b_sdp_client *client)
 {
@@ -890,7 +1041,10 @@ static int b2b_sdp_client_reinvite(struct sip_msg *msg, struct b2b_sdp_client *c
 		code = 491;
 		goto end;
 	}
-	B2B_SDP_CLIENT_WAIT_FREE(client->ctx);
+	if (b2b_sdp_client_wait_free(client->ctx) < 0) {
+		code = 491;
+		goto end;
+	}
 	ret = b2b_sdp_client_sync(client, body);
 	if (ret < 0) {
 		code = 488;
@@ -918,7 +1072,7 @@ end:
 			LM_INFO("[%.*s][%.*s] server request INVITE sent\n",
 					client->ctx->callid.len, client->ctx->callid.s,
 					client->ctx->b2b_key.len, client->ctx->b2b_key.s);
-			if (b2b_api.send_request(&req_data) < 0) {
+			if (run_b2be_api(&b2b_api, send_request, &req_data) < 0) {
 				LM_ERR("cannot send upstream INVITE\n");
 				code = 500;
 				ret = -1;
@@ -953,7 +1107,6 @@ static void b2b_sdp_client_destroy(struct b2b_sdp_client *client)
 {
 	b2b_sdp_client_release_streams(client);
 	b2b_sdp_client_release(client, 0);
-	b2b_api.entity_delete(B2B_CLIENT, &client->b2b_key, client->dlginfo, 1, 1);
 }
 
 
@@ -972,6 +1125,25 @@ static void b2b_sdp_client_remove(struct b2b_sdp_client *client)
 	lock_release(&ctx->lock);
 }
 
+static int b2b_sdp_client_remove_release(struct b2b_sdp_client *client)
+{
+	struct b2b_sdp_ctx *ctx = client->ctx;
+
+	lock_get(&ctx->lock);
+	if (!list_is_valid(&client->list)) {
+		lock_release(&ctx->lock);
+		return 0;
+	}
+	if (client->flags & B2B_SDP_CLIENT_STARTED) {
+		client->flags &= ~(B2B_SDP_CLIENT_EARLY|B2B_SDP_CLIENT_STARTED);
+		b2b_sdp_client_release_streams(client);
+	}
+	list_del(&client->list);
+	ctx->clients_no--;
+	lock_release(&ctx->lock);
+	return 1;
+}
+
 static void b2b_sdp_server_send_bye(struct b2b_sdp_ctx *ctx)
 {
 	str method;
@@ -983,7 +1155,7 @@ static void b2b_sdp_server_send_bye(struct b2b_sdp_ctx *ctx)
 	req_data.b2b_key = &ctx->b2b_key;
 	req_data.method = &method;
 	req_data.dlginfo = ctx->dlginfo;
-	if (b2b_api.send_request(&req_data) < 0)
+	if (run_b2be_api(&b2b_api, send_request, &req_data) < 0)
 		LM_ERR("[%.*s] cannot send upstream BYE\n", ctx->callid.len, ctx->callid.s);
 	else
 		LM_INFO("[%.*s][%.*s] server request BYE sent\n",
@@ -996,10 +1168,12 @@ static int b2b_sdp_client_bye(struct sip_msg *msg, struct b2b_sdp_client *client
 	str method;
 	b2b_req_data_t req_data;
 	struct b2b_sdp_ctx *ctx = client->ctx;
+	int del;
 
-	b2b_sdp_client_remove(client);
 	b2b_sdp_reply(&client->b2b_key, client->dlginfo, B2B_CLIENT, METHOD_BYE, 200, NULL);
-	b2b_sdp_client_release(client, 1);
+	del = b2b_sdp_client_remove_release(client);
+	if (!del)
+		return 0;
 	b2b_api.entity_delete(B2B_CLIENT, &client->b2b_key, client->dlginfo, 1, 1);
 	lock_get(&ctx->lock);
 
@@ -1012,14 +1186,15 @@ static int b2b_sdp_client_bye(struct sip_msg *msg, struct b2b_sdp_client *client
 				return 0;
 			}
 			ctx->pending_no = 1;
-			b2b_sdp_server_send_bye(ctx);
+			/* send the upstream BYE outside of the ctx lock */
 			lock_release(&ctx->lock);
+			b2b_sdp_server_send_bye(ctx);
 			break;
 
 		case B2B_SDP_BYE_DISABLE_TERMINATE:
 			if (list_size(&ctx->clients) == 0) {
-				b2b_sdp_server_send_bye(ctx);
 				lock_release(&ctx->lock);
+				b2b_sdp_server_send_bye(ctx);
 				break;
 			}
 			/* fallback */
@@ -1029,7 +1204,11 @@ static int b2b_sdp_client_bye(struct sip_msg *msg, struct b2b_sdp_client *client
 			body = b2b_sdp_mux_body(ctx);
 			if (body) {
 				/* we do a busy waiting if there's a different negotiation happening */
-				B2B_SDP_CLIENT_WAIT_FREE(ctx);
+				if (b2b_sdp_client_wait_free(ctx) < 0) {
+					lock_release(&ctx->lock);
+					pkg_free(body->s);
+					return 0;
+				}
 				ctx->pending_no = 1;
 				lock_release(&ctx->lock);
 				memset(&req_data, 0, sizeof(b2b_req_data_t));
@@ -1039,7 +1218,7 @@ static int b2b_sdp_client_bye(struct sip_msg *msg, struct b2b_sdp_client *client
 				req_data.method = &method;
 				req_data.body = body;
 				req_data.dlginfo = ctx->dlginfo;
-				if (b2b_api.send_request(&req_data) < 0)
+				if (run_b2be_api(&b2b_api, send_request, &req_data) < 0)
 					LM_ERR("[%.*s] cannot send upstream INVITE\n",
 							ctx->callid.len, ctx->callid.s);
 				else
@@ -1073,7 +1252,7 @@ static int b2b_sdp_reply(str *b2b_key, b2b_dlginfo_t *dlginfo,
 		reply_data.extra_headers = &content_type_sdp_hdr;
 	LM_INFO("[%.*s] %s reply %d sent\n", b2b_key->len, b2b_key->s, etype, code);
 
-	return b2b_api.send_reply(&reply_data);
+	return run_b2be_api(&b2b_api, send_reply, &reply_data);
 }
 
 static int b2b_sdp_client_sync(struct b2b_sdp_client *client, str *body)
@@ -1214,14 +1393,16 @@ static int b2b_sdp_ack(int type, str *key, b2b_dlginfo_t *dlginfo)
 
 	LM_INFO("[%.*s] %s request ACK sent\n", key->len, key->s, etype);
 
-	return b2b_api.send_request(&req);
+	return run_b2be_api(&b2b_api, send_request, &req);
 }
 
 static int b2b_sdp_client_reply_invite(struct sip_msg *msg, struct b2b_sdp_client *client)
 {
 	str *body = NULL;
 	int ret = -1;
+	int destroy_client = 0;
 	struct b2b_sdp_ctx *ctx;
+	struct b2b_sdp_client_end *end = NULL;
 
 	/* only ACK if not fake reply, or not a dummy message as
 	 * built in the dlg.c tm callback */
@@ -1247,8 +1428,10 @@ static int b2b_sdp_client_reply_invite(struct sip_msg *msg, struct b2b_sdp_clien
 		if (ctx->flags & B2B_SDP_CTX_CANCELLED) {
 			LM_DBG("contex already CANCELLED!\n");
 			if (!(client->flags & B2B_SDP_CLIENT_CANCEL))
-				b2b_sdp_client_end(client, &client->b2b_key, 0);
+				end = b2b_sdp_client_end_prepare(client,
+						&client->b2b_key, 0, 1);
 			b2b_sdp_client_destroy(client);
+			destroy_client = 1;
 			goto release;
 		}
 		body = get_body_part(msg, TYPE_APPLICATION, SUBTYPE_SDP);
@@ -1262,6 +1445,7 @@ static int b2b_sdp_client_reply_invite(struct sip_msg *msg, struct b2b_sdp_clien
 		if (!(client->flags & B2B_SDP_CLIENT_STARTED)) {
 			/* client was not started, thus this is a final negative reply */
 			b2b_sdp_client_destroy(client);
+			destroy_client = 1;
 		}
 	}
 	body = NULL;
@@ -1293,6 +1477,10 @@ release:
 	} else if (ret == -2) {
 		b2b_sdp_reply(&ctx->b2b_key, ctx->dlginfo, B2B_SERVER, METHOD_INVITE, 503, NULL);
 	}
+	if (end)
+		b2b_sdp_client_end(end);
+	else if (destroy_client)
+		b2b_api.entity_delete(B2B_CLIENT, &client->b2b_key, client->dlginfo, 1, 1);
 	if (ret < 0 && ctx->clients_no == 0) {
 		/* no more remaining clients - terminate the entity as well */
 		b2b_sdp_ctx_release(ctx, 1);
@@ -1334,8 +1522,14 @@ static int b2b_sdp_client_notify(struct sip_msg *msg, str *key, int type,
 
 	if (type == B2B_REQUEST) {
 		lock_get(&client->ctx->lock);
-		if (msg->REQ_METHOD != METHOD_BYE)
-			B2B_SDP_CLIENT_WAIT_FREE(client->ctx);
+		if (msg->REQ_METHOD != METHOD_BYE &&
+				b2b_sdp_client_wait_free(client->ctx) < 0) {
+			lock_release(&client->ctx->lock);
+			if (msg->REQ_METHOD != METHOD_ACK)
+				b2b_sdp_reply(&client->b2b_key, client->dlginfo,
+						B2B_CLIENT, msg->REQ_METHOD, 491, NULL);
+			return -1;
+		}
 		/*
 		if (client->ctx->pending_no) {
 			lock_release(&client->ctx->lock);
@@ -1563,7 +1757,7 @@ static int b2b_sdp_server_invite(struct sip_msg *msg, struct b2b_sdp_ctx *ctx)
 		req_data.body = &client->body;
 		LM_INFO("[%.*s][%.*s] client request INVITE sent\n", ctx->callid.len, ctx->callid.s,
 				client->b2b_key.len, client->b2b_key.s);
-		if (b2b_api.send_request(&req_data) < 0)
+		if (run_b2be_api(&b2b_api, send_request, &req_data) < 0)
 			LM_ERR("[%.*s] could not send re-INVITE to client!\n", ctx->callid.len, ctx->callid.s);
 	}
 	lock_release(&ctx->lock);
@@ -1581,6 +1775,7 @@ static int b2b_sdp_server_cancel(struct sip_msg *msg, struct b2b_sdp_ctx *ctx)
 	int send_cancel;
 	struct list_head *it;
 	struct b2b_sdp_client *client;
+	struct b2b_sdp_client_end *end, *ends = NULL;
 
 	/* respond to the initial INVITE */
 	b2b_sdp_reply(&ctx->b2b_key, ctx->dlginfo, B2B_SERVER,
@@ -1592,9 +1787,21 @@ static int b2b_sdp_server_cancel(struct sip_msg *msg, struct b2b_sdp_ctx *ctx)
 		if (!client->b2b_key.len)
 			continue;
 		send_cancel = (client->flags & B2B_SDP_CLIENT_EARLY);
-		b2b_sdp_client_end(client, &client->b2b_key, send_cancel);
+		end = b2b_sdp_client_end_prepare(client, &client->b2b_key,
+				send_cancel, 0);
+		if (!end)
+			continue;
+		if (send_cancel)
+			client->flags |= B2B_SDP_CLIENT_CANCEL;
+		end->next = ends;
+		ends = end;
 	}
 	lock_release(&ctx->lock);
+	while (ends) {
+		end = ends;
+		ends = end->next;
+		b2b_sdp_client_end(end);
+	}
 	return 0;
 }
 
@@ -1738,7 +1945,7 @@ static int b2b_sdp_demux_start(struct sip_msg *msg, str *uri,
 		ci.avps = clone_avp_list( *get_avp_list() );
 
 		client->flags |= B2B_SDP_CLIENT_EARLY|B2B_SDP_CLIENT_PENDING;
-		b2b_key = b2b_api.client_new(&ci, b2b_sdp_client_notify, b2b_sdp_client_dlginfo,
+		b2b_key = run_b2be_api(&b2b_api, client_new, &ci, b2b_sdp_client_notify, b2b_sdp_client_dlginfo,
 				&b2b_sdp_demux_client_cap, &ctx->callid, NULL,
 				client, b2b_sdp_client_free);
 		if (!b2b_key) {

@@ -41,6 +41,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include "str.h"
+#include "net/proxy_protocol.h"
 
 
 #include "dprint.h"
@@ -56,9 +57,11 @@
 
 
 enum sip_protos { PROTO_NONE = 0, PROTO_FIRST = 1, PROTO_UDP = 1, \
-	PROTO_TCP, PROTO_TLS, PROTO_SCTP, PROTO_WS, PROTO_WSS, PROTO_IPSEC, PROTO_SIP_LAST = PROTO_IPSEC,
-	PROTO_BIN, PROTO_BINS, PROTO_HEP_UDP, PROTO_HEP_TCP, PROTO_HEP_TLS, PROTO_SMPP, PROTO_MSRP,
-	PROTO_MSRPS, PROTO_OTHER };
+	PROTO_TCP, PROTO_TLS, PROTO_SCTP, PROTO_WS, PROTO_WSS, PROTO_IPSEC,
+	PROTO_SIP_LAST = PROTO_IPSEC,
+	PROTO_BIN, PROTO_BINS, PROTO_HEP_UDP, PROTO_HEP_TCP, PROTO_HEP_TLS,
+	PROTO_SMPP, PROTO_MSRP,
+	PROTO_MSRPS, PROTO_BOND, PROTO_OTHER};
 #define PROTO_LAST PROTO_OTHER
 
 struct ip_addr{
@@ -86,10 +89,23 @@ union sockaddr_union{
 		struct sockaddr_in6 sin6;
 };
 
+enum proxy_protocol_flags {
+	PP_INIT, PP_ERROR, PP_UNKNOWN, PP_OK
+};
+
+struct proxy_protocol {
+	enum proxy_protocol_flags flags;
+	struct ip_addr src_ip;
+	struct ip_addr dst_ip;
+	unsigned short src_port; /*!< host byte order */
+	unsigned short dst_port; /*!< host byte order */
+};
 
 
 enum si_flags { SI_NONE=0, SI_IS_IP=1, SI_IS_LO=2, SI_IS_MCAST=4,
-	SI_IS_ANYCAST=8, SI_FRAG=16, SI_REUSEPORT=32, SI_INTERNAL=64, SI_ACCEPT_SUBDOMAIN_ALIAS=128 };
+	SI_IS_ANYCAST=8, SI_FRAG=16, SI_REUSEPORT=32, SI_INTERNAL=64,
+	SI_ACCEPT_SUBDOMAIN_ALIAS=128, SI_PROXY_IN=256, SI_PROXY_OUT=512,
+	SI_PROXY=SI_PROXY_IN|SI_PROXY_OUT };
 
 struct receive_info {
 	struct ip_addr src_ip;
@@ -101,8 +117,18 @@ struct receive_info {
 	unsigned int proto_reserved2;
 	union sockaddr_union src_su; /*!< useful for replies*/
 	const struct socket_info* bind_address; /*!< sock_info structure on which the msg was received*/
+	struct proxy_protocol real_ep; /*!< real endpoint of the mssage (behind a proxy protocol) */
 	/* no need for dst_su yet */
 };
+
+#define get_rcv_src_ip(_rcv) \
+	(((_rcv)->real_ep.flags == PP_OK)?&(_rcv)->real_ep.src_ip:&(_rcv)->src_ip)
+#define get_rcv_src_port(_rcv) \
+	(((_rcv)->real_ep.flags == PP_OK)?(_rcv)->real_ep.src_port:(_rcv)->src_port)
+#define get_rcv_dst_ip(_rcv) \
+	(((_rcv)->real_ep.flags == PP_OK)?&(_rcv)->real_ep.dst_ip:&(_rcv)->dst_ip)
+#define get_rcv_dst_port(_rcv) \
+	(((_rcv)->real_ep.flags == PP_OK)?(_rcv)->real_ep.dst_port:(_rcv)->dst_port)
 
 
 struct dest_info {
@@ -112,11 +138,17 @@ struct dest_info {
 	const struct socket_info* send_sock;
 };
 
+struct socket_bond_elem {
+	char *name;
+	struct socket_bond_elem *next;
+};
+
 
 struct socket_id {
 	char* name;
 	char* adv_name;
 	char* tag;
+	struct socket_bond_elem *bond_list;
 	char* auto_scaling_profile;
 	int adv_port;
 	int proto;
@@ -394,10 +426,10 @@ static inline int hostent2su( union sockaddr_union* su,
 /*! \brief fast ip_addr -> string converter;
  * it uses an internal buffer
  */
-extern char _ip_addr_A_buffs[IP_ADDR2STR_BUF_NO][IP_ADDR_MAX_STR_SIZE];
+extern __thread char _ip_addr_A_buffs[IP_ADDR2STR_BUF_NO][IP_ADDR_MAX_STR_SIZE];
 static inline char* ip_addr2a(struct ip_addr* ip)
 {
-	static unsigned int it = 0;
+	static __thread unsigned int it = 0;
 	int offset;
 	register unsigned char a,b,c;
 	register unsigned char d;

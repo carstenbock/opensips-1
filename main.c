@@ -107,6 +107,7 @@
 #include "route.h"
 #include "bin_interface.h"
 #include "globals.h"
+#include "db/pi_framework.h"
 #include "mem/mem.h"
 #include "mem/shm_mem.h"
 #include "mem/rpm_mem.h"
@@ -133,6 +134,7 @@
 #include "statistics.h"
 #include "status_report.h"
 #include "core_stats.h"
+#include "profiling.h"
 #include "pvar.h"
 #include "signals.h"
 #include "shutdown.h"
@@ -148,8 +150,6 @@
 
 #include "test/unit_tests.h"
 #include "lib/dbg/profiling.h"
-
-#include "ssl_tweaks.h"
 
 #include "main_script.h"
 
@@ -219,13 +219,16 @@ static const struct main_script main_script[] = {
 	FN_HNDLR(init_serialization, !=, 0, "serialization"),
 	FN_HNDLR(init_mi_core, <, 0, "MI core"),
 	FN_HNDLR(evi_register_core, !=, 0, "register core events"),
+	FN_HNDLR(init_profiling, !=, 0, "profiling support"),
 	FN_HNDLR(init_black_lists, !=, 0, "black list engine"),
 	FN_HNDLR(resolv_blacklist_init, !=, 0, "resolver's blacklist"),
 	FN_HNDLR(init_dset, !=, 0, "SIP forking logic"),
 	FN_HNDLR(init_db_support, !=, 0, "SQL database support"),
+	FN_HNDLR(pi_framework_init, !=, 0, "PI framework"),
 	FN_HNDLR(init_cdb_support, !=, 0, "CacheDB support"),
 	FN_HNDLR(init_pvar_support, !=, 0, "pseudo-variable support"),
 	FN_HNDLR(init_modules, !=, 0, "modules"),
+	FN_HNDLR(pi_framework_init_db, !=, 0, "PI framework database"),
 	FN_HNDLR(init_auto_scaling, !=, 0, "auto-scaling support"),
 	FN_HNDLR(init_xlog, <, 0, "xlog"),
 	FN_HNDLR(register_route_timers, <, 0, "route_timers"),
@@ -248,7 +251,7 @@ static const struct main_script main_script[] = {
 static int main_loop(void)
 {
 	static int chd_rank;
-	int* startup_done = NULL;
+	atomic_t *startup_done = NULL;
 	utime_t last_check = 0;
 	int rc;
 	static struct internal_fork_handler profiling_handler = {
@@ -266,12 +269,12 @@ static int main_loop(void)
 	}
 
 	if(sroutes->startup.a) {/* if a startup route was defined */
-		startup_done = (int*)shm_malloc(sizeof(int));
+		startup_done = shm_malloc(sizeof(*startup_done));
 		if(startup_done == NULL) {
 			LM_ERR("No more shared memory\n");
 			goto error;
 		}
-		*startup_done = 0;
+		atomic_init(startup_done, 0);
 	}
 
 	/* fork for the timer process*/
@@ -308,8 +311,12 @@ static int main_loop(void)
 	bind_address=0;
 
 	if (startup_done) {
-		if (*startup_done==0)
+		if (atomic_load(startup_done) != 1) {
 			LM_CRIT("BUG: startup route defined, but not run :( \n");
+			goto error;
+		}
+		/* Only the first SIP worker accesses the flag, and its final
+		 * store was observed before starting the remaining workers. */
 		shm_free(startup_done);
 	}
 
@@ -407,7 +414,7 @@ int main(int argc, char** argv)
 	/* process pkg mem size from command line */
 	opterr=0;
 
-	options="A:f:cCm:M:b:l:n:N:irRvdDFEVhw:t:u:g:p:P:G:W:o:a:k:s:"
+	options="A:f:cCm:M:b:l:n:N:irRvdDFVhw:t:u:g:p:P:G:W:o:a:k:s:"
 #ifdef UNIT_TESTS
 	"T:"
 #endif
@@ -520,7 +527,7 @@ int main(int argc, char** argv)
 					/* ignoring, parsed previously */
 					break;
 			case 'i':
-					modload_check_rev = 0;
+					in_tree_mode = 1;
 					break;
 			case 'b':
 					maxbuffer=strtol(optarg, &tmp, 10);
@@ -565,10 +572,6 @@ int main(int argc, char** argv)
 			case 'F':
 					no_daemon_mode=1;
 					break;
-			case 'E':
-					LM_ERR("-E option deprecated since 3.4, set \"stderror_enabled=yes\" "
-					    "at the script level instead\n");
-					goto error00;
 			case 'N':
 					tcp_workers_no=strtol(optarg, &tmp, 10);
 					if ((tmp==0) ||(*tmp)){
@@ -633,8 +636,17 @@ int main(int argc, char** argv)
 					testing_module = optarg;
 					if (strcmp(testing_module, "core")) {
 						cfg_file = malloc(100);
-						snprintf(cfg_file, 100, "modules/%s/test/opensips.cfg",
+						/* a module lives under any of the MODULE_DIRS, so
+						 * probe the contrib one and fall back to the
+						 * regular collection, which also keeps the error
+						 * message on the common path */
+						snprintf(cfg_file, 100,
+						         "modules-contrib/%s/test/opensips.cfg",
 						         testing_module);
+						if (access(cfg_file, F_OK) != 0)
+							snprintf(cfg_file, 100,
+							         "modules/%s/test/opensips.cfg",
+							         testing_module);
 					}
 					break;
 #endif

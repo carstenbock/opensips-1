@@ -69,15 +69,16 @@ void pt_become_active(void)
 	gettimeofday( &tv, NULL);
 	usec_now = ((utime_t)(tv.tv_sec)) * 1000000 + tv.tv_usec;
 	if (usec_now==MY_LOAD.last_time) {
-		MY_LOAD.is_busy = 1;
+		__atomic_store_n(&MY_LOAD.is_busy, 1, __ATOMIC_RELEASE);
 		return;
 	}
 
 	MARK_AS_IDLE( usec_now, ST);
 	MARK_AS_IDLE( usec_now, LT);
 
-	MY_LOAD.last_time = usec_now;
-	MY_LOAD.is_busy = 1;
+	__atomic_store_n(&MY_LOAD.last_time, usec_now, __ATOMIC_RELAXED);
+	/* release: a reader seeing the new is_busy also sees the new last_time */
+	__atomic_store_n(&MY_LOAD.is_busy, 1, __ATOMIC_RELEASE);
 }
 
 
@@ -123,39 +124,58 @@ void pt_become_idle(void)
 	gettimeofday( &tv, NULL);
 	usec_now = ((utime_t)(tv.tv_sec)) * 1000000 + tv.tv_usec;
 	if (usec_now==MY_LOAD.last_time) {
-		MY_LOAD.is_busy = 0;
+		__atomic_store_n(&MY_LOAD.is_busy, 0, __ATOMIC_RELEASE);
 		return;
 	}
 
 	MARK_AS_ACTIVE( usec_now, ST);
 	MARK_AS_ACTIVE( usec_now, LT);
 
-	MY_LOAD.last_time = usec_now;
-	MY_LOAD.is_busy = 0;
+	__atomic_store_n(&MY_LOAD.last_time, usec_now, __ATOMIC_RELAXED);
+	/* release: a reader seeing the new is_busy also sees the new last_time */
+	__atomic_store_n(&MY_LOAD.is_busy, 0, __ATOMIC_RELEASE);
 }
 
 
 #define SUM_UP_LOAD(_now, _pno, _TYPE, _ratio) \
 	do { \
+		/* The process updates its load info without any lock, so it may \
+		 * do so while we are reading it. Take a snapshot: is_busy first \
+		 * (acquire, pairs with the release store in pt_become_*()), then \
+		 * last_time. And as the update may be newer than our own "_now" \
+		 * sample, never evaluate it at a time before that update - \
+		 * otherwise idx_old ends up ahead of idx_new and the loops below \
+		 * wrap around the whole window, accounting it all as busy. */ \
+		unsigned char __busy = \
+			__atomic_load_n(&PT_LOAD(_pno).is_busy, __ATOMIC_ACQUIRE); \
+		utime_t __last = \
+			__atomic_load_n(&PT_LOAD(_pno).last_time, __ATOMIC_RELAXED); \
+		utime_t __now = ((utime_t)(_now) > __last) ? (utime_t)(_now) : __last; \
 		/* check if the entire time window has the same status */ \
-		if (((long long)_now-(long long)PT_LOAD(_pno).last_time) >= \
+		if (((long long)__now-(long long)__last) >= \
 				(_TYPE##_WINDOW_TIME)*(_ratio)){\
 			/* nothing recorded in the last time window */ \
-			used += PT_LOAD(_pno).is_busy?_TYPE##_WINDOW_TIME*_ratio:0; \
+			used += __busy?_TYPE##_WINDOW_TIME*_ratio:0; \
 		} else { \
 			/* get the index inside window for the last time update */ \
-			idx_old = (PT_LOAD(_pno).last_time / _TYPE##_WINDOW_UNIT) % \
+			idx_old = (__last / _TYPE##_WINDOW_UNIT) % \
 				_TYPE##_WINDOW_SIZE; \
-			idx_new = (_now / _TYPE##_WINDOW_UNIT) % \
+			idx_new = (__now / _TYPE##_WINDOW_UNIT) % \
 				_TYPE##_WINDOW_SIZE; \
 			/* ajust the index where we start counting the past used-time \
 			 * based on the "ratio" option, if present */  \
 			if (_ratio!=1) { \
 				idx_start = (idx_new+(int)(_TYPE##_WINDOW_SIZE*(1-_ratio))) % \
 					_TYPE##_WINDOW_SIZE; \
-				/* the start is between [new,old], so no used recorded yet */ \
-				if (idx_start>=idx_old && idx_start<=idx_new) {\
-					used+= PT_LOAD(_pno).is_busy?_TYPE##_WINDOW_TIME*_ratio:0;\
+				/* The last update shares the window's first slot. Only \
+				 * the part of that slot inside the window can count. */ \
+				if (idx_start == idx_old) { \
+					utime_t elapsed = __now - __last; \
+					utime_t overlap = (utime_t)(_TYPE##_WINDOW_TIME * (_ratio)) - elapsed; \
+					utime_t recorded = PT_LOAD(_pno)._TYPE##_window[idx_old]; \
+					used += recorded < overlap ? recorded : overlap; \
+					if (__busy) \
+						used += elapsed; \
 					break; \
 				}\
 			} else { \
@@ -166,23 +186,23 @@ void pt_become_idle(void)
 				used += PT_LOAD(_pno)._TYPE##_window[i]; \
 			} \
 			/* add what is not accounted since last update */ \
-			if (PT_LOAD(_pno).is_busy) { \
+			if (__busy) { \
 				if (idx_old!=idx_new) { \
 					/* count the last used index (existing + new) */ \
 					used += PT_LOAD(_pno)._TYPE##_window[idx_old] + \
 						(_TYPE##_WINDOW_UNIT - \
-						(PT_LOAD(_pno).last_time % _TYPE##_WINDOW_UNIT)); \
+						(__last % _TYPE##_WINDOW_UNIT)); \
 					/* update the fully used */ \
 					FOR_ALL_INDEXES( i, idx_old, idx_new, _TYPE) { \
 						used += _TYPE##_WINDOW_UNIT; \
 					} \
 					/* do partial update on current index */ \
-					used += _now % _TYPE##_WINDOW_UNIT; \
+					used += __now % _TYPE##_WINDOW_UNIT; \
 				} else { \
 					used += \
-						(_now % _TYPE##_WINDOW_UNIT) \
+						(__now % _TYPE##_WINDOW_UNIT) \
 						 - \
-						(PT_LOAD(_pno).last_time % _TYPE##_WINDOW_UNIT); \
+						(__last % _TYPE##_WINDOW_UNIT); \
 				} \
 			} \
 		} \

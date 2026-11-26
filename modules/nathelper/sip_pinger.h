@@ -128,6 +128,9 @@ static int parse_branch(str branch)
 
 	branch.len -= (end - branch.s + 1);
 	branch.s = end + 1;
+	end = q_memchr(branch.s, '.', branch.len);
+	if (end)
+		branch.len = end - branch.s;
 
 	/* reverse_hex2int64() cannot fail in unsafe mode and it will return 
 	   whatever it was able to parse (0 if nothing )*/
@@ -238,7 +241,6 @@ build_branch(char *branch, int *size,
 	struct ping_cell *p_cell;
 	struct nh_table *htable;
 	struct timeval timeval_st;
-	int dangling_coords = 0;
 	int old_state;
 	int reply_matching;
 
@@ -266,7 +268,9 @@ build_branch(char *branch, int *size,
 			}
 			insert_into_hash(p_cell);
 		} else {
-			dangling_coords = 1;
+			/* use the coordinates owned by the existing ping cell */
+			ul.free_ucontact_coords(ct_coords);
+			ct_coords = p_cell->ct_coords;
 		}
 
 		old_state = p_cell->state;
@@ -317,14 +321,20 @@ build_branch(char *branch, int *size,
 		ret=int64_2reverse_hex(&branch, size, ct_coords);
 		if (ret < 0)
 			goto out_nospace;
+
+		if (*size < 2)
+			goto out_nospace;
+		*branch++ = '.';
+		*branch++ = 'p';
+		*size -= 2;
+		ret=int2reverse_hex(&branch, size, label);
+		if (ret < 0)
+			goto out_nospace;
 	} else {
 		ret=int2reverse_hex(&branch, size, label);
 		if (ret < 0)
 			goto out_nospace;
 	}
-
-	if (dangling_coords)
-		ul.free_ucontact_coords(ct_coords);
 
 	if (*size <= 0)
 		goto out_nospace;

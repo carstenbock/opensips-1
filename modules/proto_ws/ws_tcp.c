@@ -29,6 +29,7 @@
 #include "../../globals.h"
 #include "../../tsend.h"
 #include "ws_tcp.h"
+#include "../../net/tcp_common.h"
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -85,22 +86,27 @@ again:
 int ws_raw_writev(struct tcp_connection *c, int fd,
 		const struct iovec *iov, int iovcnt, int tout)
 {
-	int n;
+	int i, n, len = 0;
+
+	if (fd < 0) {
+		for (i = 0; i < iovcnt; i++)
+			len += iov[i].iov_len;
+		n = tcp_async_add_chunks(c, iov, iovcnt, 1);
+		return (n == 0) ? len : n;
+	}
 
 	/* we do not have any threosholds for ws
 	struct timeval snd;
 
 	start_expire_timer(snd,c->profile.send_threshold);
 	*/
-	lock_get(&c->write_lock);
-
 	/* optimize write for a single chunk */
 	if (iovcnt == 1)
 		n=tsend_stream(fd, iov[0].iov_base, iov[0].iov_len, tout);
 	else
 		n=tsend_stream_ev(fd, iov, iovcnt, tout);
-
-	lock_release(&c->write_lock);
+	if (n > 0)
+		tcp_conn_reset_lifetime(c);
 	/*
 	 get_time_difference(snd, c->profile.send_threshold, tout);
 	 */

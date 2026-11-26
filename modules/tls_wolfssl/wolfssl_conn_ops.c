@@ -20,26 +20,42 @@
  *
  */
 
-#include "wolfssl_mem.h"
-
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
 #include <wolfssl/error-ssl.h>
 
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sys/socket.h>
 #include <poll.h>
 #include <errno.h>
 #include <unistd.h>
 #include <netinet/tcp.h>
+#if defined(__linux__)
+#include <endian.h>
+#include <linux/tls.h>
+#endif
 
+#include "../../ut.h"
+#include "../../mem/mem.h"
+#include "../../mem/shm_mem.h"
 #include "../../net/tcp_conn_defs.h"
 #include "../../net/proto_tcp/tcp_common_defs.h"
 #include "../tls_mgm/tls_helper.h"
+#include "../tls_mgm/tls_shared_data.h"
 
 #include "wolfssl_trace.h"
 #include "wolfssl.h"
+#include "wolfssl_async.h"
 
 int _wolfssl_has_session_ticket(WOLFSSL *ssl);
 
+/*
+ * Older distro kernel headers (for example buster/bionic) may not expose the
+ * AES-GCM-256 KTLS definitions. Keep the build working on those systems and
+ * fall back to the supported subset at runtime.
+ */
 void tls_dump_cert_info(char* s, WOLFSSL_X509* cert)
 {
 	char* subj;
@@ -49,8 +65,8 @@ void tls_dump_cert_info(char* s, WOLFSSL_X509* cert)
 	issuer = wolfSSL_X509_NAME_oneline(wolfSSL_X509_get_issuer_name(cert), 0, 0);
 
 	LM_INFO("%s subject: %s, issuer: %s\n", s ? s : "", subj, issuer);
-	oss_wolfSSL_Free(subj);
-	oss_wolfSSL_Free(issuer);
+	wolfSSL_Free(subj);
+	wolfSSL_Free(issuer);
 }
 
 static void tls_dump_verification_failure(long verification_result)
@@ -155,6 +171,230 @@ static void tls_dump_verification_failure(long verification_result)
 	}
 }
 
+static void wolfssl_cache_tls_info(struct tcp_connection *c, WOLFSSL *ssl)
+{
+	WOLFSSL_CIPHER *cipher;
+	WOLFSSL_X509 *cert = NULL;
+	char desc_buf[128];
+	const char *version;
+	const char *cipher_name = 0;
+	const char *cipher_desc = 0;
+	unsigned int bits = 0;
+	long verify_res;
+	int verify_mode;
+	int peer_ok = 0;
+
+	version = wolfSSL_get_version(ssl);
+
+	cipher = wolfSSL_get_current_cipher(ssl);
+	if (cipher) {
+		cipher_name = wolfSSL_CIPHER_get_name(cipher);
+
+		desc_buf[0] = '\0';
+		wolfSSL_CIPHER_description(cipher, desc_buf, sizeof(desc_buf));
+		cipher_desc = desc_buf;
+		bits = wolfSSL_CIPHER_get_bits(cipher, 0);
+	}
+
+	verify_res = wolfSSL_get_verify_result(ssl);
+	if (verify_res == X509_V_OK) {
+		cert = wolfSSL_get_peer_certificate(ssl);
+		if (cert != NULL) {
+			peer_ok = 1;
+		} else if (_wolfssl_has_session_ticket(ssl)) {
+			verify_mode = wolfSSL_get_verify_mode(ssl);
+
+			if (wolfSSL_GetSide(ssl) == WOLFSSL_SERVER_END) {
+				if ((verify_mode & SSL_VERIFY_PEER) &&
+					(verify_mode & SSL_VERIFY_FAIL_IF_NO_PEER_CERT))
+					peer_ok = 1;
+			} else {
+				if (verify_mode & SSL_VERIFY_PEER)
+					peer_ok = 1;
+			}
+		}
+	}
+
+	if (cert)
+		wolfSSL_X509_free(cert);
+
+	tls_shared_info_store(c, version, cipher_name, cipher_desc, bits,
+			peer_ok ? 1 : 0);
+}
+
+static int _wolfssl_enable_ktls_ulp(struct tcp_connection *c, int fd)
+{
+	struct _WOLFSSL *w;
+
+	w = (struct _WOLFSSL *)c->extra_data;
+	if (!w)
+		return -1;
+
+	if (w->ktls_ulp)
+		return 0;
+
+	if (setsockopt(fd, SOL_TCP, TCP_ULP, "tls", sizeof("tls")) < 0) {
+		LM_DBG("failed to enable TCP_ULP tls on fd %d: %s\n",
+			fd, strerror(errno));
+		return -1;
+	}
+
+	w->ktls_ulp = 1;
+	return 0;
+}
+
+static int _wolfssl_enable_ktls_tx(struct tcp_connection *c, WOLFSSL *ssl)
+{
+#if defined(__linux__) && defined(SOL_TLS) && defined(TLS_TX) && defined(TCP_ULP)
+	struct _WOLFSSL *w = (struct _WOLFSSL *)c->extra_data;
+	struct tls_crypto_info *crypto_info;
+	struct tls12_crypto_info_aes_gcm_128 crypto_128;
+#if defined(TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+	struct tls12_crypto_info_aes_gcm_256 crypto_256;
+#endif
+	const unsigned char *key, *iv;
+	word64 seq;
+	unsigned int rand_hi, rand_lo;
+	int key_size, crypto_size;
+	int tls_version;
+	int fd;
+
+	if (!wolfssl_try_use_ktls || !w || w->ktls_tx)
+		return 0;
+
+	fd = c->fd;
+	if (fd < 0) {
+		LM_WARN("cannot enable KTLS, invalid socket\n");
+		return -1;
+	}
+
+	if ((wolfSSL_GetCipherType(ssl) != WOLFSSL_AEAD_TYPE) ||
+	    (wolfSSL_GetBulkCipher(ssl) != wolfssl_aes_gcm)) {
+		LM_DBG("KTLS requires AES-GCM cipher, skipping\n");
+		return -1;
+	}
+
+	key_size = wolfSSL_GetKeySize(ssl);
+#if defined(TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+	if ((key_size != TLS_CIPHER_AES_GCM_128_KEY_SIZE) &&
+	    (key_size != TLS_CIPHER_AES_GCM_256_KEY_SIZE)) {
+		LM_DBG("KTLS requires 128/256 bit AES-GCM keys, got %d\n", key_size);
+		return -1;
+	}
+#else
+	if (key_size != TLS_CIPHER_AES_GCM_128_KEY_SIZE) {
+		LM_DBG("KTLS requires 128 bit AES-GCM keys on this kernel, got %d\n",
+			key_size);
+		return -1;
+	}
+#endif
+
+	if (_wolfssl_enable_ktls_ulp(c, fd) < 0)
+		return -1;
+
+	memset(&crypto_128, 0, sizeof(crypto_128));
+#if defined(TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+	memset(&crypto_256, 0, sizeof(crypto_256));
+#endif
+	if (key_size == TLS_CIPHER_AES_GCM_128_KEY_SIZE) {
+		crypto_info = &crypto_128.info;
+		crypto_size = sizeof(crypto_128);
+#if defined(TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+	} else {
+		crypto_info = &crypto_256.info;
+		crypto_size = sizeof(crypto_256);
+	}
+#else
+	} else {
+		LM_DBG("KTLS on this kernel only supports 128-bit AES-GCM, got %d\n",
+			key_size);
+		return -1;
+	}
+#endif
+
+	tls_version = wolfSSL_version(ssl);
+	if (tls_version == TLS1_2_VERSION)
+		crypto_info->version = TLS_1_2_VERSION;
+	else if (tls_version == TLS1_3_VERSION)
+		crypto_info->version = TLS1_3_VERSION;
+	else {
+		LM_DBG("KTLS supported only for TLS 1.2/1.3 (got %x)\n", tls_version);
+		return -1;
+	}
+
+	crypto_info->cipher_type = TLS_CIPHER_AES_GCM_128;
+#if defined(TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+	if (key_size == TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+		crypto_info->cipher_type = TLS_CIPHER_AES_GCM_256;
+#endif
+
+	key = (wolfSSL_GetSide(ssl) == WOLFSSL_CLIENT_END)
+		? wolfSSL_GetClientWriteKey(ssl)
+		: wolfSSL_GetServerWriteKey(ssl);
+	iv = (wolfSSL_GetSide(ssl) == WOLFSSL_CLIENT_END)
+		? wolfSSL_GetClientWriteIV(ssl)
+		: wolfSSL_GetServerWriteIV(ssl);
+
+	if (!key || !iv) {
+		LM_DBG("KTLS secrets not available, skipping\n");
+		return -1;
+	}
+
+	wolfSSL_GetSequenceNumber(ssl, &seq);
+	seq = htobe64(seq);
+
+	if (key_size == TLS_CIPHER_AES_GCM_128_KEY_SIZE) {
+		memcpy(crypto_128.key, key, key_size);
+		memcpy(crypto_128.salt, iv, 4);
+		if (crypto_info->version == TLS_1_2_VERSION) {
+			srand((unsigned int)time(NULL));
+			rand_hi = rand();
+			rand_lo = rand();
+			memcpy(crypto_128.iv, &rand_hi, 4);
+			memcpy((crypto_128.iv + 4), &rand_lo, 4);
+		} else {
+			memcpy(crypto_128.iv, (iv + 4), 8);
+		}
+		memcpy(crypto_128.rec_seq, &seq, sizeof(seq));
+#if defined(TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+	} else {
+		memcpy(crypto_256.key, key, key_size);
+		memcpy(crypto_256.salt, iv, 4);
+		if (crypto_info->version == TLS_1_2_VERSION) {
+			srand((unsigned int)time(NULL));
+			rand_hi = rand();
+			rand_lo = rand();
+			memcpy(crypto_256.iv, &rand_hi, 4);
+			memcpy((crypto_256.iv + 4), &rand_lo, 4);
+		} else {
+			memcpy(crypto_256.iv, (iv + 4), 8);
+		}
+		memcpy(crypto_256.rec_seq, &seq, sizeof(seq));
+#endif
+	}
+
+	if (setsockopt(fd, SOL_TLS, TLS_TX, crypto_info, crypto_size) < 0) {
+		LM_WARN("failed to enable KTLS TX on fd %d: %s\n",
+			fd, strerror(errno));
+		return -1;
+	}
+
+	w->ktls_tx = 1;
+	LM_INFO("KTLS TX enabled for %s:%d\n",
+		ip_addr2a(&c->rcv.src_ip), c->rcv.src_port);
+
+	return 0;
+#else
+	(void)c;
+	(void)ssl;
+
+	if (wolfssl_try_use_ktls)
+		LM_WARN("try_use_ktls set but KTLS not supported on this platform\n");
+
+	return -1;
+#endif
+}
+
 int _wolfssl_tls_update_fd(struct tcp_connection *c, int fd)
 {
 	if (wolfSSL_set_fd(_WOLFSSL_READ_SSL(c->extra_data), fd) !=
@@ -180,9 +420,9 @@ int _wolfssl_tls_conn_init(struct tcp_connection* c,
 	*/
 	LM_DBG("Creating a whole new ssl connection\n");
 
-	c->extra_data = shm_malloc(sizeof(struct _WOLFSSL));
+	c->extra_data = thread_malloc(sizeof(struct _WOLFSSL));
 	if (!c->extra_data) {
-		LM_ERR("no more shm memory\n");
+		LM_ERR("no more private memory\n");
 		return -1;
 	}
 	memset(c->extra_data, 0, sizeof(struct _WOLFSSL));
@@ -275,6 +515,7 @@ static int _wolfssl_tls_conn_shutdown(struct tcp_connection *c)
 		case SSL_ERROR_SYSCALL:
 			LM_ERR("SSL_ERROR_SYSCALL err=%s(%d)\n",
 				strerror(errno), errno);
+			/* fall through */
 		default:
 			LM_ERR("SYSCALL ERROR err=%s(%d)\n",
 				strerror(errno), errno);
@@ -290,6 +531,158 @@ static int _wolfssl_tls_conn_shutdown(struct tcp_connection *c)
 	return -1;
 }
 
+static int _wolfssl_enable_ktls_rx(struct tcp_connection *c, WOLFSSL *ssl)
+{
+#if defined(__linux__) && defined(SOL_TLS) && defined(TLS_RX) && defined(TCP_ULP)
+	struct _WOLFSSL *w = (struct _WOLFSSL *)c->extra_data;
+	struct tls_crypto_info *crypto_info;
+	struct tls12_crypto_info_aes_gcm_128 crypto_128;
+#if defined(TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+	struct tls12_crypto_info_aes_gcm_256 crypto_256;
+#endif
+	const unsigned char *key, *iv;
+	word64 seq;
+	unsigned int rand_hi, rand_lo;
+	int key_size, crypto_size;
+	int tls_version;
+	int fd;
+
+	if (!wolfssl_try_use_ktls || !w || w->ktls_rx)
+		return 0;
+
+	fd = c->fd;
+	if (fd < 0) {
+		LM_WARN("cannot enable RX KTLS, invalid socket\n");
+		return -1;
+	}
+
+	if ((wolfSSL_GetCipherType(ssl) != WOLFSSL_AEAD_TYPE) ||
+	    (wolfSSL_GetBulkCipher(ssl) != wolfssl_aes_gcm)) {
+		LM_DBG("KTLS RX requires AES-GCM cipher, skipping\n");
+		return -1;
+	}
+
+	key_size = wolfSSL_GetKeySize(ssl);
+#if defined(TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+	if ((key_size != TLS_CIPHER_AES_GCM_128_KEY_SIZE) &&
+	    (key_size != TLS_CIPHER_AES_GCM_256_KEY_SIZE)) {
+		LM_DBG("KTLS RX requires 128/256 bit AES-GCM keys, got %d\n", key_size);
+		return -1;
+	}
+#else
+	if (key_size != TLS_CIPHER_AES_GCM_128_KEY_SIZE) {
+		LM_DBG("KTLS RX requires 128 bit AES-GCM keys on this kernel, got %d\n",
+			key_size);
+		return -1;
+	}
+#endif
+
+	if (_wolfssl_enable_ktls_ulp(c, fd) < 0)
+		return -1;
+
+	memset(&crypto_128, 0, sizeof(crypto_128));
+#if defined(TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+	memset(&crypto_256, 0, sizeof(crypto_256));
+#endif
+	if (key_size == TLS_CIPHER_AES_GCM_128_KEY_SIZE) {
+		crypto_info = &crypto_128.info;
+		crypto_size = sizeof(crypto_128);
+#if defined(TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+	} else {
+		crypto_info = &crypto_256.info;
+		crypto_size = sizeof(crypto_256);
+	}
+#else
+	} else {
+		LM_DBG("KTLS RX on this kernel only supports 128-bit AES-GCM, got %d\n",
+			key_size);
+		return -1;
+	}
+#endif
+
+	tls_version = wolfSSL_version(ssl);
+	if (tls_version == TLS1_2_VERSION)
+		crypto_info->version = TLS_1_2_VERSION;
+	else if (tls_version == TLS1_3_VERSION)
+		crypto_info->version = TLS1_3_VERSION;
+	else {
+		LM_DBG("KTLS RX supported only for TLS 1.2/1.3 (got %x)\n", tls_version);
+		return -1;
+	}
+
+	crypto_info->cipher_type = TLS_CIPHER_AES_GCM_128;
+#if defined(TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+	if (key_size == TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+		crypto_info->cipher_type = TLS_CIPHER_AES_GCM_256;
+#endif
+
+	key = (wolfSSL_GetSide(ssl) == WOLFSSL_CLIENT_END)
+		? wolfSSL_GetServerWriteKey(ssl)
+		: wolfSSL_GetClientWriteKey(ssl);
+	iv = (wolfSSL_GetSide(ssl) == WOLFSSL_CLIENT_END)
+		? wolfSSL_GetServerWriteIV(ssl)
+		: wolfSSL_GetClientWriteIV(ssl);
+
+	if (!key || !iv) {
+		LM_DBG("KTLS RX secrets not available, skipping\n");
+		return -1;
+	}
+
+	wolfSSL_GetPeerSequenceNumber(ssl, &seq);
+	seq = htobe64(seq);
+
+	if (key_size == TLS_CIPHER_AES_GCM_128_KEY_SIZE) {
+		memcpy(crypto_128.key, key, key_size);
+		memcpy(crypto_128.salt, iv, 4);
+		if (crypto_info->version == TLS_1_2_VERSION) {
+			srand((unsigned int)time(NULL));
+			rand_hi = rand();
+			rand_lo = rand();
+			memcpy(crypto_128.iv, &rand_hi, 4);
+			memcpy((crypto_128.iv + 4), &rand_lo, 4);
+		} else {
+			memcpy(crypto_128.iv, (iv + 4), 8);
+		}
+		memcpy(crypto_128.rec_seq, &seq, sizeof(seq));
+#if defined(TLS_CIPHER_AES_GCM_256_KEY_SIZE)
+	} else {
+		memcpy(crypto_256.key, key, key_size);
+		memcpy(crypto_256.salt, iv, 4);
+		if (crypto_info->version == TLS_1_2_VERSION) {
+			srand((unsigned int)time(NULL));
+			rand_hi = rand();
+			rand_lo = rand();
+			memcpy(crypto_256.iv, &rand_hi, 4);
+			memcpy((crypto_256.iv + 4), &rand_lo, 4);
+		} else {
+			memcpy(crypto_256.iv, (iv + 4), 8);
+		}
+		memcpy(crypto_256.rec_seq, &seq, sizeof(seq));
+#endif
+	}
+
+	if (setsockopt(fd, SOL_TLS, TLS_RX, crypto_info, crypto_size) < 0) {
+		LM_WARN("failed to enable KTLS RX on fd %d: %s\n",
+			fd, strerror(errno));
+		return -1;
+	}
+
+	w->ktls_rx = 1;
+	LM_INFO("KTLS RX enabled for %s:%d\n",
+		ip_addr2a(&c->rcv.src_ip), c->rcv.src_port);
+
+	return 0;
+#else
+	(void)c;
+	(void)ssl;
+
+	if (wolfssl_try_use_ktls)
+		LM_WARN("try_use_ktls set but KTLS not supported on this platform\n");
+
+	return -1;
+#endif
+}
+
 void _wolfssl_tls_conn_clean(struct tcp_connection* c,
 	struct tls_domain **tls_dom)
 {
@@ -298,8 +691,8 @@ void _wolfssl_tls_conn_clean(struct tcp_connection* c,
 	if (c->extra_data) {
 		d = wolfSSL_get_ex_data(_WOLFSSL_READ_SSL(c->extra_data), SSL_EX_DOM_IDX);
 
-		if (c->s != -1 && process_no != 0) {
-			_wolfssl_tls_update_fd(c,c->s);
+		if (c->fd != -1) {
+			_wolfssl_tls_update_fd(c,c->fd);
 			_wolfssl_tls_conn_shutdown(c);
 		}
 
@@ -307,8 +700,11 @@ void _wolfssl_tls_conn_clean(struct tcp_connection* c,
 		if (_WOLFSSL_WRITE_SSL(c->extra_data))
 			wolfSSL_free(_WOLFSSL_WRITE_SSL(c->extra_data));
 
-		shm_free(c->extra_data);
+		thread_free(c->extra_data);
 		c->extra_data = 0;
+	}
+	if (c->shared_data) {
+		tls_shared_info_free(c);
 	}
 
 	*tls_dom = d;
@@ -330,15 +726,19 @@ static inline void _wolfssl_enforce_max_version(struct tcp_connection *c)
 	case SSL3_VERSION:
 		wolfSSL_set_options(_WOLFSSL_WRITE_SSL(c->extra_data),
 			WOLFSSL_OP_NO_TLSv1);
+		/* fall through */
 	case TLS1_VERSION:
 		wolfSSL_set_options(_WOLFSSL_WRITE_SSL(c->extra_data),
 			WOLFSSL_OP_NO_TLSv1_1);
+		/* fall through */
 	case TLS1_1_VERSION:
 		wolfSSL_set_options(_WOLFSSL_WRITE_SSL(c->extra_data),
 			WOLFSSL_OP_NO_TLSv1_2);
+		/* fall through */
 	case TLS1_2_VERSION:
 		wolfSSL_set_options(_WOLFSSL_WRITE_SSL(c->extra_data),
 			WOLFSSL_OP_NO_TLSv1_3);
+		/* fall through */
 	case TLS1_3_VERSION:
 		break;
 	}
@@ -347,8 +747,9 @@ static inline void _wolfssl_enforce_max_version(struct tcp_connection *c)
 int _wolfssl_tls_async_connect(struct tcp_connection *con, int fd,
 	int timeout, trace_dest t_dst)
 {
-	unsigned int elapsed,to;
+	unsigned int elapsed, to, timeout_us;
 	unsigned int err_len;
+	short wait_events;
 	int poll_err, n, err;
 	struct timeval begin;
 	char err_buf[_WOLFSSL_ERR_BUFLEN];
@@ -364,15 +765,13 @@ int _wolfssl_tls_async_connect(struct tcp_connection *con, int fd,
 
 	/* attempt to do connect and see if we do block or not */
 	poll_err=0;
-	elapsed = 0;
-	to = timeout*1000;
+	timeout_us = timeout * 1000U;
 
 #if defined(HAVE_SELECT) && defined(BLOCKING_USE_SELECT)
 	FD_ZERO(&orig_set);
 	FD_SET(fd, &orig_set);
 #else
 	pf.fd=fd;
-	pf.events=POLLOUT|POLLIN;
 #endif
 
 	if (gettimeofday(&(begin), NULL)) {
@@ -388,6 +787,7 @@ int _wolfssl_tls_async_connect(struct tcp_connection *con, int fd,
 			_wolfssl_trace_tls(con, ssl, TRANS_TRACE_CONNECTED,
 					TRANS_TRACE_SUCCESS, &ASYNC_CONNECT_OK);
 			tls_send_trace_data(con, t_dst);
+			wolfssl_cache_tls_info(con, ssl);
 
 			con->proto_flags &= ~F_TLS_DO_CONNECT;
 
@@ -399,6 +799,8 @@ int _wolfssl_tls_async_connect(struct tcp_connection *con, int fd,
 			}
 
 			_wolfssl_enforce_max_version(con);
+			_wolfssl_enable_ktls_tx(con, ssl);
+			_wolfssl_enable_ktls_rx(con, ssl);
 
 			return 1;
 		}
@@ -415,18 +817,23 @@ int _wolfssl_tls_async_connect(struct tcp_connection *con, int fd,
 				/* we need to retry, if time has not passed yet */
 again:
 				elapsed=get_time_diff(&begin);
-				if (elapsed >= to) /* timed out */ {
+				to = wolfssl_async_timeout_left(timeout_us, elapsed);
+				if (!to) /* timed out */ {
 					LM_DBG("handshake timeout for connection %p %dms elapsed\n",
 							con, timeout);
 					return 0;
 				}
-				to -= elapsed;
+				wait_events = wolfssl_async_wait_events(err == SSL_ERROR_WANT_READ);
 #if defined(HAVE_SELECT) && defined(BLOCKING_USE_SELECT)
 				sel_set=orig_set;
 				timeout_val.tv_sec=to/1000000;
 				timeout_val.tv_usec=to%1000000;
-				n=select(fd+1, 0, &sel_set, 0, &timeout_val);
+				if (wait_events & POLLIN)
+					n=select(fd+1, &sel_set, 0, 0, &timeout_val);
+				else
+					n=select(fd+1, 0, &sel_set, 0, &timeout_val);
 #else
+				pf.events=wait_events;
 				n=poll(&pf, 1, to/1000);
 #endif
 				if (n<0){
@@ -467,6 +874,7 @@ again:
 			case SSL_ERROR_SYSCALL:
 				LM_ERR("SSL_ERROR_SYSCALL err=%s(%d)\n",
 					strerror(errno), errno);
+				/* fall through */
 			default:
 				LM_ERR("New TLS connection to %s:%d failed\n",
 					ip_addr2a(&con->rcv.src_ip), con->rcv.src_port);
@@ -504,8 +912,35 @@ int _wolfssl_tls_write(struct tcp_connection *c, int fd, const void *buf,
 	int err;
 	char err_buf[_WOLFSSL_ERR_BUFLEN];
 	WOLFSSL *ssl;
+	struct _WOLFSSL *w;
 
+	w = (struct _WOLFSSL *)c->extra_data;
 	ssl = _WOLFSSL_WRITE_SSL(c->extra_data);
+
+	if (w && w->ktls_tx) {
+		ret = send(fd, buf, len, 0);
+		if (ret >= 0) {
+			LM_DBG("KTLS write was successful (%d bytes)\n", ret);
+			return ret;
+		}
+
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			if (poll_events)
+				*poll_events = POLLOUT;
+
+			return 0;
+		}
+
+		if (errno == EINTR)
+			return 0;
+
+		LM_ERR("KTLS connection to %s:%d write failed (%d:%d)\n",
+			ip_addr2a(&c->rcv.src_ip), c->rcv.src_port, ret, errno);
+		LM_ERR("KTLS write error: %s\n", strerror(errno));
+		c->state = S_CONN_BAD;
+
+		return -1;
+	}
 
 	ret = wolfSSL_write(ssl, buf, len);
 	if (ret > 0) {
@@ -566,6 +1001,7 @@ static int _wolfssl_tls_accept(struct tcp_connection *c, short *poll_events)
 
 		_wolfssl_trace_tls(c, ssl, TRANS_TRACE_ACCEPTED, TRANS_TRACE_SUCCESS,
 			&ACCEPT_OK);
+		wolfssl_cache_tls_info(c, ssl);
 
 		/* TLS accept done, reset the flag */
 		c->proto_flags &= ~F_TLS_DO_ACCEPT;
@@ -578,6 +1014,8 @@ static int _wolfssl_tls_accept(struct tcp_connection *c, short *poll_events)
 		}
 
 		_wolfssl_enforce_max_version(c);
+		_wolfssl_enable_ktls_tx(c, ssl);
+		_wolfssl_enable_ktls_rx(c, ssl);
 
 		LM_DBG("new TLS connection from %s:%d using %s\n",
 			ip_addr2a(&c->rcv.src_ip), c->rcv.src_port,
@@ -627,6 +1065,7 @@ static int _wolfssl_tls_accept(struct tcp_connection *c, short *poll_events)
 			case SSL_ERROR_SYSCALL:
 				LM_ERR("SSL_ERROR_SYSCALL err=%s(%d)\n",
 					strerror(errno), errno);
+				/* fall through */
 			default:
 				c->state = S_CONN_BAD;
 				LM_ERR("New TLS connection from %s:%d failed to accept\n",
@@ -675,6 +1114,7 @@ static int _wolfssl_tls_connect(struct tcp_connection *c, short *poll_events,
 		_wolfssl_trace_tls(c, ssl, TRANS_TRACE_CONNECTED,
 				TRANS_TRACE_SUCCESS, &CONNECT_OK);
 		tls_send_trace_data(c, t_dst);
+		wolfssl_cache_tls_info(c, ssl);
 
 		c->proto_flags &= ~F_TLS_DO_CONNECT;
 
@@ -686,6 +1126,8 @@ static int _wolfssl_tls_connect(struct tcp_connection *c, short *poll_events,
 		}
 
 		_wolfssl_enforce_max_version(c);
+		_wolfssl_enable_ktls_tx(c, ssl);
+		_wolfssl_enable_ktls_rx(c, ssl);
 
 		LM_DBG("new TLS connection to %s:%d using %s\n",
 			ip_addr2a(&c->rcv.src_ip), c->rcv.src_port,
@@ -904,6 +1346,36 @@ static int _wolfssl_read(struct tcp_connection *c, void *buf, size_t len)
 	int ret, err;
 	WOLFSSL *ssl;
 	char err_buf[_WOLFSSL_ERR_BUFLEN];
+	struct _WOLFSSL *w = (struct _WOLFSSL *)c->extra_data;
+
+	if (w && w->ktls_rx) {
+		int fd = c->fd;
+
+		if (fd < 0) {
+			LM_ERR("KTLS RX enabled but invalid socket\n");
+			return -1;
+		}
+
+		ret = recv(fd, buf, len, 0);
+		if (ret > 0) {
+			LM_DBG("KTLS RX read %d bytes\n", ret);
+			return ret;
+		} else if (ret == 0) {
+			c->state = S_CONN_EOF;
+			LM_DBG("KTLS RX connection to %s:%d closed\n",
+				ip_addr2a(&c->rcv.src_ip), c->rcv.src_port);
+			return 0;
+		} else {
+			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+				return 0;
+
+			LM_ERR("KTLS RX connection to %s:%d read failed (%d)\n",
+				ip_addr2a(&c->rcv.src_ip), c->rcv.src_port, errno);
+			LM_ERR("KTLS RX read error: %s\n", strerror(errno));
+			c->state = S_CONN_BAD;
+			return -1;
+		}
+	}
 
 	ssl = _WOLFSSL_READ_SSL(c->extra_data);
 
@@ -984,7 +1456,7 @@ int _wolfssl_tls_read(struct tcp_connection * c,struct tcp_req *r)
 int _wolfssl_tls_conn_extra_match(struct tcp_connection *c, void *id)
 {
 	if ( (c->flags&F_CONN_ACCEPTED) ||
-	(wolfSSL_get_ex_data(c->extra_data, SSL_EX_DOM_IDX) == id) )
+	(wolfSSL_get_ex_data(_WOLFSSL_READ_SSL(c->extra_data), SSL_EX_DOM_IDX) == id) )
 		return 1; /*true*/
 
 	return 0; /*false*/

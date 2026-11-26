@@ -26,6 +26,7 @@
 
 #include <ctype.h>
 
+#include "../../mem/mem.h"
 #include "../../dprint.h"
 #include "../../ut.h"
 #include "../../net/trans_trace.h"
@@ -40,8 +41,6 @@ int *msrp_trace_is_on;
 struct script_route_ref *msrp_trace_filter_route = NULL;
 trace_dest msrp_t_dst;
 
-struct msrp_req msrp_current_req;
-
 int msrp_send_timeout = 100;
 int msrp_tls_handshake_timeout = 100;
 int msrp_max_msg_chunks = 4;
@@ -55,6 +54,59 @@ extern int msrp_check_cert_on_reusage;
 	 (*((unsigned char *)(_p) + 3) << 24)) | 0x20202020)
 
 #define MSRP_DEBUG
+
+struct msrp_dispatch_data {
+	enum msrp_msg_type type;
+	int ident_off;
+	int ident_len;
+	int method_off;
+	int method_len;
+	int eol_off;
+	int body_off;
+	int body_len;
+};
+
+int msrp_dispatch_msg(char *buf, int len, struct receive_info *rcv,
+		void *data, int data_len)
+{
+	struct msrp_dispatch_data *dispatch_data;
+	struct msrp_firstline fl;
+	str body;
+
+	if (!data || data_len != (int)sizeof(*dispatch_data)) {
+		LM_ERR("missing MSRP dispatch metadata\n");
+		return -1;
+	}
+
+	dispatch_data = data;
+	if (dispatch_data->ident_off < 0 || dispatch_data->method_off < 0 ||
+			dispatch_data->eol_off < 0 ||
+			dispatch_data->ident_off + dispatch_data->ident_len > len ||
+			dispatch_data->method_off + dispatch_data->method_len > len ||
+			dispatch_data->eol_off >= len ||
+			(dispatch_data->body_off >= 0 &&
+			dispatch_data->body_off + dispatch_data->body_len > len)) {
+		LM_ERR("invalid MSRP dispatch metadata\n");
+		return -1;
+	}
+
+	memset(&fl, 0, sizeof(fl));
+	fl.type = dispatch_data->type;
+	fl.ident.s = buf + dispatch_data->ident_off;
+	fl.ident.len = dispatch_data->ident_len;
+	fl.u.request.method.s = buf + dispatch_data->method_off;
+	fl.u.request.method.len = dispatch_data->method_len;
+	fl.eol = buf + dispatch_data->eol_off;
+
+	body.s = NULL;
+	body.len = 0;
+	if (dispatch_data->body_off >= 0) {
+		body.s = buf + dispatch_data->body_off;
+		body.len = dispatch_data->body_len;
+	}
+
+	return handle_msrp_msg(buf, len, &fl, &body, rcv);
+}
 
 
 
@@ -97,6 +149,7 @@ void msrp_brief_parse_msg(struct msrp_req *r)
 
 		r->state = MSRP_FIRSTLINE_IDENT;
 		r->tcp.parsed = p;
+		/* fall through */
 
 	case MSRP_FIRSTLINE_IDENT:
 #ifdef MSRP_DEBUG
@@ -125,6 +178,7 @@ void msrp_brief_parse_msg(struct msrp_req *r)
 		r->state = MSRP_FIRSTLINE_METHOD;
 		r->tcp.parsed = p;
 		r->fl.ident = s;
+		/* fall through */
 
 	case MSRP_FIRSTLINE_METHOD:
 #ifdef MSRP_DEBUG
@@ -275,20 +329,20 @@ static int msrp_handle_req(struct msrp_req *req,
 		struct tcp_connection *con, int _max_msg_chunks)
 {
 	struct receive_info local_rcv;
-	struct msrp_req *con_req;
+	struct msrp_dispatch_data dispatch_data;
 	char *msg_buf;
 	int msg_len;
 	long size;
 	char c;
 
-	if (req->complete){
+	if (req->complete) {
 #ifdef EXTRA_DEBUG
 		LM_DBG("end of header part\n");
 		LM_DBG("- received from: port %d\n", con->rcv.src_port);
 		print_ip("- received from: ip ", &con->rcv.src_ip, "\n");
 #endif
 
-		/* update the timeout - we successfully read the request */
+		/* refresh connection lifetime after successful read progress */
 		tcp_conn_reset_lifetime(con);
 		con->timeout=con->lifetime;
 
@@ -304,37 +358,46 @@ static int msrp_handle_req(struct msrp_req *req,
 		/* prepare for next request */
 		size=req->tcp.pos-req->tcp.parsed;
 
-		//if (req->state!=H_SKIP_EMPTY) {
-			msg_buf = req->tcp.start;
-			msg_len = req->tcp.parsed-req->tcp.start;
-			local_rcv = con->rcv;
+		msg_buf = req->tcp.start;
+		msg_len = req->tcp.parsed-req->tcp.start;
+		local_rcv = con->rcv;
 
-			if (!size) {
-				/* did not read any more things -  we can release
-				 * the connection */
-				LM_DBG("Nothing more to read on TCP conn %p, currently "
-					"in state %d \n", con,con->state);
-				if (req != &msrp_current_req) {
-					/* we have the buffer in the connection tied buff -
-					 *	detach it , release the conn and free it afterwards */
-					con->con_req = NULL;
-				}
+		if (!size) {
+			/* did not read any more things -  we can release
+			 * the connection */
+			LM_DBG("Nothing more to read on TCP conn %p, currently "
+				"in state %d \n", con,con->state);
 
-				/* TODO - we could indicate to the TCP net layer to release
-				 * the connection -> other worker may read the next available
-				 * message on the pipe */
+			/* TODO - we could indicate to the TCP net layer to release
+			 * the connection -> other worker may read the next available
+			 * message on the pipe */
 			} else {
 				LM_DBG("We still have things on the pipe - "
 					"keeping connection \n");
 			}
 
-			if (handle_msrp_msg( msg_buf, msg_len, &req->fl, &req->body, 
-			&local_rcv) <0)
-				LM_ERR("receive_msg failed \n");
+			dispatch_data.type = req->fl.type;
+			dispatch_data.ident_off = req->fl.ident.s - msg_buf;
+			dispatch_data.ident_len = req->fl.ident.len;
+			dispatch_data.method_off = req->fl.u.request.method.s - msg_buf;
+			dispatch_data.method_len = req->fl.u.request.method.len;
+			dispatch_data.eol_off = req->fl.eol - msg_buf;
+			if (req->body.s) {
+				dispatch_data.body_off = req->body.s - msg_buf;
+				dispatch_data.body_len = req->body.len;
+			} else {
+				dispatch_data.body_off = -1;
+				dispatch_data.body_len = 0;
+			}
 
-		//}
+			if (tcp_dispatch_msg(msg_buf, msg_len,
+					&local_rcv, &dispatch_data,
+					sizeof(dispatch_data)) < 0) {
+				LM_ERR("failed to deliver MSRP message\n");
+				goto error;
+			}
 
-		con->msg_attempts = 0;
+			con->msg_attempts = 0;
 
 		if (size) {
 			/* restoring the char only makes sense if there is something else to
@@ -352,59 +415,17 @@ static int msrp_handle_req(struct msrp_req *req,
 			return 1;
 		}
 
-		if (req != &msrp_current_req) {
-			/* if we no longer need this tcp_req
-			 * we can free it now */
-			shm_free(req);
-			con->con_req = NULL;
-		}
+		init_msrp_req(req, 0);
 	} else {
 		/* request not complete - check the if the thresholds are exceeded */
-		if (con->msg_attempts==0)
-			/* if first iteration, set a short timeout for reading
-			 * a whole SIP message */
-			con->timeout = get_ticks() + tcp_max_msg_time;
+		if (con->msg_attempts == 0)
+			tcp_conn_set_msg_read_timeout(con);
 
 		con->msg_attempts ++;
 		if (con->msg_attempts == _max_msg_chunks) {
 			LM_ERR("Made %u read attempts but message is not complete yet - "
 				   "closing connection \n",con->msg_attempts);
 			goto error;
-		}
-
-		if (req == &msrp_current_req) {
-			/* let's duplicate this - most likely another conn will come in */
-
-			LM_DBG("We didn't manage to read a full request\n");
-			con_req = shm_malloc(sizeof(struct msrp_req));
-			if (con_req == NULL) {
-				LM_ERR("No more mem for dynamic con request buffer\n");
-				goto error;
-			}
-			con->con_req = (void*)con_req;
-
-			if (req->tcp.pos != req->tcp.buf) {
-				/* we have read some bytes */
-				memcpy( con_req->tcp.buf, req->tcp.buf, req->tcp.pos-req->tcp.buf);
-				con_req->tcp.pos = con_req->tcp.buf + (req->tcp.pos-req->tcp.buf);
-			} else {
-				con_req->tcp.pos = con_req->tcp.buf;
-			}
-
-			if (req->tcp.start != req->tcp.buf)
-				con_req->tcp.start = con_req->tcp.buf +(req->tcp.start-req->tcp.buf);
-			else
-				con_req->tcp.start = con_req->tcp.buf;
-
-			if (req->tcp.parsed != req->tcp.buf)
-				con_req->tcp.parsed = con_req->tcp.buf+(req->tcp.parsed-req->tcp.buf);
-			else
-				con_req->tcp.parsed = con_req->tcp.buf;
-
-			con_req->complete=req->complete;
-			con_req->tcp.error = req->tcp.error;
-			con_req->state = req->state;
-			/* req will be reset on the next usage */
 		}
 	}
 
@@ -433,13 +454,18 @@ int msrp_read_req(struct tcp_connection* con, int* bytes_read)
 	bytes=-1;
 	total_bytes=0;
 
-	if (con->con_req) {
-		req = (struct msrp_req*)con->con_req;
+	if (con->proto_req) {
+		req = (struct msrp_req *)con->proto_req;
 		LM_DBG("Using the per connection buff \n");
 	} else {
-		LM_DBG("Using the global ( per process ) buff \n");
-		init_msrp_req(&msrp_current_req, 0);
-		req = &msrp_current_req;
+		LM_DBG("Allocating per connection MSRP buffer\n");
+		req = thread_malloc(sizeof(*req));
+		if (req == NULL) {
+			LM_ERR("No more mem for dynamic con request buffer\n");
+			return -1;
+		}
+		init_msrp_req(req, 0);
+		con->proto_req = (void *)req;
 	}
 
 
@@ -558,14 +584,15 @@ error:
 /*! \brief Finds a tcpconn & sends on it */
 int proto_msrp_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len,
-		const union sockaddr_union* to, unsigned int id)
+		const union sockaddr_union* to, unsigned int id,
+		struct sip_msg *msg)
 {
 	struct tcp_connection *c;
 	struct tcp_conn_profile prof;
 	struct ip_addr ip;
 	struct timeval get,snd;
 	union sockaddr_union src_su, dst_su;
-	int port = 0, fd, n, matched;
+	int port = 0, n, matched;
 	struct tls_domain *dom;
 
 	matched = tcp_con_get_profile(to, &send_sock->su, send_sock->proto, &prof);
@@ -578,11 +605,11 @@ int proto_msrp_send(const struct socket_info* send_sock,
 		port=su_getport(to);
 		dom = (msrp_check_cert_on_reusage==0 || send_sock->proto==PROTO_MSRP)?
 			NULL : tls_mgm_api.find_client_domain( &ip, port);
-		n = tcp_conn_get(id, &ip, port, PROTO_MSRP, NULL, &c, &fd, send_sock);
+		n = tcp_conn_get(id, &ip, port, PROTO_MSRP, NULL, &c, send_sock);
 		if (dom)
 			tls_mgm_api.release_domain(dom);
 	}else if (id){
-		n = tcp_conn_get(id, 0, 0, PROTO_NONE, NULL, &c, &fd, NULL);
+		n = tcp_conn_get(id, 0, 0, PROTO_NONE, NULL, &c, NULL);
 	}else{
 		LM_CRIT("tcp_send called with null id & to\n");
 		get_time_difference(get,prof.send_threshold,tcp_timeout_con_get);
@@ -607,10 +634,14 @@ int proto_msrp_send(const struct socket_info* send_sock,
 		}
 		LM_DBG("no open tcp connection found, opening new one\n");
 		/* create tcp connection */
-		if ((c=tcp_sync_connect(send_sock, to, &prof, &fd, 1))==0) {
-			LM_ERR("connect failed\n");
-			get_time_difference(get,prof.send_threshold,tcp_timeout_con_get);
-			return -1;
+		{
+			int fd;
+
+			if ((c=tcp_sync_connect(send_sock, to, &prof, &fd))==0) {
+				LM_ERR("connect failed\n");
+				get_time_difference(get,prof.send_threshold,tcp_timeout_con_get);
+				return -1;
+			}
 		}
 
 		if ( TRACE_ON( c->flags ) &&
@@ -624,10 +655,6 @@ int proto_msrp_send(const struct socket_info* send_sock,
 					&CONNECT_OK, msrp_t_dst );
 			}
 		}
-
-		LM_DBG( "Successfully connected from interface %s:%d to %s:%d!\n",
-			ip_addr2a( &c->rcv.src_ip ), c->rcv.src_port,
-			ip_addr2a( &c->rcv.dst_ip ), c->rcv.dst_port );
 
 		goto send_it;
 	}
@@ -647,7 +674,7 @@ int proto_msrp_send(const struct socket_info* send_sock,
 
 	/* now we have a connection, let's see what we can do with it */
 	/* BE CAREFUL now as we need to release the conn before exiting !!! */
-	if (fd==-1) {
+	if (c->state != S_CONN_OK && c->state != S_CONN_CONNECTING) {
 		/* connection is not writable because of its state */
 		/* return error, nothing to do about it */
 		tcp_conn_release(c, 0);
@@ -656,37 +683,27 @@ int proto_msrp_send(const struct socket_info* send_sock,
 
 
 send_it:
-	LM_DBG("sending via fd %d...\n",fd);
-
+	LM_DBG("sending on conn %p...\n", c);
 	start_expire_timer(snd,prof.send_threshold);
 
 	if (send_sock->proto==PROTO_MSRP)
-		n = tcp_write_on_socket(c, fd, buf, len,
+		n = tcp_write_on_socket(c, -1, buf, len,
 			msrp_send_timeout, 0);
 	else
-		n = msrps_write_on_socket(c, fd, buf, len,
+		n = msrps_write_on_socket(c, -1, buf, len,
 			msrp_tls_handshake_timeout, msrp_send_timeout);
 
 	get_time_difference(snd,prof.send_threshold,tcp_timeout_send);
 	stop_expire_timer(get,prof.send_threshold,"MSRP ops",buf,(int)len,1);
 
-	tcp_conn_reset_lifetime(c);
-
-	LM_DBG("after write: c= %p n/len=%d/%d fd=%d\n",c, n, len, fd);
+	LM_DBG("after write: c=%p n/len=%d/%d\n", c, n, len);
 	/* LM_DBG("buf=\n%.*s\n", (int)len, buf); */
 	if (n<0){
 		LM_ERR("failed to send\n");
 		c->state=S_CONN_BAD;
-		if (c->proc_id != process_no)
-			close(fd);
 		tcp_conn_release(c, 0);
 		return -1;
 	}
-
-	/* only close the FD if not already in the context of our process
-	either we just connected, or main sent us the FD */
-	if (c->proc_id != process_no)
-		close(fd);
 
 	/* mark the ID of the used connection (tracing purposes) */
 	last_outgoing_tcp_id = c->id;

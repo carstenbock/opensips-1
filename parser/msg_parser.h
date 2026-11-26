@@ -131,6 +131,12 @@ enum request_method {
 #define FL_USE_SIPTRACE_B2B  (1<<23) /* used by tracer to check if the b2b
                                       * tracing was enabled */
 #define FL_ACK_WITH_BODY     (1<<24) /* ACK message has SDP body */
+#define FL_TM_FAKE_REQ_REBUILT (1<<25) /* a TM faked request whose buffer and
+                                      * parsed structures were re-flattened by
+                                      * b2b into standalone pkg memory, no
+                                      * longer sharing the transaction clone
+                                      * (GH#3796) */
+#define FL_NO_AUTO_100       (1<<26) /* do not send the automatic 100 Trying */
 
 /* define the # of unknown URI parameters to parse */
 #define URI_MAX_U_PARAMS 10
@@ -354,6 +360,8 @@ struct sip_msg {
 	struct timeval time;
 
 	struct msg_callback *msg_cb;
+	/* Replacement message buffer allocated from pkg memory, if any. */
+	char *pkg_buf;
 };
 
 
@@ -372,9 +380,7 @@ extern int sdp_get_custom_body(struct sip_msg *msg, str *body);
 int parse_msg_opt(char* buf, unsigned int len, struct sip_msg* msg,
 		int free_on_err);
 
-#define parse_headers(msg, flags,next) 	parse_headers_aux(msg,flags,next, 1)
-
-int parse_headers_aux(struct sip_msg* msg, hdr_flags_t flags, int next, int sip_well_known_parse);
+int parse_headers(struct sip_msg *msg, hdr_flags_t flags, int next);
 
 #define get_hdr_field(buf,end,hdr)	get_hdr_field_aux(buf,end,hdr,1)
 

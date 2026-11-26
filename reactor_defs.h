@@ -64,13 +64,15 @@ enum fd_types { F_NONE=0,
 		/* fd types specific to TCP oriented processes (SIP workers) */
 		F_TCPMAIN, F_TCPCONN,
 		/* fd types for TCP management process (TCP main process) */
-		F_TCP_LISTENER, F_TCP_TCPWORKER, F_TCP_WORKER,
+		F_TCP_LISTENER,
+		F_TCP_NOTIFY,
 		/* generic fd type specific to the custome processes (like MI) */
 		F_GEN_PROC,
 		};
 
 extern io_wait_h _worker_io;
 extern unsigned int reactor_size;
+extern unsigned int worker_reactor_timeout;
 
 int init_reactor_size(void);
 
@@ -79,6 +81,9 @@ int init_reactor_size(void);
 
 #define reactor_add_reader( _fd, _type, _prio, _data) \
 	io_watch_add(&_worker_io, _fd, _type, _data, _prio, 0, IO_WATCH_READ)
+#define reactor_add_reader_excl( _fd, _type, _prio, _data) \
+	io_watch_add(&_worker_io, _fd, _type, _data, _prio, 0, \
+		IO_WATCH_READ|IO_WATCH_EXCLUSIVE)
 
 #define reactor_add_reader_with_timeout( _fd, _type, _prio, _t, _data) \
 	io_watch_add(&_worker_io, _fd, _type, _data, _prio, _t, IO_WATCH_READ)
@@ -114,4 +119,3 @@ int init_reactor_size(void);
 	io_check_app_flag( &_worker_io , _app_flag)
 
 #endif
-

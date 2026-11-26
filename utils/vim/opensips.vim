@@ -39,6 +39,7 @@ syn keyword osGlobalParam dns_use_search_list shm_hash_split_percentage
 syn keyword osGlobalParam shm_secondary_hash_size mem_warming mem_warming_enabled
 syn keyword osGlobalParam mem_warming_pattern_file mem_warming_percentage
 syn keyword osGlobalParam mem_log mem_dump execmsgthreshold execdnsthreshold
+syn keyword osGlobalParam worker_reactor_timeout workerreactortimeout
 syn keyword osGlobalParam dns_use_search_list shm_hash_split_percentage
 syn keyword osGlobalParam tcp_threshold tcpthreshold event_shm_threshold
 syn keyword osGlobalParam event_pkg_threshold query_buffer_size
@@ -51,10 +52,10 @@ syn keyword osGlobalParam open_files_limit mcast_loopback mcast_ttl tos
 syn keyword osGlobalParam max_while_loops disable_stateless_fwd db_default_url
 syn keyword osGlobalParam disable_503_translation import_file server_header
 syn keyword osGlobalParam tcp_max_msg_time abort_on_assert anycast
-syn keyword osGlobalParam log_prefix tcp_parallel_read_on_workers
+syn keyword osGlobalParam log_prefix
 syn keyword osGlobalParam stderror_log_format syslog_log_format
-syn keyword osGlobalParam log_json_buf_size log_msg_buf_size
-syn keyword osGlobalParam log_event_enabled log_event_level_filter
+syn keyword osGlobalParam log_json_buf_size log_msg_buf_size log_ratelimit_period
+syn keyword osGlobalParam log_event_enabled log_event_level_filter parse_err_log_level
 syn keyword osGlobalParam shm_memlog_size
 
 " String constants

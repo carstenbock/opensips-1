@@ -36,6 +36,14 @@
 enum process_type { TYPE_NONE=0, TYPE_UDP, TYPE_TCP,
 	TYPE_TIMER, TYPE_MODULE};
 
+enum profiling_proc_level {
+	LEVEL_OFF = 0,
+	LEVEL_SIP,
+	LEVEL_EXTRAPROCS,
+	LEVEL_TIMER,
+	LEVEL_FULL = LEVEL_TIMER,
+};
+
 #include "pt_scaling.h"
 
 struct process_table {
@@ -65,12 +73,6 @@ struct process_table {
 	/* same as above, but holder for non-existing processes */
 	int ipc_sync_pipe_holder[2];
 
-	/* holder for the unixsocks used by TCP layer for inter-proc communication;
-	 * used when the corresponding process does not exist */
-	int tcp_socks_holder[2];
-	/* unix socket on which TCP MAIN listens */
-	int unix_sock;
-
 	/* logging level of this process */
 	int log_level;
 	/* used when resetting the log level */
@@ -78,6 +80,8 @@ struct process_table {
 	/* used for suppressing the E_CORE_LOG event for new logs while handling
 	 * the event itself */
 	int suppress_log_event;
+	/* process-level profiling verbosity for this process */
+	enum profiling_proc_level profiling_proc_level;
 
 	/* statistics of this process - they do not change during runtime,
 	 * even when the proc is terminated or respawn - we just hide/unhide */
@@ -104,6 +108,7 @@ extern unsigned int counted_max_processes;
 extern int _termination_in_progress;
 
 int   init_multi_proc_support();
+void  free_process_table(void);
 void  set_proc_attrs(const char *fmt, ...);
 int   count_init_child_processes(void);
 int   count_child_processes(void);

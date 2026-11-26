@@ -374,8 +374,9 @@ done:
 		presentity->waiting_reply = 1;
 		presentity->pending_publ  = pending_publ->next;
 
-		send_publish_int(presentity, publ, get_event(presentity->event),
-				presentity->hash_index);
+		if (send_publish_int(presentity, publ, get_event(presentity->event),
+				presentity->hash_index) != ERR_PUBLISH_NO_ERROR)
+			LM_ERR("failed to send pending PUBLISH\n");
 
 		shm_free(pending_publ);
 		pkg_free(publ);
@@ -430,7 +431,7 @@ int send_publish_int(ua_pres_t* presentity, publ_info_t* publ, pua_event_t* ev,
 {
 	unsigned long pres_id= 0;
 	int ret = ERR_PUBLISH_GENERIC;
-	char etag_buf[256];
+	char etag_buf[PUA_MAX_ETAG_LEN + 1];
 	char tuple_buf[128];
 	str tuple_id= {0, 0};
 	str etag= {0, 0};
@@ -446,6 +447,14 @@ int send_publish_int(ua_pres_t* presentity, publ_info_t* publ, pua_event_t* ev,
 	{
 		LM_DBG("presentity exists\n");
 		pres_id = PRES_HASH_ID(presentity);
+		if(presentity->etag.s &&
+				(presentity->etag.len < 0 ||
+				 presentity->etag.len > PUA_MAX_ETAG_LEN))
+		{
+			LM_ERR("SIP-ETag is too long\n");
+			lock_release(&HashT->p_records[hash_index].lock);
+			return ret;
+		}
 		ver= ++presentity->version;
 
 		/* copy etag */
@@ -454,6 +463,7 @@ int send_publish_int(ua_pres_t* presentity, publ_info_t* publ, pua_event_t* ev,
 			etag.s = etag_buf;
 			memcpy(etag.s, presentity->etag.s, presentity->etag.len);
 			etag.len = presentity->etag.len;
+			etag.s[etag.len] = '\0';
 		}
 		/* tuple id */
 		if(presentity->tuple_id.s)
@@ -508,8 +518,12 @@ int send_publish_int(ua_pres_t* presentity, publ_info_t* publ, pua_event_t* ev,
 		if(publ->body== NULL)
 		{
 			if (ev->content_type.s && ev->content_type.len) {
-				LM_ERR("New '%.*s' PUBLISH and no body found - invalid request\n",
-					ev->name.len, ev->name.s);
+				if (publ->flag & PUBL_SILENT_ERR)
+					LM_DBG("New '%.*s' PUBLISH and no body found\n",
+						ev->name.len, ev->name.s);
+				else
+					LM_ERR("New '%.*s' PUBLISH and no body found - invalid request\n",
+						ev->name.len, ev->name.s);
 				ret = ERR_PUBLISH_NO_BODY;
 				goto error;
 			}
@@ -532,7 +546,7 @@ int send_publish_int(ua_pres_t* presentity, publ_info_t* publ, pua_event_t* ev,
 
 	LM_DBG("cback param = %ld\n", pres_id);
 
-	if (tmb.t_request(&met,						/* Type of the message */
+	if (run_tm_api(&tmb, t_request, &met,						/* Type of the message */
 			publ->pres_uri,							/* Request-URI */
 			publ->pres_uri,							/* To */
 			publ->pres_uri,							/* From */
@@ -608,7 +622,7 @@ int send_publish( publ_info_t* publ )
 
 	lock_get(&HashT->p_records[hash_code].lock);
 
-	if(publ->flag != INSERT_TYPE) {
+	if(!(publ->flag & INSERT_TYPE)) {
 		presentity= search_htable(&pres, hash_code);
 		if (presentity==NULL && is_pua_cluster_enabled()) {
 			lock_release(&HashT->p_records[hash_code].lock);
@@ -669,4 +683,3 @@ int send_publish( publ_info_t* publ )
 
 	return send_publish_int(presentity, publ, ev, hash_code);
 }
-

@@ -47,10 +47,12 @@ struct clusterer_binds cluster_api;
 
 static void tm_repl_cancel(bin_packet_t *packet, str *buf, struct receive_info *ri)
 {
+	static context_p my_ctx = NULL;
 	int itmp;
 	char *tmp;
 	str stmp;
 	struct cell *t;
+	context_p old_ctx;
 	/* build a nice static message, exactly how t_lookupOriginalT() expects */
 	struct sip_msg msg;
 	struct via_body via;
@@ -119,6 +121,19 @@ static void tm_repl_cancel(bin_packet_t *packet, str *buf, struct receive_info *
 
 	LM_DBG("Got CANCEL with branch id=%.*s\n", branch.value.len, branch.value.s);
 
+	old_ctx = current_processing_ctx;
+
+	if (my_ctx==NULL) {
+		my_ctx = context_alloc(CONTEXT_GLOBAL);
+		if (my_ctx==NULL) {
+			LM_ERR("failed to alloc new ctx in pkg\n");
+			free_sip_msg(&msg);
+			return;
+		}
+	}
+	memset( my_ctx, 0, context_size(CONTEXT_GLOBAL) );
+	set_global_context(my_ctx);
+
 	/* try to get the transaction */
 	set_t(T_UNDEFINED); /* set undefined, because we might have already got a cancel here */
 	reset_cancelled_t();
@@ -126,7 +141,7 @@ static void tm_repl_cancel(bin_packet_t *packet, str *buf, struct receive_info *
 	/* if transaction is not here, must be somebody else's */
 	if (!t) {
 		LM_DBG("Original transaction not here!\n");
-		return;
+		goto cleanup_ctx;
 	}
 
 	/* transaction is located here - do a proper parsing if not done already */
@@ -159,6 +174,13 @@ cleanup:
 	if ((t=get_t()) != NULL && t != T_UNDEFINED)
 		t_unref_cell(t);
 
+cleanup_ctx:
+	if (current_processing_ctx==NULL)
+		my_ctx=NULL;
+	else
+		context_destroy(CONTEXT_GLOBAL, my_ctx);
+	set_global_context(old_ctx);
+
 	free_sip_msg(&msg);
 }
 
@@ -183,6 +205,11 @@ static void receive_tm_repl(bin_packet_t *packet)
 
 	/* first part is common to all messages */
 	TM_BIN_POP(int, &proto, "proto");
+	if (proto < PROTO_FIRST || proto >= PROTO_LAST ||
+			protos[proto].id == PROTO_NONE) {
+		LM_WARN("received replicated message with invalid protocol: %d\n", proto);
+		return;
+	}
 	TM_BIN_POP(str, &tmp, "dst host");
 	TM_BIN_POP(int, &port, "dst port");
 
@@ -205,10 +232,18 @@ static void receive_tm_repl(bin_packet_t *packet)
 	ri.proto_reserved1 = ri.proto_reserved2 = 0;
 
 	TM_BIN_POP(str, &tmp, "src host");
+	if (tmp.len > sizeof(ri.src_ip)) {
+		LM_WARN("received replicated message with oversized source address\n");
+		return;
+	}
 	memcpy((char *)&ri.src_ip, tmp.s, tmp.len);
 	TM_BIN_POP(int, &ri.src_port, "src port");
 	TM_BIN_POP(str, &tmp, "message");
 	/* we need to substract the '\0' termination from message len */
+	if (tmp.len == 0) {
+		LM_WARN("received replicated message without a terminating NUL\n");
+		return;
+	}
 	tmp.len--;
 
 	/* only auto-CANCEL is treated differently */
@@ -388,7 +423,7 @@ static void *tm_replicate_cancel(struct sip_msg *msg)
 		break;
 	}
 	bin_free_packet(&packet);
-	return NULL; /* dummy return to comply with TM_BIN_PUSH() */
+	return rc == CLUSTERER_SEND_SUCCESS ? (void *)1 : NULL;
 }
 #undef TM_BIN_PUSH
 /**
@@ -432,7 +467,7 @@ static int tm_replicate_broadcast(struct sip_msg *msg)
 
 	bin_packet_t *packet = tm_replicate_packet(msg, TM_CLUSTER_REQUEST);
 	if (!packet)
-		return -1;
+		return 0;
 
 	rc = cluster_api.send_all(packet, tm_repl_cluster);
 	switch (rc) {
@@ -453,7 +488,7 @@ static int tm_replicate_broadcast(struct sip_msg *msg)
 		break;
 	}
 	bin_free_packet(packet);
-	return 0;
+	return rc == CLUSTERER_SEND_SUCCESS;
 }
 
 /**

@@ -37,6 +37,8 @@
  *  2007-01-25  DNS failover at transaction level added (bogdan)
  */
 
+#include <stdint.h>
+
 #include "../../dprint.h"
 #include "../../config.h"
 #include "../../ut.h"
@@ -51,6 +53,7 @@
 #include "../../mem/mem.h"
 #include "../../parser/parser_f.h"
 #include "../../parser/parse_body.h"
+#include "../../context.h"
 #include "t_funcs.h"
 #include "t_hooks.h"
 #include "t_msgbuilder.h"
@@ -58,12 +61,14 @@
 #include "t_cancel.h"
 #include "t_lookup.h"
 #include "t_fwd.h"
+#include "t_reply.h"
 #include "fix_lumps.h"
 #include "config.h"
 #include "cluster.h"
 #include "../usrloc/ul_evi.h"
 #include "../../msg_callbacks.h"
 #include "../../mod_fix.h"
+#include "../../net/tcp_common.h"
 
 #define NO_BODY_CLONE_MARKER ((struct sip_msg_body*)-1)
 
@@ -81,11 +86,7 @@ void t_on_branch( struct script_route_ref *ref )
 	 * created; if not -> use the static variable */
 	holder = (!t || t==T_UNDEFINED ) ? &goto_on_branch : &t->on_branch ;
 
-	/* if something already set, free it first */
-	if (*holder)
-		shm_free( *holder );
-
-	*holder = ref ? dup_ref_script_route_in_shm( ref, 0) : NULL;
+	tm_set_script_route_ref( t, holder, ref );
 }
 
 
@@ -694,7 +695,7 @@ void cancel_invite(struct sip_msg *cancel_msg,
 	/* we need to check which branches should be canceled under lock to avoid
 	 * concurrency with replies that are coming in the same time */
 	/* generate local cancels for all branches */
-	which_cancel(t_invite, &cancel_bitmap );
+	which_cancel(t_invite, cancel_bitmap );
 	UNLOCK_REPLIES(t_invite);
 
 	set_cancel_extra_hdrs( reason.s, reason.len);
@@ -717,7 +718,7 @@ void cancel_invite(struct sip_msg *cancel_msg,
 	if ( (t_invite->nr_of_outgoings-t_invite->first_branch)==1 &&
 	(TM_BRANCH(t_invite,t_invite->first_branch).flags & T_UAC_IS_PHONY) ) {
 		relay_reply( t_invite, FAKED_REPLY, t_invite->first_branch,
-			487, &cancel_bitmap);
+			487, cancel_bitmap);
 	}
 #if 0
 	/* internally cancel branches with no received reply */
@@ -749,7 +750,8 @@ int t_forward_nonack( struct cell *t, struct sip_msg* p_msg ,
 	str current_uri;
 	branch_bm_t  added_branches = BRANCH_BM_ZERO;
 	struct cell *t_invite;
-	int i, success_branch;
+	int i, success_branch, send_ret;
+	unsigned long long tcp_chunk_fail_token;
 	const struct socket_info *bk_sock;
 	unsigned int bk_bflags;
 	struct msg_branch *branch;
@@ -906,7 +908,15 @@ int t_forward_nonack( struct cell *t, struct sip_msg* p_msg ,
 							&uac->request.dst);
 					run_trans_callbacks(TMCB_PRE_SEND_BUFFER, t, p_msg, 0, i);
 
-					if (SEND_BUFFER( &uac->request)==0) {
+					tcp_chunk_fail_token = TM_CHUNK_FAIL_TOKEN(
+						t->hash_index, t->label, i);
+					if (tcp_register_fail_cb(tm_tcp_chunk_fail,
+						(void *)(uintptr_t)tcp_chunk_fail_token, NULL) < 0)
+						LM_ERR("failed to register TCP chunk failure callback\n");
+					send_ret = SEND_BUFFER( &uac->request);
+					tcp_clear_fail_cb();
+
+					if (send_ret==0) {
 						reset_bavp_list();
 						ser_error = 0;
 						break;
@@ -1108,6 +1118,50 @@ int t_wait_no_more_branches( struct cell *t, int extra)
 }
 
 
+int t_wait_no_more_branches_timeout(struct cell *t, int code)
+{
+	static context_p my_ctx = NULL;
+	context_p old_ctx;
+	struct cell *old_t;
+	branch_bm_t cancel_bitmap = BRANCH_BM_ZERO;
+	int b;
+
+	for (b = t->nr_of_outgoings - 1; b >= t->first_branch; b--) {
+		if (TM_BRANCH(t, b).flags & T_UAC_IS_PHONY) {
+			if (TM_BRANCH(t, b).last_received < 200) {
+				old_ctx = current_processing_ctx;
+				old_t = get_t();
+				if (my_ctx == NULL) {
+					my_ctx = context_alloc(CONTEXT_GLOBAL);
+					if (my_ctx == NULL) {
+						LM_ERR("failed to alloc new ctx in pkg\n");
+						return -1;
+					}
+				}
+				memset(my_ctx, 0, context_size(CONTEXT_GLOBAL));
+				set_global_context(my_ctx);
+				set_t(t);
+
+				_tm_branch_index = b;
+				LOCK_REPLIES(t);
+				relay_reply(t, FAKED_REPLY, b, code, cancel_bitmap);
+				_tm_branch_index = 0;
+
+				if (current_processing_ctx == NULL)
+					my_ctx = NULL;
+				else
+					context_destroy(CONTEXT_GLOBAL, my_ctx);
+				set_global_context(old_ctx);
+				set_t(old_t);
+			}
+			TM_BRANCH(t, b).br_flags = t->nr_of_outgoings;
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
 int t_inject_branch( struct cell *t, struct sip_msg *msg, int flags)
 {
 	static struct sip_msg faked_req;
@@ -1164,7 +1218,7 @@ int t_inject_branch( struct cell *t, struct sip_msg *msg, int flags)
 
 	/* do we have to cancel the existing branches before injecting new ones? */
 	if (flags&TM_INJECT_FLAG_CANCEL) {
-		which_cancel( t, &cancel_bm );
+		which_cancel( t, cancel_bm );
 	}
 
 	if (flags&TM_INJECT_FLAG_LAST)

@@ -35,7 +35,7 @@
 #lua= Easily implement your own OpenSIPS extensions in Lua | liblua5.1-0-dev, libmemcache-dev and libmysqlclient-dev
 #httpd= Provides an HTTP transport layer implementation for OpenSIPS. | libmicrohttpd
 #http2d= Provides HTTP/2 server-side support, using nghttp2 | nghttp2 library (libnghttp2), libevent, libssl and libevent-openssl
-#mi_xmlrpc_ng= New version of the xmlrpc server that handles xmlrpc requests and generates xmlrpc responses. | parsing/building XML library, typically libxml
+#mi_xmlrpc= New version of the xmlrpc server that handles xmlrpc requests and generates xmlrpc responses. | parsing/building XML library, typically libxml
 #lost= LoST (RFC 5222) and HELD (RFC 6155) client used for emergency call routing | XML parsing & building library, typically libxml2-dev
 #mmgeoip= Lightweight wrapper for the MaxMind GeoIP API | libGeoIP
 #osp= Enables OpenSIPS to support secure, multi-lateral peering using the OSP standard | OSP development kit, typically osptoolkit
@@ -76,10 +76,19 @@
 #xmpp= Gateway between OpenSIPS and a jabber server. It enables the exchange of IMs between SIP clients and XMPP(jabber) clients. | parsing/building XML files, typically libexpat1-devel
 #uuid= UUID generator | uuid-dev
 
-# the below definition must be one single line (no wrapping) to make the "menuconfig" tool happy
-exclude_modules?= aaa_diameter aaa_radius auth_jwt auth_web3 b2b_logic_xml cachedb_cassandra cachedb_couchbase cachedb_dynamodb cachedb_memcached cachedb_mongodb cachedb_redis carrierroute cgrates compression cpl_c db_berkeley db_http db_mysql db_oracle db_perlvdb db_postgres db_sqlite db_unixodbc dialplan emergency event_rabbitmq event_kafka event_sqs h350 httpd http2d identity jabber json launch_darkly ldap lost lua mi_xmlrpc_ng mmgeoip opentelemetry osp perl pi_http presence presence_dialoginfo presence_mwi presence_reginfo presence_xml presence_dfks proto_ipsec proto_sctp proto_tls proto_wss pua pua_bla pua_dialoginfo pua_mi pua_reginfo pua_usrloc pua_xmpp python regex rabbitmq_consumer rest_client rls rtp.io siprec sngtc snmpstats stir_shaken tls_mgm tls_openssl tls_wolfssl uuid xcap xcap_client xml xmpp
+# Modules omitted from the default build, generally due to external dependencies.
+exclude_modules?= aaa_diameter aaa_radius auth_jwt auth_web3 b2b_logic_xml cachedb_cassandra cachedb_couchbase cachedb_dynamodb cachedb_memcached cachedb_mongodb cachedb_redis carrierroute cgrates compression cpl_c db_berkeley db_http db_mysql db_oracle db_perlvdb db_postgres db_sqlite db_unixodbc dialplan emergency event_rabbitmq event_kafka event_sqs h350 httpd http2d identity jabber json launch_darkly ldap lost lua mi_xmlrpc mmgeoip opentelemetry osp perl pi_http presence presence_dialoginfo presence_mwi presence_reginfo presence_xml presence_dfks proto_ipsec proto_sctp proto_tls proto_wss pua pua_bla pua_dialoginfo pua_mi pua_reginfo pua_usrloc pua_xmpp python regex rabbitmq_consumer rest_client rls rtp.io siprec sngtc snmpstats stir_shaken tls_mgm tls_openssl tls_wolfssl uuid xcap xcap_client xml xmpp
 
+# Modules forced into the build, even when also listed in exclude_modules.
 include_modules?=
+
+# Source directories containing loadable module collections.  Each directory
+# is also available as a make target; all-modules builds all collections.
+MODULE_DIRS?= modules modules-contrib
+
+# Additional flags passed to the compiler and linker.
+CC_EXTRA_OPTS ?=
+LD_EXTRA_OPTS ?=
 
 DEFS+= -DPKG_MALLOC #Use a faster malloc
 DEFS+= -DSHM_MMAP #Use mmap instead of SYSV shared memory
@@ -94,6 +103,10 @@ DEFS+= -DHP_MALLOC #High performance allocator with fine-grained locking
 DEFS+= -DDBG_MALLOC #Include additional, debug-enabled allocator flavors
 DEFS+= -DF_PARALLEL_MALLOC #Fast memory allocator with paralel buckets
 #DEFS+= -DQM_DBG_MALLOC_HIST=3 #Size of debug history for Q_MALLOC (default is 1)
+# Preferred allocator when multiple allocators are compiled. If it is not
+# compiled, the first available allocator in F_MALLOC, Q_MALLOC, HP_MALLOC
+# order is used.
+#PREFERRED_MALLOC=Q_MALLOC
 #DEFS+= -DNO_DEBUG #Compile out all debug messages
 #DEFS+= -DNO_LOG #Compile out all logging
 #DEFS_GROUP_START
@@ -116,4 +129,10 @@ DEFS+= -DCC_O0 #Zero compiler optimizations (FAST compile, SLOW code. For devs)
 #DEFS+= -DFUZZ_BUILD #Add extra runtime checks to prevent false-positive crashes
 #DEFS+= -DPROFILING #Periodically sample each process' call stack, for profiling purposes
 
+# Default installation prefix
 PREFIX ?= /usr/local/
+
+# Debian-style layout; adjust the multiarch triplet as needed.
+#PREFIX = /usr
+#LIBDIR = lib/x86_64-linux-gnu
+#cfg_dir = ../etc/opensips/

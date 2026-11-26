@@ -27,6 +27,7 @@
 #define _WS_HANDSHAKE_H_
 
 #include "../../ip_addr.h"
+#include "../../lib/csv.h"
 
 #define HTTP_SEP			"\r\n"
 #define HTTP_SEP_LEN		(sizeof(HTTP_SEP) - 1)
@@ -117,14 +118,66 @@ static int trace_ws( struct tcp_connection* conn, trans_trace_event event, str* 
 static int complete_ws_trace( struct tcp_connection* conn, trans_trace_status status, str* rpl, str* message);
 
 #define WS_TRACE_MAX 1024
-static char ws_trace_buf[WS_TRACE_MAX];
+
+static inline int ws_parse_headers(struct sip_msg *msg)
+{
+	struct hdr_field *hf;
+	char *tmp, *rest, *end;
+
+	tmp = msg->unparsed;
+	end = msg->buf + msg->len;
+
+	while (tmp < end) {
+		hf = thread_malloc(sizeof *hf);
+		if (!hf) {
+			LM_ERR("thread memory allocation failed\n");
+			return -1;
+		}
+
+		memset(hf, 0, sizeof *hf);
+		hf->type = HDR_ERROR_T;
+		rest = get_hdr_field_aux(tmp, end, hf, 0);
+
+		if (hf->type == HDR_ERROR_T) {
+			LM_INFO("bad header field\n");
+			thread_free(hf);
+			return -1;
+		}
+
+		if (hf->type == HDR_EOH_T) {
+			msg->eoh = tmp;
+			msg->unparsed = tmp;
+			thread_free(hf);
+			return 0;
+		}
+
+		if (!msg->headers)
+			msg->headers = hf;
+		else
+			msg->last_header->next = hf;
+		msg->last_header = hf;
+		tmp = rest;
+	}
+
+	msg->unparsed = tmp;
+	return 0;
+}
+
+static inline void ws_free_parsed_headers(struct sip_msg *msg)
+{
+	struct hdr_field *hf, *next;
+
+	for (hf = msg->headers; hf; hf = next) {
+		next = hf->next;
+		thread_free(hf);
+	}
+	msg->headers = NULL;
+	msg->last_header = NULL;
+}
 
 /* safety checks */
 #ifndef _ws_common_module
 #error "_ws_common_module not defined!"
-#endif
-#ifndef _ws_common_tcp_current_req
-#error "_ws_common_tcp_current_req not defined!"
 #endif
 #ifndef _ws_common_max_msg_chunks
 #error "_ws_common_max_msg_chunks not defined!"
@@ -144,6 +197,47 @@ static char ws_trace_buf[WS_TRACE_MAX];
 #ifndef _ws_common_require_origin
 #error "_ws_common_require_origin not defined!"
 #endif
+/* the "allowed_origins" list, parsed once in mod_init; NULL = any Origin */
+static csv_record *ws_allowed_origins_list;
+
+/* Parse the comma-separated "allowed_origins" parameter into a list (spaces
+ * around the entries are ignored). Called once, from mod_init. */
+static int ws_parse_allowed_origins(str *param)
+{
+	str origins;
+
+	if (!param->s)
+		return 0;
+	param->len = strlen(param->s);
+	origins = *param;
+	trim(&origins);
+	if (origins.len == 0)
+		return 0;
+
+	ws_allowed_origins_list = parse_csv_record(&origins);
+	if (!ws_allowed_origins_list) {
+		LM_ERR("failed to parse allowed_origins <%.*s>\n",
+				param->len, param->s);
+		return -1;
+	}
+	return 0;
+}
+
+/* Is <origin> in the "allowed_origins" list (exact, case-insensitive match)?
+ * An empty or unset list allows any Origin, which is the behaviour without
+ * the "allowed_origins" parameter. */
+static int ws_origin_allowed(const str *origin)
+{
+	csv_record *it;
+
+	if (!ws_allowed_origins_list)
+		return 1;
+	for (it = ws_allowed_origins_list; it; it = it->next)
+		if (it->s.len && it->s.len == origin->len &&
+				strncasecmp(it->s.s, origin->s, origin->len) == 0)
+			return 1;
+	return 0;
+}
 
 /* all flags for req */
 #define WS_ALL_REQ_F (WS_HOST_F | \
@@ -161,27 +255,26 @@ static char ws_trace_buf[WS_TRACE_MAX];
 					WS_PROTO_F)
 
 
-#define WS_KEY_LEN 24
-static char ws_key[WS_KEY_LEN];
 static const char base64alphabet[] =
 "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 #define BASE64ALPHABET_LEN (sizeof(base64alphabet)-1)
 
 
 /* we're using a completely random key - no reason yet for something else */
-static str ws_rand_key(void)
+static void ws_rand_key(struct tcp_connection *con)
 {
-	static str key = { ws_key, WS_KEY_LEN };
+	char *key = ((struct ws_data *)con->proto_data)->key_buf;
 	int i;
 
 	/* randomly selected 16-byte base64 encoded value requires
 	 * 22 characters and 2 paddings at the end */
 	for (i = 0; i < WS_KEY_LEN - 2; i++)
-		ws_key[i] = base64alphabet[rand() % BASE64ALPHABET_LEN];
-	ws_key[i++] = '=';
-	ws_key[i++] = '=';
+		key[i] = base64alphabet[rand() % BASE64ALPHABET_LEN];
+	key[i++] = '=';
+	key[i++] = '=';
 
-	return key;
+	WS_KEY(con).s = key;
+	WS_KEY(con).len = WS_KEY_LEN;
 }
 
 static inline int ws_client_handshake(struct tcp_connection *con)
@@ -207,19 +300,21 @@ static inline int ws_client_handshake(struct tcp_connection *con)
 #endif
 
 	WS_STATE(con) = WS_CON_HANDSHAKE;
-	WS_KEY(con) = ws_rand_key();
+	ws_rand_key(con);
 	if (ws_start_handshake(con) < 0) {
 		LM_ERR("cannot start handshake\n");
 		return -1;
 	}
 
 	/* there should be no req in the con */
-	if (con->con_req) {
+	if (con->proto_req) {
 		LM_BUG("there should not be any con req!\n");
 		goto error;
 	}
-	init_tcp_req(&_ws_common_tcp_current_req, 0);
-	req=&_ws_common_tcp_current_req;
+	req = tcp_conn_get_req(con);
+	if (!req)
+		goto error;
+	init_tcp_req(req, 0);
 
 	to = _ws_common_read_tout*1000;
 	if (gettimeofday(&(begin), NULL)) {
@@ -328,7 +423,7 @@ static inline int ws_client_handshake(struct tcp_connection *con)
 #endif
 	}
 
-	/* update the timeout - we successfully read the request */
+	/* refresh connection lifetime after successful read progress */
 	tcp_conn_reset_lifetime(con);
 	con->timeout=con->lifetime;
 
@@ -405,13 +500,11 @@ static int ws_server_handshake(struct tcp_connection *con)
 	struct tcp_req *req;
 	str trace_str;
 
-	if (con->con_req) {
+	if (con->msg_attempts) {
 		if (WS_TYPE(con) != WS_SERVER) {
 			LM_BUG("cannot create handshake as %d\n", WS_TYPE(con));
 			return -1;
 		}
-		req=con->con_req;
-		LM_DBG("Using the per connection buff \n");
 	} else {
 		if (WS_TYPE(con) != WS_NONE) {
 			LM_BUG("not a new connection here %d", WS_TYPE(con));
@@ -419,11 +512,15 @@ static int ws_server_handshake(struct tcp_connection *con)
 		}
 		WS_TYPE(con) = WS_SERVER;
 		WS_STATE(con) = WS_CON_HANDSHAKE;
-		LM_DBG("Using the global ( per process ) buff \n");
-		init_tcp_req(&_ws_common_tcp_current_req, 0);
-		req=&_ws_common_tcp_current_req;
-		/* first time here, mark the state as being SERVER */
+		req = tcp_conn_get_req(con);
+		if (!req)
+			return -1;
+		init_tcp_req(req, 0);
 	}
+	req = tcp_conn_get_req(con);
+	if (!req)
+		return -1;
+	LM_DBG("Using the per connection buff \n");
 
 	if (req->error == TCP_REQ_OK) {
 		bytes = ws_read_http(con, req);
@@ -466,7 +563,7 @@ static int ws_server_handshake(struct tcp_connection *con)
 #endif
 		}
 
-		/* update the timeout - we successfully read the request */
+		/* refresh connection lifetime after successful read progress */
 		tcp_conn_reset_lifetime(con);
 		con->timeout=con->lifetime;
 
@@ -486,11 +583,6 @@ static int ws_server_handshake(struct tcp_connection *con)
 			 * the connection */
 			LM_DBG("We're releasing the connection in state %d \n",
 					con->state);
-			if (req != &_ws_common_tcp_current_req) {
-				/* we have the buffer in the connection tied buff -
-				 *	detach it , release the conn and free it afterwards */
-				con->con_req = NULL;
-			}
 			/* TODO - we could indicate to the TCP net layer to release
 			 * the connection -> other worker may read the next available
 			 * message on the pipe */
@@ -523,10 +615,6 @@ static int ws_server_handshake(struct tcp_connection *con)
 		}
 
 		con->msg_attempts = 0;
-		if (req != &_ws_common_tcp_current_req) {
-			shm_free(req);
-			con->con_req = NULL;
-		}
 
 		/* handshake now completed, destroy the handshake data */
 		WS_STATE(con) = WS_CON_HANDSHAKE_DONE;
@@ -548,47 +636,6 @@ static int ws_server_handshake(struct tcp_connection *con)
 		}
 	}
 
-	if (!req->complete && (req == &_ws_common_tcp_current_req)) {
-		/* let's duplicate this - most likely another conn will come in */
-
-		con->con_req = shm_malloc(sizeof(struct tcp_req));
-		if (con->con_req == NULL) {
-			LM_ERR("No more mem for dynamic con request buffer\n");
-			goto error;
-		}
-
-		if (req->pos != req->buf) {
-			/* we have read some bytes */
-			memcpy(con->con_req->buf,req->buf,req->pos-req->buf);
-			con->con_req->pos = con->con_req->buf + (req->pos-req->buf);
-		} else {
-			con->con_req->pos = con->con_req->buf;
-		}
-
-		if (req->start != req->buf)
-			con->con_req->start = con->con_req->buf +(req->start-req->buf);
-		else
-			con->con_req->start = con->con_req->buf;
-
-		if (req->parsed != req->buf)
-			con->con_req->parsed =con->con_req->buf+(req->parsed-req->buf);
-		else
-			con->con_req->parsed = con->con_req->buf;
-
-		if (req->body != 0) {
-			con->con_req->body = con->con_req->buf + (req->body-req->buf);
-		} else
-			con->con_req->body = 0;
-
-		con->con_req->complete=req->complete;
-		con->con_req->has_content_len=req->has_content_len;
-		con->con_req->content_len=req->content_len;
-		con->con_req->bytes_to_go=req->bytes_to_go;
-		con->con_req->error = req->error;
-		con->con_req->state = req->state;
-		/* req will be reset on the next usage */
-	}
-
 	LM_DBG("ws_read end\n");
 done:
 	/* connection will be released */
@@ -597,10 +644,6 @@ error:
 	/* connection will be released as ERROR */
 	if (WS_STATE(con) == WS_CON_BAD_REQ)
 		ws_bad_handshake(con);
-	if (req != &_ws_common_tcp_current_req) {
-		shm_free(req);
-		con->con_req = NULL;
-	}
 	return -1;
 }
 
@@ -844,7 +887,7 @@ static int ws_parse_req_handshake(struct tcp_connection *c, char *msg, int len)
 	memset(&tmp_msg, 0, sizeof(struct sip_msg));
 	tmp_msg.len = len;
 	tmp_msg.buf = tmp_msg.unparsed = msg;
-	if (parse_headers_aux(&tmp_msg, HDR_EOH_F, 0,0) < 0) {
+	if (ws_parse_headers(&tmp_msg) < 0) {
 		LM_ERR("cannot parse headers\n%.*s\n", len, msg);
 		goto ws_error;
 	}
@@ -902,6 +945,12 @@ static int ws_parse_req_handshake(struct tcp_connection *c, char *msg, int len)
 					GET_LOWER(hf->name.s + 5) != 'n')
 				break;
 
+			str_trim_spaces_lr(hf->body);
+			if (!ws_origin_allowed(&hf->body)) {
+				LM_ERR("Origin <%.*s> not in allowed_origins\n",
+						hf->body.len, hf->body.s);
+				goto ws_error;
+			}
 			if (_ws_common_require_origin)
 				flags |= WS_ORIGIN_F;
 			break;
@@ -998,56 +1047,59 @@ static int ws_parse_req_handshake(struct tcp_connection *c, char *msg, int len)
 	}
 
 	/* parsing done, free headers */
-	free_hdr_field_lst(tmp_msg.headers);
+	ws_free_parsed_headers(&tmp_msg);
 
 	return 0;
 ws_error:
-	free_hdr_field_lst(tmp_msg.headers);
+	ws_free_parsed_headers(&tmp_msg);
 error:
 	WS_STATE(c) = WS_CON_BAD_REQ;
 	return -1;
 }
 
-/*
- * The Polar library needs this to be 64 bytes, to avoid overflow
- * when computing the SHA1 hash
- */
-unsigned char ws_key_buf[64] = "xxxxxxxxxxxxxxxxxxxxxxxx" /* the key len: 24 */
-		WS_GUID_KEY /* the GUID */;
-unsigned char ws_sha1_buf[WS_SHA1_KEY_LEN];
-unsigned char ws_accept_buf[WS_ACCEPT_KEY_LEN];
-
-static void ws_compute_key(str *key)
+static void ws_compute_key(str *key, unsigned char *accept)
 {
-	memcpy(ws_key_buf, key->s, key->len);
-	sha1(ws_key_buf, key->len + WS_GUID_KEY_LEN, ws_sha1_buf);
-	base64encode(ws_accept_buf, ws_sha1_buf, WS_SHA1_KEY_LEN);
+	/* The Polar library needs this to be 64 bytes, to avoid overflow
+	 * when computing the SHA1 hash */
+	unsigned char key_buf[64];
+	unsigned char sha1_buf[WS_SHA1_KEY_LEN];
+
+	memcpy(key_buf, key->s, key->len);
+	memcpy(key_buf + key->len, WS_GUID_KEY, WS_GUID_KEY_LEN);
+	sha1(key_buf, key->len + WS_GUID_KEY_LEN, sha1_buf);
+	base64encode(accept, sha1_buf, WS_SHA1_KEY_LEN);
 }
 
 static int ws_is_valid_key(str *key, str *accept)
 {
-	ws_compute_key(key);
-	return strncasecmp((char *)ws_accept_buf, accept->s, accept->len) == 0;
+	unsigned char accept_buf[WS_ACCEPT_KEY_LEN];
+
+	if (accept->len != WS_ACCEPT_KEY_LEN)
+		return 0;
+	ws_compute_key(key, accept_buf);
+	return memcmp(accept_buf, accept->s, WS_ACCEPT_KEY_LEN) == 0;
 }
 
 static int ws_complete_handshake(struct tcp_connection *c)
 {
 	int n;
 	struct timeval get;
-	static struct iovec iov[] = {
+	unsigned char accept_buf[WS_ACCEPT_KEY_LEN];
+	char trace_buf[WS_TRACE_MAX];
+	struct iovec iov[] = {
 		{ (void*)WS_HTTP_ACCEPT, WS_HTTP_ACCEPT_LEN }, /* all mandatory headers */
-		{ (void *)ws_accept_buf, WS_ACCEPT_KEY_LEN }, /* the cookie */
+		{ (void *)accept_buf, WS_ACCEPT_KEY_LEN }, /* the cookie */
 		{ (void *)HTTP_END, HTTP_END_LEN }/* message end */
 	};
 
-	str trace_str = { ws_trace_buf, 0 };
+	str trace_str = { trace_buf, 0 };
 	int iov_len = sizeof(iov) / sizeof(struct iovec), i;
 
 	reset_tcp_vars(c->profile.send_threshold);
 	start_expire_timer(get, c->profile.send_threshold);
 
-	/* compute the ws_key in ws_accept_buf */
-	ws_compute_key(&WS_KEY(c));
+	/* compute the ws_key in accept_buf */
+	ws_compute_key(&WS_KEY(c), accept_buf);
 
 	n = _ws_common_writev(c, c->fd, iov, 3, _ws_common_write_tout);
 	stop_expire_timer(get, c->profile.send_threshold,
@@ -1122,7 +1174,7 @@ static int ws_parse_rpl_handshake(struct tcp_connection *c, char *msg, int len)
 	memset(&tmp_msg, 0, sizeof(struct sip_msg));
 	tmp_msg.len = len;
 	tmp_msg.buf = tmp_msg.unparsed = msg;
-	if (parse_headers_aux(&tmp_msg, HDR_EOH_F, 0, 0) < 0) {
+	if (ws_parse_headers(&tmp_msg) < 0) {
 		LM_ERR("cannot parse headers\n%.*s\n", len, msg);
 		goto ws_error;
 	}
@@ -1253,11 +1305,11 @@ static int ws_parse_rpl_handshake(struct tcp_connection *c, char *msg, int len)
 	}
 
 	/* parsing done, free headers */
-	free_hdr_field_lst(tmp_msg.headers);
+	ws_free_parsed_headers(&tmp_msg);
 
 	return 0;
 ws_error:
-	free_hdr_field_lst(tmp_msg.headers);
+	ws_free_parsed_headers(&tmp_msg);
 error:
 	WS_STATE(c) = WS_CON_BAD_REQ;
 	return -1;
@@ -1272,12 +1324,13 @@ static int ws_start_handshake(struct tcp_connection *c)
 	char *ip;
 	char *port;
 	int port_len;
-	static char host_orig_buf[MAX_HOST_LEN];
+	char host_orig_buf[MAX_HOST_LEN];
 	char *h;
 
-	str trace_str = { ws_trace_buf, 0 };
+	char trace_buf[WS_TRACE_MAX];
+	str trace_str = { trace_buf, 0 };
 
-	static struct iovec iov[] = {
+	struct iovec iov[] = {
 		{ (void*)HTTP_GET_METHOD, HTTP_GET_METHOD_LEN },	/* GET method */
 		{ (void*)" ", 1 },
 		{ (void*)NULL, 0 },									/* the resource */
@@ -1493,11 +1546,7 @@ static int ws_read_http(struct tcp_connection *c, struct tcp_req *r)
 				break;
 
 			case H_STARTWS:
-				switch (*p){
-					content_len_beg_case;
-					crlf_default_skip_case;
-				}
-				p++;
+				r->state=H_SKIP;
 				break;
 			case H_SKIP_EMPTY:
 				switch (*p){
@@ -1559,7 +1608,11 @@ static int ws_read_http(struct tcp_connection *c, struct tcp_req *r)
 			change_state_case(H_CONT_LEN4,  'E', 'e', H_CONT_LEN5);
 			change_state_case(H_CONT_LEN5,  'N', 'n', H_CONT_LEN6);
 			change_state_case(H_CONT_LEN6,  'T', 't', H_CONT_LEN7);
-			change_state_case(H_CONT_LEN7,  '-', '_', H_CONT_LEN8);
+			case H_CONT_LEN7:
+				if (*p == '-') r->state=H_CONT_LEN8;
+				else r->state=H_SKIP;
+				p++;
+				break;
 			change_state_case(H_CONT_LEN8,  'L', 'l', H_CONT_LEN9);
 			change_state_case(H_CONT_LEN9,  'E', 'e', H_CONT_LEN10);
 			change_state_case(H_CONT_LEN10, 'N', 'n', H_CONT_LEN11);
@@ -1617,6 +1670,13 @@ static int ws_read_http(struct tcp_connection *c, struct tcp_req *r)
 					case '8':
 					case '9':
 						r->content_len=r->content_len*10+(*p-'0');
+						if (r->content_len>=TCP_BUF_SIZE) {
+							LM_ERR("Content-Length value %d bigger than the "
+								"reading buffer\n", r->content_len);
+							r->error = TCP_REQ_BAD_LEN;
+							r->state = H_SKIP;
+							r->content_len = 0;
+						}
 						break;
 					case '\r':
 					case ' ':

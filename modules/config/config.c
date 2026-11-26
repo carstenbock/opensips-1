@@ -111,29 +111,29 @@ static const param_export_t params[]={
 };
 
 static const mi_export_t mi_cmds[] = {
-	{ "config_reload", 0, 0, 0, {
+	{ "reload", 0, 0, 0, {
 		{mi_config_reload, {NULL}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"config_reload", 0}
 	},
-	{ "config_list", 0, 0, 0, {
+	{ "list", 0, 0, 0, {
 		{mi_config_list, {NULL}},
 		{mi_config_list, {"description", NULL}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"config_list", 0}
 	},
-	{ "config_push", 0, 0, 0, {
+	{ "push", 0, 0, 0, {
 		{mi_config_push, {"name", NULL}},
 		{mi_config_push, {"name", "value", NULL}},
 		{mi_config_push, {"name", "value", "description", NULL}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"config_push", 0}
 	},
-	{ "config_push_bulk", 0, 0, 0, {
+	{ "push_bulk", 0, 0, 0, {
 		{mi_config_push_bulk, {"configs", NULL}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"config_push_bulk", 0}
 	},
-	{ "config_flush", 0, 0, 0, {
+	{ "flush", 0, 0, 0, {
 		{mi_config_flush, {NULL}},
 		{mi_config_flush, {"name", NULL}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"config_flush", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };
@@ -200,9 +200,13 @@ static int mod_init(void)
 	/*verify table versions */
 	if(db_check_table_version(&config_db_func, config_db_con,
 			&config_table, CONFIG_TABLE_VERSION) < 0) {
+		config_db_func.close(config_db_con);
+		config_db_con = NULL;
 		LM_ERR("error during table version check\n");
 		return -1;
 	}
+	config_db_func.close(config_db_con);
+	config_db_con = NULL;
 
 	config_lock = lock_alloc();
 	if (!config_lock || !lock_init(config_lock)) {
@@ -653,8 +657,6 @@ end:
 error:
 	if(result)
 		config_db_func.free_result(config_db_con, result);
-	if (ret)
-		free_config_hash(ret);
 	return NULL;
 }
 
@@ -932,7 +934,7 @@ static mi_response_t *mi_config_flush(const mi_params_t *params,
 		e = hash_entry(*config_hash, name);
 		hash_lock(*config_hash, e);
 		config_val_p *_cv = (config_val_p *)hash_find(*config_hash, e, name);
-		if (*_cv && _cv)
+		if (_cv && *_cv)
 			config_val_flush_hash_it(&count, name, *_cv);
 		hash_unlock(*config_hash, e);
 	} else {

@@ -37,7 +37,7 @@
 
 #define JSONRPC_REQ_NEW		0
 #define JSONRPC_REQ_SENT	1
-#define STREAM_REACTOR_TIMEOUT  1 /* sec */
+#define STREAM_REACTOR_TIMEOUT  1000 /* ms */
 #define STREAM_MAX_PENDING_READS 4
 #define IS_ERR(_err) (errno == _err)
 #define STREAM_ADDR(con) \
@@ -545,7 +545,10 @@ static void handle_reply_jsonrpc(struct stream_con *con)
 		}
 
 		/* advance the buffer */
-		bytes_read = end - buf.s;
+		if (end < buf.s || end - buf.s > buf.len ||
+				end - buf.s > INT_MAX)
+			goto error;
+		bytes_read = (int)(end - buf.s);
 		buf.len -= bytes_read;
 		buf.s += bytes_read;
 

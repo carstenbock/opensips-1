@@ -36,6 +36,7 @@
 
 #include "dprint.h"
 #include "mem/mem.h"
+#include "mem/shm_mem.h"
 #include "re.h"
 
 #include <string.h>
@@ -48,10 +49,15 @@ void subst_expr_free(struct subst_expr* se)
 
 	if (se->replacement.s) pkg_free(se->replacement.s);
 	if (se->re) { regfree(se->re); pkg_free(se->re); };
-	for (i = 0; i < se->n_escapes; i++)
-		if (se->replace[i].type == REPLACE_SPEC
-		    && se->replace[i].u.spec.pvp.pvi.type == PV_IDX_PVAR)
-		        pv_spec_free(se->replace[i].u.spec.pvp.pvi.u.dval);
+	for (i = 0; i < se->n_escapes; i++) {
+		if (se->replace[i].type != REPLACE_SPEC)
+			continue;
+		if (se->replace[i].u.spec.pvp.pvi.type == PV_IDX_PVAR)
+			pv_spec_free(se->replace[i].u.spec.pvp.pvi.u.dval);
+		if ((se->replace[i].u.spec.pvp.pvv_flags & PV_PARAM_PVV_SHM) &&
+		    se->replace[i].u.spec.pvp.pvv.s)
+			shm_free(se->replace[i].u.spec.pvp.pvv.s);
+	}
 	pkg_free(se);
 }
 
@@ -71,7 +77,7 @@ void replace_lst_free(struct replace_lst* l)
 }
 
 #define MAX_REPLACE_WITH 100
-int parse_repl(struct replace_with * rw, char ** begin,
+int parse_repl(struct replace_with * rw, int rw_size, char ** begin,
 				char * end, int *max_token_nb, int with_sep)
 {
 
@@ -94,6 +100,10 @@ int parse_repl(struct replace_with * rw, char ** begin,
 	escape=0;
 	for(;p<end; p++){
 		if (escape){
+			if (token_nb >= rw_size){
+				LM_ERR("too many replacement tokens in %s\n", *begin);
+				goto error;
+			}
 			escape=0;
 			switch (*p){
 				/* special char escapes */
@@ -164,14 +174,13 @@ int parse_repl(struct replace_with * rw, char ** begin,
 			}
 
 			token_nb++;
-
-			if (token_nb>=MAX_REPLACE_WITH){
-				LM_ERR("too many escapes in the replace part %s\n", *begin);
-				goto error;
-			}
 		}else if (*p=='\\') {
 			escape=1;
 		}else if (*p==PV_MARKER) {
+			if (token_nb >= rw_size){
+				LM_ERR("too many replacement tokens in %s\n", *begin);
+				goto error;
+			}
 			s.s = p;
 			s.len = end - s.s;
 			p0 = pv_parse_spec(&s, &rw[token_nb].u.spec);
@@ -263,7 +272,8 @@ found_re:
 		goto error;
 	}
 	repl=p+1;
-	if((rw_no = parse_repl(rw, &p, end, &max_pmatch, WITH_SEP))< 0)
+	if((rw_no = parse_repl(rw, sizeof(rw)/sizeof(rw[0]), &p, end,
+			&max_pmatch, WITH_SEP))< 0)
 		goto error;
 
 
@@ -476,6 +486,10 @@ static int replace_build(const char* match, int nmatch, regmatch_t* pmatch,
 				LM_CRIT("unknown type %d\n", se->replace[r].type);
 				/* ignore it */
 		}
+	}
+	if (dest-rbuf+(end-p)>=REPLACE_BUFFER_SIZE-1){
+		LM_ERR("overflow\n");
+		goto error;
 	}
 	memcpy(dest, p, end-p);
 

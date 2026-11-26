@@ -41,6 +41,8 @@
 #include "../../tsend.h"
 #include "../../trace_api.h"
 #include "../../net/net_tcp_dbg.h"
+#include "../../net/proxy_protocol.h"
+#include "../../parser/msg_parser.h"
 
 #include "tcp_common_defs.h"
 #include "proto_tcp_handler.h"
@@ -54,18 +56,11 @@ static int proto_tcp_init(struct proto_info *pi);
 static int proto_tcp_init_listener(struct socket_info *si);
 static int proto_tcp_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id);
+		unsigned int id, struct sip_msg *msg);
 inline static int _tcp_write_on_socket(struct tcp_connection *c, int fd,
 		char *buf, int len);
 
-/* buffer to be used for reading all TCP SIP messages
-   detached from the actual con - in order to improve
-   paralelism ( process the SIP message while the con
-   can be sent back to main to do more stuff */
-static struct tcp_req tcp_current_req;
-
 #define _tcp_common_write _tcp_write_on_socket
-#define _tcp_common_current_req tcp_current_req
 #include "tcp_common.h"
 
 static int tcp_read_req(struct tcp_connection* con, int* bytes_read);
@@ -88,8 +83,6 @@ static char* trace_filter_route;
 static struct script_route_ref* trace_filter_route_ref = NULL;
 /**/
 
-extern int unix_tcp_sock;
-
 /* default port for TCP protocol */
 static int tcp_port = SIP_PORT;
 
@@ -98,10 +91,6 @@ static int tcp_send_timeout = 100;
 
 /* 1 if TCP connect & write should be async */
 static int tcp_async = 1;
-
-/* Number of milliseconds that a worker will block waiting for a local
- * connect - if connect op exceeds this, it will get passed to TCP main*/
-static int tcp_async_local_connect_timeout = 100;
 
 /* Number of milliseconds that a worker will block waiting for a local
  * write - if write op exceeds this, it will get passed to TCP main*/
@@ -119,12 +108,6 @@ static int tcp_crlf_pingpong = 1;
 /* 0: do not drop single CRLF messages */
 static int tcp_crlf_drop = 0;
 
-/* if the handling/processing (NOT READING) of the SIP messages should
- * be done in parallel (after one SIP msg is read, while processing it, 
- * another READ op may be performed) */
-static int tcp_parallel_handling = 0;
-
-
 static const cmd_export_t cmds[] = {
 	{"proto_init", (cmd_function)proto_tcp_init, {{0, 0, 0}}, 0},
 	{0,0,{{0,0,0}},0}
@@ -140,12 +123,8 @@ static const param_export_t params[] = {
 	{ "tcp_async",                       INT_PARAM, &tcp_async              },
 	{ "tcp_async_max_postponed_chunks",  INT_PARAM,
 											&tcp_async_max_postponed_chunks },
-	{ "tcp_async_local_connect_timeout", INT_PARAM,
-											&tcp_async_local_connect_timeout},
 	{ "tcp_async_local_write_timeout",   INT_PARAM,
 											&tcp_async_local_write_timeout  },
-	{ "tcp_parallel_handling",           INT_PARAM,
-											&tcp_parallel_handling  },
 	{ "trace_destination",               STR_PARAM, &trace_destination_name.s},
 	{ "trace_on",						 INT_PARAM, &trace_is_on_tmp        },
 	{ "trace_filter_route",				 STR_PARAM, &trace_filter_route     },
@@ -153,12 +132,10 @@ static const param_export_t params[] = {
 };
 
 static const mi_export_t mi_cmds[] = {
-	{ "tcp_trace", 0, 0, 0, {
+	{ "trace", 0, 0, 0, {
 		{w_tcp_trace_mi, {0}},
 		{w_tcp_trace_mi_1, {"trace_mode", 0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
+		{EMPTY_MI_RECIPE}}, {"tcp_trace", 0}},
 	{EMPTY_MI_EXPORT}
 };
 
@@ -207,7 +184,7 @@ static int proto_tcp_init(struct proto_info *pi)
 	pi->tran.send			= proto_tcp_send;
 	pi->tran.dst_attr		= tcp_conn_fcntl;
 
-	pi->net.flags			= PROTO_NET_USE_TCP;
+	pi->net.flags			= PROTO_NET_USE_TCP | PROTO_NET_SUPPORTS_PROXY;
 	pi->net.stream.read		= tcp_read_req;
 	pi->net.stream.write		= tcp_async_write;
 	pi->net.report			= tcp_report;
@@ -363,7 +340,8 @@ inline static int _tcp_write_on_socket(struct tcp_connection *c, int fd,
 /*! \brief Finds a tcpconn & sends on it */
 static int proto_tcp_send(const struct socket_info* send_sock,
 									char* buf, unsigned int len,
-									const union sockaddr_union* to, unsigned int id)
+									const union sockaddr_union* to, unsigned int id,
+									struct sip_msg *msg)
 {
 	struct tcp_connection *c;
 	struct tcp_conn_profile prof;
@@ -380,9 +358,11 @@ static int proto_tcp_send(const struct socket_info* send_sock,
 	if (to){
 		su2ip_addr(&ip, to);
 		port=su_getport(to);
-		n = tcp_conn_get(id, &ip, port, PROTO_TCP, NULL, &c, &fd, send_sock);
+		fd = -1;
+		n = tcp_conn_get(id, &ip, port, PROTO_TCP, NULL, &c, send_sock);
 	}else if (id){
-		n = tcp_conn_get(id, 0, 0, PROTO_NONE, NULL, &c, &fd, NULL);
+		fd = -1;
+		n = tcp_conn_get(id, 0, 0, PROTO_NONE, NULL, &c, NULL);
 	}else{
 		LM_CRIT("tcp_send called with null id & to\n");
 		get_time_difference(get,prof.send_threshold,tcp_timeout_con_get);
@@ -409,69 +389,53 @@ static int proto_tcp_send(const struct socket_info* send_sock,
 			tcp_async);
 		/* create tcp connection */
 		if (tcp_async) {
-			n = tcp_async_connect(send_sock, to, &prof,
-					tcp_async_local_connect_timeout, &c, &fd, 1);
+			n = tcp_async_connect(send_sock, to, &prof, &c, &fd);
 			if ( n<0 ) {
 				LM_ERR("async TCP connect failed\n");
 				get_time_difference(get,prof.send_threshold,tcp_timeout_con_get);
 				return -1;
 			}
-			/* connect succeeded, we have a connection */
-			LM_DBG( "Successfully connected from interface %s:%d to %s:%d!\n",
-				ip_addr2a( &c->rcv.src_ip ), c->rcv.src_port,
-				ip_addr2a( &c->rcv.dst_ip ), c->rcv.dst_port );
-
-			if (n==0) {
-				/* attach the write buffer to it */
-				if (tcp_async_add_chunk(c, buf, len, 1) < 0) {
-					LM_ERR("Failed to add the initial write chunk\n");
-					len = -1; /* report an error - let the caller decide what to do */
-				}
-
-				/* trace the message */
-				if ( TRACE_ON( c->flags ) &&
-						check_trace_route( trace_filter_route_ref, c) ) {
-					if ( tcpconn2su( c, &src_su, &dst_su) < 0 ) {
-						LM_ERR("can't create su structures for tracing!\n");
-					} else {
-						trace_message_atonce( PROTO_TCP, c->cid,
-							&src_su, &dst_su,
-							TRANS_TRACE_CONNECT_START, TRANS_TRACE_SUCCESS,
-							&AS_CONNECT_INIT, t_dst );
-					}
-				}
-
-				/* mark the ID of the used connection (tracing purposes) */
-				last_outgoing_tcp_id = c->id;
-				send_sock->last_real_ports->local = c->rcv.dst_port;
-				send_sock->last_real_ports->remote = c->rcv.src_port;
-
-				/* connect is still in progress, break the sending
-				 * flow now (the actual write will be done when
-				 * connect will be completed */
-				LM_DBG("Successfully started async connection \n");
-				sh_log(c->hist, TCP_RELEASED, "send 1, (%d)", c->refcnt);
-				tcp_conn_release(c, 0);
-				return len;
+			if (send_stream_proxy_protocol_v1(c, -1,
+					tcp_send_timeout, 1,
+					msg ? &msg->rcv : NULL, "TCP") < 0) {
+				LM_ERR("Failed to add the outbound PROXY header chunk\n");
+				len = -1; /* report an error - let the caller decide what to do */
+				goto async_connect_done;
 			}
 
-			LM_DBG("First connect attempt succeeded in less than %d ms, "
-				"proceed to writing \n",tcp_async_local_connect_timeout);
-			/* our first connect attempt succeeded - go ahead as normal */
-			/* trace the attempt */
-			if (  TRACE_ON( c->flags ) &&
+			/* attach the write buffer to it */
+			if (tcp_async_add_chunk(c, buf, len, 1) < 0) {
+				LM_ERR("Failed to add the initial write chunk\n");
+				len = -1; /* report an error - let the caller decide what to do */
+			}
+
+			/* trace the message */
+			if ( TRACE_ON( c->flags ) &&
 					check_trace_route( trace_filter_route_ref, c) ) {
-				c->proto_flags |= F_TCP_CONN_TRACED;
 				if ( tcpconn2su( c, &src_su, &dst_su) < 0 ) {
 					LM_ERR("can't create su structures for tracing!\n");
 				} else {
-					trace_message_atonce( PROTO_TCP, c->cid, &src_su, &dst_su,
-						TRANS_TRACE_CONNECTED, TRANS_TRACE_SUCCESS,
-						&ASYNC_CONNECT_OK, t_dst );
+					trace_message_atonce( PROTO_TCP, c->cid,
+						&src_su, &dst_su,
+						TRANS_TRACE_CONNECT_START, TRANS_TRACE_SUCCESS,
+						&AS_CONNECT_INIT, t_dst );
 				}
 			}
+
+			/* mark the ID of the used connection (tracing purposes) */
+			last_outgoing_tcp_id = c->id;
+			send_sock->last_real_ports->local = c->rcv.dst_port;
+			send_sock->last_real_ports->remote = c->rcv.src_port;
+
+			/* connect is still in progress, break the sending
+			 * flow now (the actual write will be done when
+			 * connect will be completed */
+async_connect_done:
+			sh_log(c->hist, TCP_RELEASED, "send 1, (%d)", c->refcnt);
+			tcp_conn_release(c, 0);
+			return len;
 		} else {
-			if ((c=tcp_sync_connect(send_sock, to, &prof, &fd, 1))==0) {
+			if ((c=tcp_sync_connect(send_sock, to, &prof, &fd))==0) {
 				LM_ERR("connect failed\n");
 				get_time_difference(get,prof.send_threshold,tcp_timeout_con_get);
 				return -1;
@@ -489,9 +453,6 @@ static int proto_tcp_send(const struct socket_info* send_sock,
 				}
 			}
 
-			LM_DBG( "Successfully connected from interface %s:%d to %s:%d!\n",
-				ip_addr2a( &c->rcv.src_ip ), c->rcv.src_port,
-				ip_addr2a( &c->rcv.dst_ip ), c->rcv.dst_port );
 		}
 
 		goto send_it;
@@ -512,75 +473,78 @@ static int proto_tcp_send(const struct socket_info* send_sock,
 
 	/* now we have a connection, let's see what we can do with it */
 	/* BE CAREFUL now as we need to release the conn before exiting !!! */
-	if (fd==-1) {
-		/* connection is not writable because of its state - can we append
-		 * data to it for later writting (async writting)? */
-		if (c->state==S_CONN_CONNECTING) {
-			/* the connection is currently in the process of getting
-			 * connected - let's append our send chunk as well - just in
-			 * case we ever manage to get through */
-			LM_DBG("We have acquired a TCP connection which is still "
-				"pending to connect - delaying write \n");
-			n = tcp_async_add_chunk(c,buf,len,1);
-			if (n < 0) {
-				LM_ERR("Failed to add another write chunk to %p\n",c);
-				/* we failed due to internal errors - put the
-				 * connection back */
-				sh_log(c->hist, TCP_RELEASED, "send 2, (%d)", c->refcnt);
-				tcp_conn_release(c, 0);
-				return -1;
-			}
+	if (c->state==S_CONN_CONNECTING) {
+		/* the connection is currently in the process of getting
+		 * connected - let's append our send chunk as well - just in
+		 * case we ever manage to get through */
+		LM_DBG("We have acquired a TCP connection which is still "
+			"pending to connect - delaying write \n");
 
-			/* mark the ID of the used connection (tracing purposes) */
-			last_outgoing_tcp_id = c->id;
-			send_sock->last_real_ports->local = c->rcv.dst_port;
-			send_sock->last_real_ports->remote = c->rcv.src_port;
-
-			/* we successfully added our write chunk - success */
-			sh_log(c->hist, TCP_RELEASED, "send 3, (%d)", c->refcnt);
-			tcp_conn_release(c, 0);
-			return len;
-		} else {
-			/* the FD transfer failed (we have an established conn, 
-			 * but returned fd is -1) -> leave the conn alone, return error
-			 * for the write op, nothing to do about it */
+		if (send_stream_proxy_protocol_v1(c, -1,
+				tcp_send_timeout, 1,
+				msg ? &msg->rcv : NULL, "TCP") < 0) {
+			LM_ERR("Failed to add the outbound PROXY header chunk\n");
 			sh_log(c->hist, TCP_RELEASED, "send 4, (%d)", c->refcnt);
 			tcp_conn_release(c, 0);
 			return -1;
 		}
+
+		n = tcp_async_add_chunk(c,buf,len,1);
+		if (n < 0) {
+			LM_ERR("Failed to add another write chunk to %p\n",c);
+			/* we failed due to internal errors - put the
+			 * connection back */
+			sh_log(c->hist, TCP_RELEASED, "send 2, (%d)", c->refcnt);
+			tcp_conn_release(c, 0);
+			return -1;
+		}
+
+		/* mark the ID of the used connection (tracing purposes) */
+		last_outgoing_tcp_id = c->id;
+		send_sock->last_real_ports->local = c->rcv.dst_port;
+		send_sock->last_real_ports->remote = c->rcv.src_port;
+
+		/* we successfully added our write chunk - success */
+		sh_log(c->hist, TCP_RELEASED, "send 3, (%d)", c->refcnt);
+		tcp_conn_release(c, 0);
+		return len;
+	} else if (c->state != S_CONN_OK) {
+		/* the connection is not writable because of its state */
+		sh_log(c->hist, TCP_RELEASED, "send 4, (%d)", c->refcnt);
+		tcp_conn_release(c, 0);
+		return -1;
 	}
 
 
 send_it:
-	LM_DBG("sending via fd %d...\n",fd);
-
-	start_expire_timer(snd,prof.send_threshold);
-
-	n = tcp_write_on_socket(c, fd, buf, len,
-			tcp_send_timeout, tcp_async_local_write_timeout);
-
-	get_time_difference(snd,prof.send_threshold,tcp_timeout_send);
-	stop_expire_timer(get,prof.send_threshold,"tcp ops",buf,(int)len,1);
-
-	tcp_conn_reset_lifetime(c);
-
-	LM_DBG("after write: c= %p n/len=%d/%d fd=%d\n",c, n, len, fd);
-	/* LM_DBG("buf=\n%.*s\n", (int)len, buf); */
-	if (n<0){
-		LM_ERR("failed to send on conn %p / %u\n", c, c->id);
+	LM_DBG("sending on conn %p...\n", c);
+	if (send_stream_proxy_protocol_v1(c, -1,
+			tcp_send_timeout, 1,
+			msg ? &msg->rcv : NULL, "TCP") < 0) {
+		LM_ERR("failed to send outbound PROXY header\n");
 		c->state=S_CONN_BAD;
-		if (c->proc_id != process_no)
-			close(fd);
-
 		sh_log(c->hist, TCP_RELEASED, "send 5, (%d)", c->refcnt);
 		tcp_conn_release(c, 0);
 		return -1;
 	}
 
-	/* only close the FD if not already in the context of our process
-	either we just connected, or main sent us the FD */
-	if (c->proc_id != process_no)
-		close(fd);
+	start_expire_timer(snd,prof.send_threshold);
+
+	n = tcp_write_on_socket(c, -1, buf, len,
+			tcp_send_timeout, tcp_async_local_write_timeout);
+
+	get_time_difference(snd,prof.send_threshold,tcp_timeout_send);
+	stop_expire_timer(get,prof.send_threshold,"tcp ops",buf,(int)len,1);
+
+	LM_DBG("after write: c=%p n/len=%d/%d\n", c, n, len);
+	/* LM_DBG("buf=\n%.*s\n", (int)len, buf); */
+	if (n<0){
+		LM_ERR("failed to send on conn %p / %u\n", c, c->id);
+		c->state=S_CONN_BAD;
+		sh_log(c->hist, TCP_RELEASED, "send 5, (%d)", c->refcnt);
+		tcp_conn_release(c, 0);
+		return -1;
+	}
 
 	/* mark the ID of the used connection (tracing purposes) */
 	last_outgoing_tcp_id = c->id;
@@ -651,7 +615,7 @@ again:
  */
 static int tcp_read_req(struct tcp_connection* con, int* bytes_read)
 {
-	int bytes, rc;
+	int bytes, rc = 0;
 	int total_bytes;
 	struct tcp_req* req;
 
@@ -679,13 +643,20 @@ static int tcp_read_req(struct tcp_connection* con, int* bytes_read)
 	bytes=-1;
 	total_bytes=0;
 
-	if (con->con_req) {
-		req=con->con_req;
-		LM_DBG("Using the per connection buff for conn %p\n",con);
-	} else {
-		LM_DBG("Using the global ( per process ) buff for conn %p\n",con);
-		init_tcp_req(&tcp_current_req, 0);
-		req=&tcp_current_req;
+	req = tcp_conn_get_req(con);
+	if (!req)
+		goto error;
+	if (con->msg_attempts == 0)
+		init_tcp_req(req, 0);
+	LM_DBG("Using the connection buff for conn %p\n", con);
+
+	switch (check_tcp_proxy_protocol(con)) {
+	case 0:
+		goto done;
+	case -1:
+		goto error;
+	case 1:
+		break;
 	}
 
 again:
@@ -734,24 +705,21 @@ again:
 		goto error;
 	}
 
-	int parallel_handling = tcp_is_default_profile(con->profile) ?
-			tcp_parallel_handling : (con->profile.parallel_read == 2);
 	int max_chunks = tcp_attr_isset(con, TCP_ATTR_MAX_MSG_CHUNKS) ?
 			con->profile.attrs[TCP_ATTR_MAX_MSG_CHUNKS] : tcp_max_msg_chunks;
 
-	switch ((rc = tcp_handle_req(req,con,max_chunks,parallel_handling))){
+	switch ((rc = tcp_handle_req(req, con, max_chunks))){
 		case 1:
 			goto again;
 		case -1:
 			goto error;
 	}
 
-	LM_DBG("tcp_read_req end for conn %p, req is %p\n",con,con->con_req);
+	LM_DBG("tcp_read_req end for conn %p, req is %p\n",con,req);
 done:
 	if (bytes_read) *bytes_read=total_bytes;
 
-	return rc == 2   ?  1  /* connection is already released! */
-	       /* 0,1? */:  0; /* connection will be released */
+	return 0;
 error:
 	/* connection will be released as ERROR */
 	return -1;

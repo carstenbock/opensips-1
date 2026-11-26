@@ -35,6 +35,17 @@ static inline void bin_parse_headers(struct tcp_req *req){
 
 	px = (unsigned int*)(req->buf + MARKER_SIZE);
 	req->content_len = (*px);
+	if (req->content_len < MIN_BIN_PACKET_SIZE) {
+		LM_ERR("invalid BIN packet size %u\n", req->content_len);
+		req->error = TCP_REQ_BAD_LEN;
+		return;
+	}
+	if (req->content_len > BIN_MAX_BUF_LEN) {
+		LM_ERR("BIN packet size %u exceeds max size %zu\n",
+				req->content_len, (size_t)BIN_MAX_BUF_LEN);
+		req->error = TCP_REQ_BAD_LEN;
+		return;
+	}
 	if(req->pos - req->buf == req->content_len){
 		LM_DBG("received a COMPLETE message\n");
 		req->complete = 1;
@@ -49,13 +60,25 @@ static inline void bin_parse_headers(struct tcp_req *req){
 	}
 }
 
+static inline int bin_receive_msg(char *buf, int len, struct receive_info *rcv,
+		void *data, int data_len)
+{
+	(void)len;
+	(void)data;
+	(void)data_len;
+
+	call_callbacks(buf, rcv);
+	return 0;
+}
+
 static inline int bin_handle_req(struct tcp_req *req,
-							struct tcp_connection *con, int _max_msg_chunks)
+								struct tcp_connection *con, int _max_msg_chunks)
 {
 	long size;
+	struct receive_info local_rcv;
 
 	if (req->complete){
-		/* update the timeout - we successfully read the request */
+		/* refresh connection lifetime after successful read progress */
 		tcp_conn_reset_lifetime(con);
 		con->timeout = con->lifetime;
 
@@ -72,28 +95,21 @@ static inline int bin_handle_req(struct tcp_req *req,
 			 * the connection */
 			LM_DBG("Nothing more to read on TCP conn %p, currently in state %d \n",
 				con,con->state);
-			if (req != &_bin_common_current_req) {
-				/* we have the buffer in the connection tied buff -
-				 *	detach it , release the conn and free it afterwards */
-				con->con_req = NULL;
-			}
 		} else {
 			LM_DBG("We still have things on the pipe - "
 				"keeping connection \n");
 		}
 
-		/* give the message to the registered functions */
-		call_callbacks(req->buf, &con->rcv);
-
-
-		if (!size && req != &_bin_common_current_req) {
-			/* if we no longer need this tcp_req
-			 * we can free it now */
-			shm_free(req);
-			con->con_req = NULL;
+		local_rcv = con->rcv;
+		if (tcp_dispatch_msg(req->buf,
+				req->parsed - req->buf, &local_rcv,
+				NULL, 0) < 0) {
+			LM_ERR("failed to deliver BIN message\n");
+			goto error;
 		}
 
-		con->msg_attempts = 0;
+
+			con->msg_attempts = 0;
 
 		if (size) {
 			memmove(req->buf, req->parsed, size);
@@ -106,44 +122,14 @@ static inline int bin_handle_req(struct tcp_req *req,
 
 	} else {
 		/* request not complete - check the if the thresholds are exceeded */
-		if (con->msg_attempts==0)
-			/* if first iteration, set a short timeout for reading
-			 * a whole SIP message */
-			con->timeout = get_ticks() + tcp_max_msg_time;
+		if (con->msg_attempts == 0)
+			tcp_conn_set_msg_read_timeout(con);
 
 		con->msg_attempts ++;
 		if (con->msg_attempts == _max_msg_chunks) {
 			LM_ERR("Made %u read attempts but message is not complete yet - "
 				   "closing connection \n",con->msg_attempts);
 			goto error;
-		}
-
-		if (req == &_bin_common_current_req) {
-			/* let's duplicate this - most likely another conn will come in */
-
-			LM_DBG("We didn't manage to read a full request\n");
-			con->con_req = shm_malloc(sizeof(struct tcp_req));
-			if (con->con_req == NULL) {
-				LM_ERR("No more mem for dynamic con request buffer\n");
-				goto error;
-			}
-
-			if (req->pos != req->buf) {
-				/* we have read some bytes */
-				memcpy(con->con_req->buf,req->buf,req->pos-req->buf);
-				con->con_req->pos = con->con_req->buf + (req->pos-req->buf);
-			} else {
-				con->con_req->pos = con->con_req->buf;
-			}
-
-			if (req->parsed != req->buf)
-				con->con_req->parsed =con->con_req->buf+(req->parsed-req->buf);
-			else
-				con->con_req->parsed = con->con_req->buf;
-
-			con->con_req->complete=req->complete;
-			con->con_req->content_len=req->content_len;
-			con->con_req->error = req->error;
 		}
 	}
 

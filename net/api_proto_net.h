@@ -31,11 +31,14 @@
 /* api_proto_net flags */
 #define PROTO_NET_USE_TCP	(1<<0) /* set by proto's that are based on TCP */
 #define PROTO_NET_USE_UDP	(1<<1) /* set by proto's that are based on UDP */
+#define PROTO_NET_SUPPORTS_PROXY	(1<<2) /* listener may use proxy_protocol */
 
 
 typedef int  (*proto_net_dgram_read_f)(const struct socket_info *si, int *len);
 
 typedef int  (*proto_net_stream_write_f)(struct tcp_connection *c, int fd);
+typedef int  (*proto_net_stream_handle_f)(char *msg, int len,
+		struct receive_info *rcv, void *data, int data_len);
 
 /**
  * Read a complete SIP message from the network, including its body/payload and
@@ -57,8 +60,11 @@ typedef int  (*proto_net_stream_write_f)(struct tcp_connection *c, int fd);
  */
 typedef int  (*proto_net_stream_read_f)(struct tcp_connection *c, int *len);
 typedef int  (*proto_net_stream_conn_init_f)(struct tcp_connection *c);
+typedef int  (*proto_net_stream_conn_connect_f)(struct tcp_connection *c);
 typedef void (*proto_net_stream_conn_clean_f)(struct tcp_connection *c);
 typedef int  (*proto_net_stream_extra_match_f)(struct tcp_connection *c, void *id);
+typedef int  (*proto_net_stream_conn_dump_f)(struct tcp_connection *c,
+		void *data);
 
 typedef void (*proto_net_report_f)( int type, unsigned long long conn_id,
 		int conn_flags, void *extra);
@@ -72,11 +78,14 @@ struct api_proto_net {
 		struct {
 			unsigned			async_chunks;
 			proto_net_stream_read_f		read;
+			proto_net_stream_handle_f	handle;
 			proto_net_stream_write_f	write;
 			struct {
 				proto_net_stream_conn_init_f   init;
+				proto_net_stream_conn_connect_f connect;
 				proto_net_stream_conn_clean_f  clean;
 				proto_net_stream_extra_match_f match;
+				proto_net_stream_conn_dump_f dump;
 			} conn;
 		} stream;
 	};

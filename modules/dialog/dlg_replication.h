@@ -36,8 +36,9 @@
 
 #define DLG_BIN_V3      3
 #define DLG_BIN_V4      4
+#define DLG_BIN_V5      5
 
-#define BIN_VERSION DLG_BIN_V4
+#define BIN_VERSION DLG_BIN_V5
 
 extern int dialog_repl_cluster;
 extern int profile_repl_cluster;
@@ -50,6 +51,7 @@ extern struct clusterer_binds clusterer_api;
 extern str shtag_dlg_val;
 
 extern int cluster_auto_sync;
+extern int raise_events_as_backup;
 
 int dlg_init_clustering(void);
 
@@ -74,4 +76,3 @@ int get_shtag_state(struct dlg_cell *dlg);
 int set_dlg_shtag(struct dlg_cell *dlg, str *tag_name);
 
 #endif /* _DIALOG_DLG_REPLICATION_H_ */
-

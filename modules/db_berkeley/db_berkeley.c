@@ -88,8 +88,7 @@ static const param_export_t params[] = {
 static const mi_export_t mi_cmds[] = {
 	{ MI_BDB_RELOAD, 0, 0, 0, {
 		{mi_bdb_reload, {"table_path", 0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{EMPTY_MI_EXPORT}
 };
 
@@ -954,8 +953,10 @@ int _bdb_delete_cursor(db_con_t* _h, db_key_t* _k, db_op_t* _op, db_val_t* _v, i
 
 	/* create an empty db_res_t which gets returned even if no result */
 	_r = db_new_result();
-	if (!_r)
-	{	LM_ERR("no memory for result \n");
+	if (!_r) {
+		LM_ERR("no memory for result \n");
+		ret = -1;
+		goto error;
 	}
 
 	RES_ROW_N(_r) = 0;

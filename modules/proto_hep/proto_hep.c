@@ -63,16 +63,18 @@ static int hep_tcp_or_tls_read_req(struct tcp_connection* con, int* bytes_read,
 static int hep_udp_read_req(const struct socket_info* si, int* bytes_read);
 static int hep_udp_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id);
+		unsigned int id, struct sip_msg *msg);
 static int hep_tcp_or_tls_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id, unsigned int is_tls);
+		unsigned int id, unsigned int is_tls, struct sip_msg *msg);
 static int hep_tcp_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id);
+		unsigned int id, struct sip_msg *msg);
 static int hep_tls_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id);
+		unsigned int id, struct sip_msg *msg);
+static int hep_receive_msg(char *buf, int len, struct receive_info *ri,
+		void *data, int data_len);
 static void update_recv_info(struct receive_info* ri, struct hep_desc* h);
 void free_hep_context(void* ptr);
 static int proto_hep_tls_conn_init(struct tcp_connection* c);
@@ -84,10 +86,8 @@ static int hep_async = 1;
 static int hep_send_timeout = 100;
 static int hep_async_max_postponed_chunks = 32;
 static int hep_max_msg_chunks = 32;
-static int hep_async_local_connect_timeout = 100;
 static int hep_async_local_write_timeout = 10;
 static int hep_tls_handshake_timeout = 100;
-static int hep_tls_async_handshake_connect_timeout = 10;
 
 int hep_ctx_idx = 0;
 int hep_capture_id = 1;
@@ -103,7 +103,6 @@ str homer5_delim = {":", 0};
 compression_api_t compression_api;
 load_compression_f load_compression;
 
-static struct tcp_req hep_current_req;
 /* we consider that different messages may contain different versions of hep
  * so we need to know what is the current version of hep */
 static int hep_current_proto;
@@ -136,7 +135,6 @@ static const param_export_t params[] = {
 	{ "hep_async_max_postponed_chunks",  INT_PARAM, &hep_async_max_postponed_chunks },
 	/* what protocol shall be used: 1, 2 or 3 */
 	{ "hep_capture_id",                  INT_PARAM, &hep_capture_id                 },
-	{ "hep_async_local_connect_timeout", INT_PARAM, &hep_async_local_connect_timeout},
 	{ "hep_async_local_write_timeout",   INT_PARAM, &hep_async_local_write_timeout  },
 	{ "compressed_payload",              INT_PARAM, &payload_compression            },
 	{ "hep_id",                          STR_PARAM|USE_FUNC_PARAM, parse_hep_id     },
@@ -239,7 +237,7 @@ static int mod_init(void)
 		}
 	}
 
-	hep_ctx_idx = context_register_ptr(CONTEXT_GLOBAL, 0);
+	hep_ctx_idx = context_register_ptr(CONTEXT_GLOBAL, free_hep_context);
 	homer5_delim.len = strlen(homer5_delim.s);
 
 	local_su.sin.sin_addr.s_addr = TRACE_INADDR_LOOPBACK;
@@ -268,6 +266,9 @@ void free_hep_context(void *ptr)
 	/* for version 3 we may have custom chunks which are in shm so we
 	 * need to free them */
 	if (h->version == 3) {
+		if (h->u.hepv3.payload_chunk_free)
+			pkg_free(h->u.hepv3.payload_chunk.data);
+
 		it = h->u.hepv3.chunk_list;
 		while (it) {
 			if (foo) {
@@ -319,6 +320,7 @@ static int proto_hep_init_tcp(struct proto_info* pi)
 	pi->net.flags          = PROTO_NET_USE_TCP;
 
 	pi->net.stream.read    = hep_tcp_read_req;
+	pi->net.stream.handle = hep_receive_msg;
 	pi->net.stream.write   = tcp_async_write;
 
 	pi->tran.send          = hep_tcp_send;
@@ -344,6 +346,7 @@ static int proto_hep_init_tls(struct proto_info* pi)
 	pi->net.flags           = PROTO_NET_USE_TCP;
 
 	pi->net.stream.read     = hep_tls_read_req;
+	pi->net.stream.handle = hep_receive_msg;
 	pi->net.stream.write    = hep_tls_async_write;
 
 	pi->tran.send           = hep_tls_send;
@@ -376,9 +379,10 @@ static int proto_hep_bind_udp_listener(struct socket_info* si)
 
 static int hep_udp_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id)
+		unsigned int id, struct sip_msg *msg)
 {
 	int n, tolen;
+
 	tolen = sockaddru_len(*to);
 
 again:
@@ -398,21 +402,21 @@ again:
 
 static int hep_tcp_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id)
+		unsigned int id, struct sip_msg *msg)
 {
-	return hep_tcp_or_tls_send(send_sock, buf, len, to, id, 0);
+	return hep_tcp_or_tls_send(send_sock, buf, len, to, id, 0, msg);
 }
 
 static int hep_tls_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id)
+		unsigned int id, struct sip_msg *msg)
 {
-	return hep_tcp_or_tls_send(send_sock, buf, len, to, id, 1);
+	return hep_tcp_or_tls_send(send_sock, buf, len, to, id, 1, msg);
 }
 
 static int hep_tcp_or_tls_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id, unsigned int is_tls)
+		unsigned int id, unsigned int is_tls, struct sip_msg *msg)
 {
 	struct tcp_connection* c;
 	int port = 0;
@@ -422,9 +426,12 @@ static int hep_tcp_or_tls_send(const struct socket_info* send_sock,
 	if (to) {
 		su2ip_addr(&ip, to);
 		port=su_getport(to);
-		n = tcp_conn_get(id, &ip, port, is_tls ? PROTO_HEP_TLS : PROTO_HEP_TCP, NULL, &c, &fd, send_sock);
+		fd = -1;
+		n = tcp_conn_get(id, &ip, port,
+			is_tls ? PROTO_HEP_TLS : PROTO_HEP_TCP, NULL, &c, send_sock);
 	} else if (id) {
-		n = tcp_conn_get(id, 0, 0, PROTO_NONE, NULL, &c, &fd, NULL);
+		fd = -1;
+		n = tcp_conn_get(id, 0, 0, PROTO_NONE, NULL, &c, NULL);
 	} else {
 		LM_CRIT("tcp_send called with null id & to\n");
 		return -1;
@@ -451,65 +458,27 @@ static int hep_tcp_or_tls_send(const struct socket_info* send_sock,
 		LM_DBG("no open tcp connection found, opening new one, async = %d\n", hep_async);
 		/* create tcp connection */
 		if (hep_async) {
-			n = tcp_async_connect(send_sock, to, &prof,
-					hep_async_local_connect_timeout, &c, &fd, 1);
+			n = tcp_async_connect(send_sock, to, &prof, &c, &fd);
 			if (n < 0) {
 				LM_ERR("async TCP connect failed\n");
 				return -1;
 			}
-			/* connect succeeded, we have a connection */
-			if (n == 0) {
-				/* attach the write buffer to it */
-				if (tcp_async_add_chunk(c, buf, len, 1) < 0) {
-					LM_ERR("Failed to add the initial write chunk\n");
-					len = -1; /* report an error - let the caller decide what to do */
-				}
-
-				/* mark the ID of the used connection (tracing purposes) */
-				last_outgoing_tcp_id = c->id;
-				send_sock->last_real_ports->local = c->rcv.dst_port;
-				send_sock->last_real_ports->remote = c->rcv.src_port;
-				/* connect is still in progress, break the sending
-				 * flow now (the actual write will be done when
-				 * connect will be completed */
-				LM_DBG("Successfully started async connection \n");
-				tcp_conn_release(c, 0);
-				return len;
+			/* attach the write buffer to it */
+			if (tcp_async_add_chunk(c, buf, len, 1) < 0) {
+				LM_ERR("Failed to add the initial write chunk\n");
+				len = -1; /* report an error - let the caller decide what to do */
 			}
-			if (is_tls) {
-				LM_DBG("first TCP connect attempt succeeded in less than %dms, "
-					"proceed to TLS connect \n", hep_async_local_connect_timeout);
-				/* succesful TCP conection done - starting async SSL connect */
 
-				lock_get(&c->write_lock);
-				/* we connect under lock to make sure no one else is reading our
-				 * connect status */
-				tls_mgm_api.tls_update_fd(c, fd);
-				n = tls_mgm_api.tls_async_connect(c, fd,
-					hep_tls_async_handshake_connect_timeout, NULL);
-				lock_release(&c->write_lock);
-				if (n < 0) {
-					LM_ERR("failed async TLS connect\n");
-					tcp_conn_release(c, 0);
-					return -1;
-				}
-				if (n == 0) {
-					/* attach the write buffer to it */
-					if (tcp_async_add_chunk(c, buf, len, 1) < 0) {
-						LM_ERR("failed to add the initial write chunk\n");
-						tcp_conn_release(c, 0);
-						return -1;
-					}
-
-					LM_DBG("successfully started async TLS connection\n");
-					tcp_conn_release(c, 1);
-					return len;
-				}
-
-				LM_DBG("first TLS handshake attempt succeeded in less than %dms, "
-					"proceed to writing \n", hep_tls_async_handshake_connect_timeout);
-			}
-		} else if ((c = tcp_sync_connect(send_sock, to, &prof, &fd, 1)) == 0) {
+			/* mark the ID of the used connection (tracing purposes) */
+			last_outgoing_tcp_id = c->id;
+			send_sock->last_real_ports->local = c->rcv.dst_port;
+			send_sock->last_real_ports->remote = c->rcv.src_port;
+			/* connect is still in progress, break the sending
+			 * flow now (the actual write will be done when
+			 * connect will be completed */
+			tcp_conn_release(c, 0);
+			return len;
+		} else if ((c = tcp_sync_connect(send_sock, to, &prof, &fd)) == 0) {
 			LM_ERR("connect failed\n");
 			return -1;
 		}
@@ -518,67 +487,51 @@ static int hep_tcp_or_tls_send(const struct socket_info* send_sock,
 
 	/* now we have a connection, let's see what we can do with it */
 	/* BE CAREFUL now as we need to release the conn before exiting !!! */
-	if (fd == -1) {
-		/* connection is not writable because of its state - can we append
-		 * data to it for later writting (async writting)? */
-		if (c->state == S_CONN_CONNECTING) {
-			/* the connection is currently in the process of getting
-			 * connected - let's append our send chunk as well - just in
-			 * case we ever manage to get through */
-			LM_DBG("We have acquired a TCP connection which is still "
-				"pending to connect - delaying write \n");
-			n = tcp_async_add_chunk(c,buf,len,1);
-			if (n < 0) {
-				LM_ERR("Failed to add another write chunk to %p\n",c);
-				/* we failed due to internal errors - put the
-				 * connection back */
-				tcp_conn_release(c, 0);
-				return -1;
-			}
-
-			/* mark the ID of the used connection (tracing purposes) */
-			last_outgoing_tcp_id = c->id;
-			send_sock->last_real_ports->local = c->rcv.dst_port;
-			send_sock->last_real_ports->remote = c->rcv.src_port;
-
-			/* we successfully added our write chunk - success */
-			tcp_conn_release(c, 0);
-			return len;
-		} else {
-			/* return error, nothing to do about it */
+	if (c->state == S_CONN_CONNECTING) {
+		/* the connection is currently in the process of getting
+		 * connected - let's append our send chunk as well - just in
+		 * case we ever manage to get through */
+		LM_DBG("We have acquired a TCP connection which is still "
+			"pending to connect - delaying write \n");
+		n = tcp_async_add_chunk(c,buf,len,1);
+		if (n < 0) {
+			LM_ERR("Failed to add another write chunk to %p\n",c);
+			/* we failed due to internal errors - put the
+			 * connection back */
 			tcp_conn_release(c, 0);
 			return -1;
 		}
-	}
 
-send_it:
-	LM_DBG("sending via fd %d...\n",fd);
+		/* mark the ID of the used connection (tracing purposes) */
+		last_outgoing_tcp_id = c->id;
+		send_sock->last_real_ports->local = c->rcv.dst_port;
+		send_sock->last_real_ports->remote = c->rcv.src_port;
 
-	if (is_tls) {
-		n = hep_tls_write_on_socket(c, fd, buf, len);
-	} else {
-		n = tcp_write_on_socket(c, fd, buf, len,
-			hep_send_timeout, hep_async_local_write_timeout);
-	}
-
-	tcp_conn_reset_lifetime(c);
-
-	LM_DBG("after write: c= %p n/len=%d/%d fd=%d\n", c, n, len, fd);
-	/* LM_DBG("buf=\n%.*s\n", (int)len, buf); */
-	if (n < 0){
-		LM_ERR("failed to send\n");
-		c->state = S_CONN_BAD;
-		if (c->proc_id != process_no) {
-			close(fd);
-		}
+		/* we successfully added our write chunk - success */
+		tcp_conn_release(c, 0);
+		return len;
+	} else if (c->state != S_CONN_OK) {
+		/* return error, nothing to do about it */
 		tcp_conn_release(c, 0);
 		return -1;
 	}
 
-	/* only close the FD if not already in the context of our process
-	either we just connected, or main sent us the FD */
-	if (c->proc_id != process_no) {
-		close(fd);
+send_it:
+	LM_DBG("sending on conn %p...\n", c);
+	if (is_tls) {
+		n = hep_tls_write_on_socket(c, -1, buf, len);
+	} else {
+		n = tcp_write_on_socket(c, -1, buf, len,
+			hep_send_timeout, hep_async_local_write_timeout);
+	}
+
+	LM_DBG("after write: c=%p n/len=%d/%d\n", c, n, len);
+	/* LM_DBG("buf=\n%.*s\n", (int)len, buf); */
+	if (n < 0){
+		LM_ERR("failed to send\n");
+		c->state = S_CONN_BAD;
+		tcp_conn_release(c, 0);
+		return -1;
 	}
 
 	/* mark the ID of the used connection (tracing purposes) */
@@ -671,6 +624,93 @@ again:
 	return bytes_read;
 }
 
+static int hep_receive_msg(char *buf, int len, struct receive_info *ri,
+		void *data, int data_len)
+{
+	struct hep_context *hep_ctx = NULL;
+	struct receive_info local_rcv;
+	context_p ctx = NULL;
+	str msg;
+	int ret = 0;
+	(void)data;
+	(void)data_len;
+
+	if ((hep_ctx = shm_malloc(sizeof(struct hep_context))) == NULL) {
+		LM_ERR("no more shared memory!\n");
+		return -1;
+	}
+
+	memset(hep_ctx, 0, sizeof(struct hep_context));
+	memcpy(&hep_ctx->ri, ri, sizeof(struct receive_info));
+	local_rcv = *ri;
+
+	if (len < 4) {
+		LM_ERR("invalid message! too short!\n");
+		goto error_free_hep;
+	}
+
+	if (!memcmp(buf, HEP_HEADER_ID, HEP_HEADER_ID_LEN)) {
+		if (unpack_hepv3(buf, len, &hep_ctx->h)) {
+			LM_ERR("hepv3 unpacking failed\n");
+			goto error_free_hep;
+		}
+	} else {
+		if (unpack_hepv12(buf, len, &hep_ctx->h)) {
+			LM_ERR("hepv12 unpacking failed\n");
+			goto error_free_hep;
+		}
+	}
+
+	if ((ctx = context_alloc(CONTEXT_GLOBAL)) == NULL) {
+		LM_ERR("failed to allocate new context! skipping...\n");
+		goto error_free_hep;
+	}
+
+	memset(ctx, 0, context_size(CONTEXT_GLOBAL));
+	context_put_ptr(CONTEXT_GLOBAL, ctx, hep_ctx_idx, hep_ctx);
+
+	update_recv_info(&local_rcv, &hep_ctx->h);
+
+	set_global_context(ctx);
+	ret = run_hep_cbs();
+	set_global_context(NULL);
+	if (ret < 0) {
+		LM_ERR("failed to run hep callbacks\n");
+		goto error_free_ctx;
+	}
+
+	if (hep_ctx->h.version == 3) {
+		msg.len =
+			hep_ctx->h.u.hepv3.payload_chunk.chunk.length - sizeof(hep_chunk_t);
+		msg.s = hep_ctx->h.u.hepv3.payload_chunk.data;
+	} else {
+		msg.len = len - hep_ctx->h.u.hepv12.hdr.hp_l;
+		msg.s = buf + hep_ctx->h.u.hepv12.hdr.hp_l;
+
+		if (hep_ctx->h.u.hepv12.hdr.hp_v == 2) {
+			msg.s += sizeof(struct hep_timehdr);
+			msg.len -= sizeof(struct hep_timehdr);
+		}
+	}
+
+	if (ret != HEP_SCRIPT_SKIP) {
+		if (receive_msg(msg.s, msg.len, &local_rcv, ctx, 0) < 0)
+			LM_ERR("receive_msg failed \n");
+	} else {
+		context_destroy(CONTEXT_GLOBAL, ctx);
+		context_free(ctx);
+	}
+	return 0;
+
+error_free_ctx:
+	context_destroy(CONTEXT_GLOBAL, ctx);
+	context_free(ctx);
+error_free_hep:
+	if (!ctx)
+		free_hep_context(hep_ctx);
+	return -1;
+}
+
 static inline int hep_handle_req(struct tcp_req* req,
 							struct tcp_connection* con, int _max_msg_chunks)
 {
@@ -679,13 +719,8 @@ static inline int hep_handle_req(struct tcp_req* req,
 	int msg_len;
 	long size;
 
-	int ret = 0;
-
-	struct hep_context* hep_ctx = NULL;
-	context_p ctx = NULL;
-
 	if (req->complete){
-		/* update the timeout - we successfully read the request */
+		/* refresh connection lifetime after successful read progress */
 		tcp_conn_reset_lifetime(con);
 		con->timeout = con->lifetime;
 
@@ -704,82 +739,21 @@ static inline int hep_handle_req(struct tcp_req* req,
 			 * the connection */
 			LM_DBG("Nothing more to read on TCP conn %p, currently in state %d \n",
 				con, con->state);
-			if (req != &hep_current_req) {
-				/* we have the buffer in the connection tied buff -
-				 *	detach it , release the conn and free it afterwards */
-				con->con_req = NULL;
-			}
 			/* TODO - we could indicate to the TCP net layer to release
 			 * the connection -> other worker may read the next available
 			 * message on the pipe */
-		} else {
-			LM_DBG("We still have things on the pipe - "
-				"keeping connection \n");
-		}
-
-		if (msg_buf[0] == 'H' && msg_buf[1] == 'E' && msg_buf[2] == 'P') {
-			if ((hep_ctx = shm_malloc(sizeof(struct hep_context))) == NULL) {
-				LM_ERR("no more shared memory!\n");
-				return -1;
-			}
-			memset(hep_ctx, 0, sizeof(struct hep_context));
-			memcpy(&hep_ctx->ri, &local_rcv, sizeof(struct receive_info));
-
-			/* HEP related */
-			if (unpack_hepv3(msg_buf, msg_len, &hep_ctx->h)) {
-				LM_ERR("failed to unpack hepV3\n");
-				goto error_free_hep;
-			}
-			update_recv_info(&local_rcv, &hep_ctx->h);
-
-			/* set context for receive_msg */
-			if ((ctx=context_alloc(CONTEXT_GLOBAL)) == NULL) {
-				LM_ERR("failed to allocate new context! skipping...\n");
-				goto error_free_hep;
+			} else {
+				LM_DBG("We still have things on the pipe - "
+					"keeping connection \n");
 			}
 
-			memset(ctx, 0, context_size(CONTEXT_GLOBAL));
-
-			context_put_ptr(CONTEXT_GLOBAL, ctx, hep_ctx_idx, hep_ctx);
-			/* run hep callbacks; set the current processing context
-			 * to hep context; this way callbacks will have all the data
-			 * needed */
-			set_global_context(ctx);
-			ret=run_hep_cbs();
-			if (ret < 0) {
-				LM_ERR("failed to run hep callbacks\n");
-				goto error_free_hep;
+			if (tcp_dispatch_msg(msg_buf, msg_len,
+					&local_rcv, NULL, 0) < 0) {
+				LM_ERR("failed to deliver HEP message\n");
+				goto error;
 			}
-			set_global_context(NULL);
 
-			msg_len = hep_ctx->h.u.hepv3.payload_chunk.chunk.length - sizeof(hep_chunk_t);
-			/* remove the hep header; leave only the payload */
-			msg_buf = hep_ctx->h.u.hepv3.payload_chunk.data;
-		}
-
-		/* skip receive msg if we were told so from at least one callback */
-		if (ret != HEP_SCRIPT_SKIP) {
-			if (receive_msg(msg_buf, msg_len, &local_rcv, ctx, 0) < 0) {
-				LM_ERR("receive_msg failed \n");
-			}
-		} else {
-			if (ctx) {
-				context_free(ctx);
-			}
-		}
-
-		if (hep_ctx) {
-			free_hep_context(hep_ctx);
-		}
-
-		if (!size && req != &hep_current_req) {
-			/* if we no longer need this tcp_req
-			 * we can free it now */
-			shm_free(req);
-			con->con_req = NULL;
-		}
-
-		con->msg_attempts = 0;
+			con->msg_attempts = 0;
 
 		if (size) {
 			memmove(req->buf, req->parsed, size);
@@ -788,11 +762,8 @@ static inline int hep_handle_req(struct tcp_req* req,
 		}
 	} else {
 		/* request not complete - check the if the thresholds are exceeded */
-		if (con->msg_attempts == 0) {
-			/* if first iteration, set a short timeout for reading
-			 * a whole SIP message */
-			con->timeout = get_ticks() + tcp_max_msg_time;
-		}
+		if (con->msg_attempts == 0)
+			tcp_conn_set_msg_read_timeout(con);
 
 		con->msg_attempts++;
 		if (con->msg_attempts == _max_msg_chunks) {
@@ -800,42 +771,9 @@ static inline int hep_handle_req(struct tcp_req* req,
 				"closing connection \n",con->msg_attempts);
 			goto error;
 		}
-
-		if (req == &hep_current_req) {
-			/* let's duplicate this - most likely another conn will come in */
-
-			LM_DBG("We didn't manage to read a full request\n");
-			con->con_req = shm_malloc(sizeof(struct tcp_req));
-			if (con->con_req == NULL) {
-				LM_ERR("No more mem for dynamic con request buffer\n");
-				goto error;
-			}
-
-			if (req->pos != req->buf) {
-				/* we have read some bytes */
-				memcpy(con->con_req->buf, req->buf, req->pos-req->buf);
-				con->con_req->pos = con->con_req->buf + (req->pos-req->buf);
-			} else {
-				con->con_req->pos = con->con_req->buf;
-			}
-
-			if (req->parsed != req->buf) {
-				con->con_req->parsed =con->con_req->buf+(req->parsed-req->buf);
-			} else {
-				con->con_req->parsed = con->con_req->buf;
-			}
-
-			con->con_req->complete=req->complete;
-			con->con_req->content_len=req->content_len;
-			con->con_req->error = req->error;
-			/* req will be reset on the next usage */
-		}
 	}
 	/* everything ok */
 	return 0;
-
-error_free_hep:
-	shm_free(hep_ctx);
 
 error:
 	/* report error */
@@ -873,6 +811,7 @@ static int hep_tls_async_write(struct tcp_connection* con, int fd)
 		}
 
 		tcp_async_update_write(con, n);
+		tcp_conn_reset_lifetime(con);
 	}
 	return 0;
 }
@@ -898,14 +837,12 @@ static int hep_tcp_or_tls_read_req(struct tcp_connection* con, int* bytes_read,
 	bytes = -1;
 	total_bytes = 0;
 
-	if (con->con_req) {
-		req = con->con_req;
-		LM_DBG("Using the per connection buff \n");
-	} else {
-		LM_DBG("Using the global ( per process ) buff \n");
-		init_tcp_req(&hep_current_req, 0);
-		req = &hep_current_req;
-	}
+	req = tcp_conn_get_req(con);
+	if (!req)
+		return -1;
+	if (con->msg_attempts == 0)
+		init_tcp_req(req, 0);
+	LM_DBG("Using the connection buff\n");
 	
 	if (is_tls) {
 		ret = tls_mgm_api.tls_fix_read_conn(con, con->fd, hep_tls_handshake_timeout, NULL, 1);
@@ -1047,7 +984,7 @@ static int hep_udp_read_req(const struct socket_info* si, int* bytes_read)
 
 	if (len < 4) {
 		LM_ERR("invalid message! too short!\n");
-		return -1;
+		goto error_free_hep;
 	}
 
 	if (!memcmp(buf, HEP_HEADER_ID, HEP_HEADER_ID_LEN)) {
@@ -1055,14 +992,14 @@ static int hep_udp_read_req(const struct socket_info* si, int* bytes_read)
 		/* coverity[tainted_data] */
 		if (unpack_hepv3(buf, len, &hep_ctx->h)) {
 			LM_ERR("hepv3 unpacking failed\n");
-			return -1;
+			goto error_free_hep;
 		}
 	} else {
 		/* HEPv2 */
 		/* coverity[tainted_data] */
 		if (unpack_hepv12(buf, len, &hep_ctx->h)) {
 			LM_ERR("hepv12 unpacking failed\n");
-			return -1;
+			goto error_free_hep;
 		}
 	}
 
@@ -1086,40 +1023,60 @@ static int hep_udp_read_req(const struct socket_info* si, int* bytes_read)
 	set_global_context(NULL);
 	if (ret < 0) {
 		LM_ERR("failed to run hep callbacks\n");
-		return -1;
+		goto error_free_ctx;
 	}
 
 	if (hep_ctx->h.version == 3) {
 		/* HEPv3 */
+		if (hep_ctx->h.u.hepv3.payload_chunk.chunk.length <
+					sizeof(hep_chunk_t)) {
+			LM_ERR("invalid HEPv3 payload chunk length\n");
+			goto error_free_ctx;
+		}
 		msg.len =
 			hep_ctx->h.u.hepv3.payload_chunk.chunk.length - sizeof(hep_chunk_t);
 		msg.s = hep_ctx->h.u.hepv3.payload_chunk.data;
 	} else {
 		/* HEPv12 */
+		if (hep_ctx->h.u.hepv12.hdr.hp_l > len) {
+			LM_ERR("invalid HEPv12 header length\n");
+			goto error_free_ctx;
+		}
 		msg.len = len - hep_ctx->h.u.hepv12.hdr.hp_l;
 		msg.s = buf + hep_ctx->h.u.hepv12.hdr.hp_l;
 
 		if (hep_ctx->h.u.hepv12.hdr.hp_v == 2) {
+			if (msg.len < (int)sizeof(struct hep_timehdr)) {
+				LM_ERR("invalid HEPv12 time header length\n");
+				goto error_free_ctx;
+			}
 			msg.s += sizeof(struct hep_timehdr);
 			msg.len -= sizeof(struct hep_timehdr);
 		}
 	}
 
 	if (ret != HEP_SCRIPT_SKIP) {
+		if (msg.len < 0) {
+			LM_ERR("invalid HEP payload bounds\n");
+			goto error_free_ctx;
+		}
 		/* receive_msg must free buf too!*/
 		receive_msg( msg.s, msg.len, &ri, ctx, 0);
 	} else {
 		if (ctx) {
+			context_destroy(CONTEXT_GLOBAL, ctx);
 			context_free(ctx);
 		}
 	}
 
-	free_hep_context(hep_ctx);
-
 	return 0;
 
+error_free_ctx:
+	context_destroy(CONTEXT_GLOBAL, ctx);
+	context_free(ctx);
 error_free_hep:
-	shm_free(hep_ctx);
+	if (!ctx)
+		free_hep_context(hep_ctx);
 	return -1;
 
 }
@@ -1253,7 +1210,11 @@ static int hep_tls_write_on_socket(struct tcp_connection* c, int fd, char* buf, 
 {
 	int n;
 	lock_get(&c->write_lock);
-	if (c->async) {
+	if (fd < 0) {
+		n = tcp_async_add_chunk(c, buf, len, 0);
+		if (n == 0)
+			n = len;
+	} else if (c->async) {
 		if (!c->async->pending) {
 			if (tls_mgm_api.tls_update_fd(c, fd) < 0) {
 				n = -1;
@@ -1273,5 +1234,7 @@ static int hep_tls_write_on_socket(struct tcp_connection* c, int fd, char* buf, 
 }
 release:
 	lock_release(&c->write_lock);
+	if (fd >= 0 && n > 0)
+		tcp_conn_reset_lifetime(c);
 	return n;
 }

@@ -538,49 +538,48 @@ static const param_export_t params[] = {
 #define HLP6 "Params: [ enable ] ; Enables probing of gateways if parameter "\
 	"value greater than 0. Disables probing of gateways if parameter"\
 "value is 0. With no parameter, returns current probing status"
-
 static const mi_export_t mi_cmds[] = {
-	{ "dr_reload", HLP1, 0, 0, {
+	{ "reload", HLP1, 0, 0, {
 		{dr_reload_cmd, {0}},
 		{dr_reload_cmd, {"inherit_state", 0}},
 		{dr_reload_cmd_1, {"partition_name", 0}},
 		{dr_reload_cmd_1, {"partition_name", "inherit_state", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dr_reload", 0}
 	},
-	{ "dr_gw_status", HLP2, MI_NAMED_PARAMS_ONLY, 0, {
+	{ "gw_status", HLP2, MI_NAMED_PARAMS_ONLY, 0, {
 		{mi_dr_gw_status_1, {0}},
 		{mi_dr_gw_status_2, {"partition_name", 0}},
 		{mi_dr_gw_status_3, {"gw_id", 0}},
 		{mi_dr_gw_status_4, {"gw_id", "status", 0}},
 		{mi_dr_gw_status_5, {"partition_name", "gw_id", 0}},
 		{mi_dr_gw_status_6, {"partition_name", "gw_id", "status", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dr_gw_status", 0}
 	},
-	{ "dr_carrier_status", HLP3, MI_NAMED_PARAMS_ONLY, 0, {
+	{ "carrier_status", HLP3, MI_NAMED_PARAMS_ONLY, 0, {
 		{mi_dr_cr_status_1, {0}},
 		{mi_dr_cr_status_2, {"partition_name", 0}},
 		{mi_dr_cr_status_3, {"carrier_id", 0}},
 		{mi_dr_cr_status_4, {"carrier_id", "status", 0}},
 		{mi_dr_cr_status_5, {"partition_name", "carrier_id", 0}},
 		{mi_dr_cr_status_6, {"partition_name", "carrier_id", "status", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dr_carrier_status", 0}
 	},
-	{ "dr_number_routing", HLP4, MI_NAMED_PARAMS_ONLY, 0, {
+	{ "number_routing", HLP4, MI_NAMED_PARAMS_ONLY, 0, {
 		{mi_dr_number_routing_1, {"number", 0}},
 		{mi_dr_number_routing_2, {"group_id", "number", 0}},
 		{mi_dr_number_routing_3, {"partition_name", "number", 0}},
 		{mi_dr_number_routing_4, {"partition_name", "group_id", "number", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dr_number_routing", 0}
 	},
-	{ "dr_reload_status", HLP5, 0, 0, {
+	{ "reload_status", HLP5, 0, 0, {
 		{mi_dr_reload_status, {0}},
 		{mi_dr_reload_status_1, {"partition_name", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dr_reload_status", 0}
 	},
-	{ "dr_enable_probing", HLP6, 0, 0, {
+	{ "enable_probing", HLP6, 0, 0, {
 		{mi_dr_enable_probing, {0}},
 		{mi_dr_enable_probing_1, {"status", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dr_enable_probing", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };
@@ -786,7 +785,7 @@ static int dr_disable(struct sip_msg *req, struct head_db * current_partition)
 		LM_DBG("partition : %.*s\n", current_partition->partition.len,
 				current_partition->partition.s);
 		gw->flags |= DR_DST_STAT_DSBL_FLAG|DR_DST_STAT_DIRT_FLAG;
-		dr_gw_status_changed( current_partition, gw, 
+		dr_gw_status_changed( current_partition, gw,
 			MI_SSTR("script dr_disable"));
 	}
 
@@ -970,7 +969,7 @@ static void dr_prob_handler(unsigned int ticks, void* param)
 			}
 			dlg->state = DLG_CONFIRMED;
 
-			if (dr_tmb.t_request_within(&dr_probe_method, NULL, NULL, dlg,
+			if (run_tm_api(&dr_tmb, t_request_within, &dr_probe_method, NULL, NULL, dlg,
 			dr_probing_callback, (void*)pack, osips_shm_free)<0) {
 				LM_ERR("unable to execute dialog, disabling destination...\n");
 				lock_start_read( it->ref_lock );
@@ -1217,13 +1216,13 @@ static inline int dr_reload_data_head(struct head_db *hd,
 	if (initial)
 		sr_set_status( dr_srg, STR2CI(hd->partition), SR_STATUS_LOADING_DATA,
 			CHAR_INT("startup data loading"), 0);
-	else 
+	else
 		sr_set_status( dr_srg, STR2CI(hd->partition), SR_STATUS_RELOADING_DATA,
 			CHAR_INT("data re-loading"), 0);
 
 	if (!uses_rule_table_query(hd, &rule_table_query)) {
 
-		if (generate_data_md5) { 
+		if (generate_data_md5) {
 			MD5Init(&Md5Ctx);
 			ctxp = &Md5Ctx;
 		}
@@ -1281,7 +1280,7 @@ static inline int dr_reload_data_head(struct head_db *hd,
 
 		dr_dbf->free_result(db_hdl, res);
 
-		if (generate_data_md5) { 
+		if (generate_data_md5) {
 			MD5Init(&Md5Ctx);
 			ctxp = &Md5Ctx;
 		}
@@ -2311,7 +2310,7 @@ static int dr_exit(void)
 	while( it!=NULL ) {
 		to_clean = it;
 		it = it->next;
-		if (dr_persistent_state && !to_clean->cache && 
+		if (dr_persistent_state && !to_clean->cache &&
 		db_connect_head(to_clean)==0 ) {
 			dr_state_flusher(to_clean);
 
@@ -2998,9 +2997,9 @@ static int weight_based_sort(pgw_list_t *pgwl, int size, unsigned short *idx)
 				// return -1;
 			}
 		} else {
-			/* randomly select index */
-			//	i = (unsigned int)((size-first)*((double)rand()/((double)RAND_MAX)));
-			i = first;
+			/* all remaining gateways have weight 0, treat them as equal
+			   and randomly select one with uniform distribution */
+			i = first + (unsigned int)((size - first) * ((double)rand() / ((double)RAND_MAX + 1.0)));
 		}
 		LM_DBG("selecting element %d with weight %d\n",
 				idx[i], pgwl[ idx[i] ].weight);
@@ -3656,7 +3655,7 @@ no_gws:
 	if ( flags & DR_PARAM_RULE_FALLBACK ) {
 		if ( !(flags & DR_PARAM_INTERNAL_TRIGGERED) ) {
 			/* first time - we need to save some date, to be able to
-			 * do the rule fallback later in "next_gw" , but do it only if 
+			 * do the rule fallback later in "next_gw" , but do it only if
 			 * there is room for fallback (more rules are available) */
 			if (rule_idx>0) {
 				LM_DBG("saving rule_idx %d, prefix '%.*s'\n",rule_idx,
@@ -5248,8 +5247,14 @@ mi_response_t *mi_dr_number_routing(const mi_params_t *params,
 	unsigned int i;
 	static const str gw_str = str_init("GATEWAY");
 	static const str carrier_str = str_init("CARRIER");
+	static const str active_str = str_init("active");
+	static const str inactive_str = str_init("disabled by script");
+	static const str probing_str = str_init("disabled by probing");
+	static const str disabled_str = str_init("disabled by MI");
 	str chosen_desc;
 	str chosen_id;
+	str chosen_status;
+	pgw_t *gw;
 
 	if (get_mi_string_param(params, "number", &number.s, &number.len) < 0)
 		return init_mi_param_error();
@@ -5273,26 +5278,49 @@ mi_response_t *mi_dr_number_routing(const mi_params_t *params,
 	if (add_mi_string(resp_obj, MI_SSTR("Matched Prefix"),
 		number.s, matched_len) < 0)
 		goto error;
+	if (add_mi_number(resp_obj, MI_SSTR("Rule ID"), route->id) < 0 ||
+		add_mi_number(resp_obj, MI_SSTR("Rule Priority"), route->priority) < 0)
+		goto error;
 
 	arr_obj = add_mi_array(resp_obj, MI_SSTR("GW List"));
 	if (!arr_obj)
 		goto error;
 
-	for (i = 0; i < route->pgwa_len; ++i){
+	for (i = 0; i < route->pgwa_len; ++i) {
+		gw = NULL;
 		if (route->pgwl[i].is_carrier) {
 			chosen_desc = carrier_str;
 			chosen_id = route->pgwl[i].dst.carrier->id;
-		}
-		else {
+			chosen_status = (route->pgwl[i].dst.carrier->flags & DR_CR_FLAG_IS_OFF) ?
+				disabled_str : active_str;
+		} else {
+			gw = route->pgwl[i].dst.gw;
 			chosen_desc = gw_str;
-			chosen_id = route->pgwl[i].dst.gw->id;
+			chosen_id = gw->id;
+			if (!(gw->flags & DR_DST_STAT_DSBL_FLAG))
+				chosen_status = active_str;
+			else if (gw->flags & DR_DST_STAT_NOEN_FLAG)
+				chosen_status = disabled_str;
+			else if (gw->flags & DR_DST_PING_DSBL_FLAG)
+				chosen_status = probing_str;
+			else
+				chosen_status = inactive_str;
 		}
+
 		gw_obj = add_mi_object(arr_obj, NULL, 0);
 		if (!gw_obj)
 			goto error;
 
 		if (add_mi_string(gw_obj, chosen_desc.s, chosen_desc.len,
-			chosen_id.s, chosen_id.len) < 0)
+			chosen_id.s, chosen_id.len) < 0 ||
+			add_mi_string(gw_obj, MI_SSTR("Status"),
+			chosen_status.s, chosen_status.len) < 0 ||
+			add_mi_number(gw_obj, MI_SSTR("Weight"),
+			route->pgwl[i].weight) < 0)
+			goto error;
+
+		if (gw && add_mi_string(gw_obj, MI_SSTR("Address"),
+				gw->ip_str.s, gw->ip_str.len) < 0)
 			goto error;
 	}
 

@@ -29,7 +29,7 @@
  * load and pkg stats, will allow running scripting and proper shutdown.
  */
 
-#define REACTOR_PROC_TIMEOUT  1
+#define REACTOR_PROC_TIMEOUT  1000 /* ms */
 
 typedef int (*reactor_proc_cb_f) (int fd, void *param, int was_timeout);
 
@@ -41,6 +41,11 @@ struct reactor_proc_cb {
 int reactor_proc_init(char *name);
 
 int reactor_proc_add_fd(int fd, reactor_proc_cb_f func, void *param);
+
+/* Remove fd from reactor and free the callback (reactor_proc_cb) allocated by
+ * reactor_proc_add_fd. Use this instead of reactor_del_reader() for FDs
+ * that were added with reactor_proc_add_fd() to avoid a PKG memory leak. */
+int reactor_proc_del_fd(int fd, int idx, int io_flags);
 
 int reactor_proc_loop(void);
 

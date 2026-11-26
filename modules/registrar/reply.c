@@ -34,6 +34,7 @@
  */
 
 #include <stdio.h>
+#include <limits.h>
 
 #include "../../ut.h"
 #include "../../parser/msg_parser.h"
@@ -372,38 +373,41 @@ static inline int lent_gruu_params(char *dst, ucontact_t *c)
  * Calculate the length of buffer needed to
  * print contacts
  */
-static inline unsigned int calc_buf_len(ucontact_t* c,int build_gruu,
+static inline int calc_buf_len(ucontact_t* c,int build_gruu,
 		struct sip_msg *_m)
 {
-	unsigned int len;
+	size_t len;
 	int qlen;
 	const struct socket_info *sock;
+	#define ADD_LEN(_value) do { \
+		size_t _add = (size_t)(_value); \
+		if (_add > (size_t)INT_MAX - len) return -1; \
+		len += _add; \
+	} while (0)
 
 	len = 0;
 	while(c) {
 		if (VALID_CONTACT(c, get_act_time())) {
-			if (len) len += CONTACT_SEP_LEN;
-			len += 2 /* < > */ + c->c.len;
+			if (len) ADD_LEN(CONTACT_SEP_LEN);
+			ADD_LEN((size_t)2 /* < > */ + c->c.len);
 			qlen = len_q(c->q);
-			if (qlen) len += Q_PARAM_LEN + qlen;
-			len += EXPIRES_PARAM_LEN + INT2STR_MAX_LEN;
+			if (qlen) ADD_LEN((size_t)Q_PARAM_LEN + qlen);
+			ADD_LEN((size_t)EXPIRES_PARAM_LEN + INT2STR_MAX_LEN);
 			if (c->received.s) {
-				len += 1 /* ; */
+				ADD_LEN((size_t)1 /* ; */
 					+ rcv_param.len
 					+ 1 /* = */
 					+ 1 /* dquote */
 					+ c->received.len
-					+ 1 /* dquote */
-					;
+					+ 1 /* dquote */);
 			}
 			if (build_gruu && c->instance.s && lend_gruus) {
-				len += lent_gruu_params(NULL, c);
-				len += SIP_INSTANCE_SIZE
+				ADD_LEN(lent_gruu_params(NULL, c));
+				ADD_LEN((size_t)SIP_INSTANCE_SIZE
 					+ 1 /* quote */
 					+ c->instance.len
-					+ 1 /* quote */
-					;
-			} else if (build_gruu && c->instance.s) {
+					+ 1 /* quote */);
+			} else if (build_gruu && c->instance.s && c->instance.len >= 2) {
 				str guser, ghost, gr;
 
 				sock = (c->sock)?(c->sock):(_m->rcv.bind_address);
@@ -413,27 +417,25 @@ static inline unsigned int calc_buf_len(ucontact_t* c,int build_gruu,
 				}
 				reg_pub_gruu_gr(&c->instance, &gr);
 				/* pub gruu */
-				len += PUB_GRUU_SIZE
+				ADD_LEN((size_t)PUB_GRUU_SIZE
 					+ 1 /* quote */
 					+ SIP_PROTO_SIZE
 					+ guser.len
 					+ (ghost.len ? 1 + ghost.len : 0)
 					+ GR_PARAM_SIZE
 					+ gr.len
-					+ 1 /* quote */
-					;
+					+ 1 /* quote */);
 				/* temp gruu */
 				if (stored_temp_gruu(c, &gr)) {
-					len += TEMP_GRUU_SIZE
+					ADD_LEN((size_t)TEMP_GRUU_SIZE
 						+ 1 /* quote */
 						+ gr.len
-						+ 1 /* quote */
-						;
+						+ 1 /* quote */);
 				} else {
 					if (reg_gruu_target(c->aor, sock, 1, &guser, &ghost) < 0
 							|| ghost.len <= 0)
 						ghost.len = sock ? sock->name.len + 1 + sock->port_no_str.len : 0;
-					len += TEMP_GRUU_SIZE
+					ADD_LEN((size_t)TEMP_GRUU_SIZE
 						+ 1 /* quote */
 						+ SIP_PROTO_SIZE
 						+ TEMP_GRUU_HEADER_SIZE
@@ -441,23 +443,22 @@ static inline unsigned int calc_buf_len(ucontact_t* c,int build_gruu,
 						+ 1 /* @ */
 						+ ghost.len
 						+ GR_NO_VAL_SIZE
-						+ 1 /* quote */
-						;
+						+ 1 /* quote */);
 				}
 				/* sip.instance */
-				len += SIP_INSTANCE_SIZE
+				ADD_LEN((size_t)SIP_INSTANCE_SIZE
 					+ 1 /* quote */
 					+ c->instance.len
-					+ 1 /* quote */
-					;
+					+ 1 /* quote */);
 			}
-			len += copy_echoed_attrs(NULL, c, build_gruu && c->instance.s);
+			ADD_LEN(copy_echoed_attrs(NULL, c, build_gruu && c->instance.s));
 		}
 		c = c->next;
 	}
 
-	if (len) len += CONTACT_BEGIN_LEN + CRLF_LEN;
-	return len;
+	if (len) ADD_LEN((size_t)CONTACT_BEGIN_LEN + CRLF_LEN);
+	#undef ADD_LEN
+	return (int)len;
 }
 
 /*! \brief
@@ -476,6 +477,10 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 		build_gruu=1;
 
 	contact.data_len = calc_buf_len(c,build_gruu,_m);
+	if (contact.data_len < 0) {
+		LM_ERR("contact header length overflow\n");
+		return -1;
+	}
 	if (!contact.data_len) return 0;
 
 	if (!contact.buf || (contact.buf_len < contact.data_len)) {
@@ -544,7 +549,7 @@ int build_contact(ucontact_t* c,struct sip_msg *_m)
 				memcpy(p,c->instance.s,c->instance.len);
 				p += c->instance.len;
 				*p++ = '\"';
-			} else if (build_gruu && c->instance.s) {
+			} else if (build_gruu && c->instance.s && c->instance.len >= 2) {
 				str guser, ghost, gr;
 
 				sock = (c->sock)?(c->sock):(_m->rcv.bind_address);

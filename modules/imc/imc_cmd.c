@@ -25,6 +25,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <limits.h>
 #include <sys/types.h>
 #include "../../mem/shm_mem.h"
 #include "../../mem/mem.h"
@@ -36,6 +37,8 @@
 #include "imc_cmd.h"
 
 #define IMC_BUF_SIZE	1024
+#define IMC_NOT_REGISTERED_MSG " is not registered.  "
+#define IMC_NOT_REGISTERED_MSG_LEN ((int)(sizeof(IMC_NOT_REGISTERED_MSG) - 1))
 
 static char imc_body_buf[IMC_BUF_SIZE];
 
@@ -45,6 +48,26 @@ static str imc_hdr_ctype = { "Content-Type: text/plain\r\n",  26};
 int imc_send_message(str *src, str *dst, str *headers, str *body);
 int imc_room_broadcast(imc_room_p room, str *ctype, str *body);
 void imc_inv_callback( struct cell *t, int type, struct tmcb_params *ps);
+
+static int imc_body_print_user(str *body, const char *fmt, str *user)
+{
+	body->s = imc_body_buf;
+	body->len = snprintf(body->s, IMC_BUF_SIZE, fmt, user->len, user->s);
+
+	if(body->len < 0)
+	{
+		LM_ERR("unable to print message\n");
+		body->len = 0;
+		return -1;
+	}
+	if(body->len >= IMC_BUF_SIZE)
+	{
+		LM_ERR("buffer size overflow\n");
+		body->len = 0;
+		return -1;
+	}
+	return body->len;
+}
 
 /**
  * parse cmd
@@ -220,10 +243,8 @@ int imc_handle_create(struct sip_msg* msg, imc_cmd_t *cmd,
 			}
 			LM_DBG("added as member [%.*s]\n",member->uri.len, member->uri.s);
 			/* send info message */
-			body.s = imc_body_buf;
-			body.len = snprintf(body.s, IMC_BUF_SIZE,
-				"*** <%.*s> has joined the room",
-				member->uri.len, member->uri.s);
+			body.len = imc_body_print_user(&body,
+					"*** <%.*s> has joined the room", &member->uri);
 			if(body.len>0)
 				imc_room_broadcast(room, &imc_hdr_ctype, &body);
 
@@ -322,9 +343,8 @@ int imc_handle_join(struct sip_msg* msg, imc_cmd_t *cmd,
 
 build_inform:
 	/* send info message */
-	body.s = imc_body_buf;
-	body.len = snprintf(body.s, IMC_BUF_SIZE, "*** <%.*s> has joined the room",
-					member->uri.len, member->uri.s);
+	body.len = imc_body_print_user(&body, "*** <%.*s> has joined the room",
+			&member->uri);
 	if(body.len>0)
 		imc_room_broadcast(room, &imc_hdr_ctype, &body);
 
@@ -484,7 +504,7 @@ int imc_handle_invite(struct sip_msg* msg, imc_cmd_t *cmd,
 	cback_param->member_domain = member->domain;
 	cback_param->inv_uri = member->uri;
 	/*?!?! possible race with 'remove user' */
-	result= tmb.t_request(&imc_msg_type,				/* Request Method */
+	result= run_tm_api(&tmb, t_request, &imc_msg_type,				/* Request Method */
 				&member->uri,							/* Request-URI */
 				&member->uri,							/* To */
 				&room->uri,								/* From */
@@ -549,9 +569,8 @@ int imc_handle_accept(struct sip_msg* msg, imc_cmd_t *cmd,
 	member->flags &= ~IMC_MEMBER_INVITED;
 
 	/* send info message */
-	body.s = imc_body_buf;
-	body.len = snprintf(body.s, IMC_BUF_SIZE, "*** <%.*s> has joined the room",
-					member->uri.len, member->uri.s);
+	body.len = imc_body_print_user(&body, "*** <%.*s> has joined the room",
+			&member->uri);
 	if(body.len>0)
 		imc_room_broadcast(room, &imc_hdr_ctype, &body);
 
@@ -689,9 +708,8 @@ int imc_handle_remove(struct sip_msg* msg, imc_cmd_t *cmd,
 	member->flags |= IMC_MEMBER_DELETED;
 	imc_del_member(room, &inv_uri.user, &inv_uri.host);
 
-	body.s = imc_body_buf;
-	body.len = snprintf(body.s, IMC_BUF_SIZE, "*** <%.*s> has joined the room",
-					member->uri.len, member->uri.s);
+	body.len = imc_body_print_user(&body, "*** <%.*s> has joined the room",
+			&member->uri);
 	if(body.len>0)
 		imc_room_broadcast(room, &imc_hdr_ctype, &body);
 
@@ -740,10 +758,8 @@ int imc_handle_deny(struct sip_msg* msg, imc_cmd_t *cmd,
 
 #if 0
 	/* send info message */
-	body.s = imc_body_buf;
-	body.len = snprintf(body.s, IMC_BUF_SIZE,
-			"The user [%.*s] has denied the invitation",
-			src->user.len, src->user.s);
+	body.len = imc_body_print_user(&body,
+			"The user [%.*s] has denied the invitation", &src->user);
 	if(body.len>0)
 		imc_send_message(&room->uri, &memeber->uri, &imc_hdr_ctype, &body);
 #endif
@@ -771,8 +787,10 @@ int imc_handle_list(struct sip_msg* msg, imc_cmd_t *cmd,
 	imc_member_p member = 0;
 	imc_member_p imp = 0;
 	str room_name;
-	str body;
+	str body = {0, 0};
 	char *p;
+	int marker_len;
+	int entry_len;
 
 	/* the user wants to leave the room */
 	room_name = cmd->param[0].s?cmd->param[0]:dst->user;
@@ -793,7 +811,43 @@ int imc_handle_list(struct sip_msg* msg, imc_cmd_t *cmd,
 				src->user.len, src->user.s,	room_name.len, room_name.s);
 		goto error;
 	}
-	p = imc_body_buf;
+
+	body.len = sizeof("Members:\n") - 1;
+	imp = room->members;
+	while(imp)
+	{
+		if((imp->flags&IMC_MEMBER_INVITED)||(imp->flags&IMC_MEMBER_DELETED)
+				|| (imp->flags&IMC_MEMBER_SKIP))
+		{
+			imp = imp->next;
+			continue;
+		}
+
+		marker_len = ((imp->flags & IMC_MEMBER_OWNER) ||
+				(imp->flags & IMC_MEMBER_ADMIN)) ? 1 : 0;
+		if(imp->uri.len > INT_MAX - marker_len - 1)
+		{
+			LM_ERR("member uri too large [%d]\n", imp->uri.len);
+			goto error;
+		}
+		entry_len = marker_len + imp->uri.len + 1;
+		if(entry_len > INT_MAX - 1 - body.len)
+		{
+			LM_ERR("member list too large\n");
+			goto error;
+		}
+		body.len += entry_len;
+		imp = imp->next;
+	}
+
+	body.s = pkg_malloc(body.len + 1);
+	if(body.s == NULL)
+	{
+		LM_ERR("no more pkg memory\n");
+		goto error;
+	}
+
+	p = body.s;
 	memcpy(p, "Members:\n", 9);
 	p+=9;
 	imp = room->members;
@@ -810,24 +864,25 @@ int imc_handle_list(struct sip_msg* msg, imc_cmd_t *cmd,
 			*p++ = '*';
 		else if(imp->flags & IMC_MEMBER_ADMIN)
 			*p++ = '~';
-		strncpy(p, imp->uri.s, imp->uri.len);
+		memcpy(p, imp->uri.s, imp->uri.len);
 		p += imp->uri.len;
 		*p++ = '\n';
 		imp = imp->next;
 	}
 
-	imc_release_room(room);
-
 	/* write over last '\n' */
 	*(--p) = 0;
-	body.s   = imc_body_buf;
 	body.len = p-body.s;
 	LM_DBG("members = [%.*s]\n", body.len, body.s);
 	imc_send_message(&room->uri, &member->uri, &imc_hdr_ctype, &body);
 
+	pkg_free(body.s);
+	imc_release_room(room);
 
 	return 0;
 error:
+	if(body.s)
+		pkg_free(body.s);
 	if(room!=NULL)
 		imc_release_room(room);
 	return -1;
@@ -883,10 +938,8 @@ int imc_handle_exit(struct sip_msg* msg, imc_cmd_t *cmd,
 		/* delete user */
 		member->flags |= IMC_MEMBER_DELETED;
 		imc_del_member(room, &src->user, &src->host);
-		body.s = imc_body_buf;
-		body.len = snprintf(body.s, IMC_BUF_SIZE,
-				"The user [%.*s] has left the room",
-				src->user.len, src->user.s);
+		body.len = imc_body_print_user(&body,
+				"The user [%.*s] has left the room", &src->user);
 		if(body.len>0)
 			imc_room_broadcast(room, &imc_hdr_ctype, &body);
 	}
@@ -972,7 +1025,7 @@ int imc_handle_help(struct sip_msg* msg, imc_cmd_t *cmd, str *src, str *dst)
 	body.len = IMC_HELP_MSG_LEN;
 
 	LM_DBG("to: [%.*s] from: [%.*s]\n", src->len, src->s, dst->len, dst->s);
-	tmb.t_request(&imc_msg_type,						/* Request method */
+	run_tm_api(&tmb, t_request, &imc_msg_type,						/* Request method */
 				NULL,									/* Request-URI */
 				src,									/* To */
 				dst,									/* From */
@@ -997,15 +1050,19 @@ int imc_handle_unknown(struct sip_msg* msg, imc_cmd_t *cmd, str *src, str *dst)
 	body.len = snprintf(body.s, IMC_BUF_SIZE,
 		"invalid command '%.*s' - send ''%.*shelp' for details",
 		cmd->name.len, cmd->name.s, imc_cmd_start_str.len, imc_cmd_start_str.s);
-
-	if(body.len<=0)
+	if(body.len <= 0)
 	{
 		LM_ERR("unable to print message\n");
 		return -1;
 	}
+	if(body.len >= IMC_BUF_SIZE)
+	{
+		LM_ERR("buffer size overflow\n");
+		return -1;
+	}
 
 	LM_DBG("to: [%.*s] from: [%.*s]\n", src->len, src->s, dst->len, dst->s);
-	tmb.t_request(&imc_msg_type,						/* Request method */
+	run_tm_api(&tmb, t_request, &imc_msg_type,						/* Request method */
 				NULL,									/* Request-URI */
 				src,									/* To */
 				dst,									/* From */
@@ -1112,7 +1169,7 @@ int imc_send_message(str *src, str *dst, str *headers, str *body)
 	if(src==NULL || dst==NULL || body==NULL)
 		return -1;
 	/* to-do: callbac to remove user fi delivery fails */
-	tmb.t_request(&imc_msg_type,						/* Request method */
+	run_tm_api(&tmb, t_request, &imc_msg_type,						/* Request method */
 			NULL,										/* Request-URI */
 			dst,										/* To */
 			src,										/* From */
@@ -1131,13 +1188,12 @@ int imc_send_message(str *src, str *dst, str *headers, str *body)
  */
 void imc_inv_callback( struct cell *t, int type, struct tmcb_params *ps)
 {
-	str body_final;
-	char from_uri_buf[256];
-	char to_uri_buf[256];
-	char body_buf[256];
+	str body_final = {0, 0};
 	str from_uri_s, to_uri_s;
 	imc_member_p member= NULL;
 	imc_room_p room = NULL;
+	del_member_t *cb_param;
+	int del_member = 0;
 
 	if(ps->param==NULL || *ps->param==NULL ||
 			(del_member_t*)(*ps->param) == NULL)
@@ -1145,19 +1201,23 @@ void imc_inv_callback( struct cell *t, int type, struct tmcb_params *ps)
 		LM_DBG("member not received\n");
 		return;
 	}
+	cb_param = (del_member_t *)(*ps->param);
 
 	LM_DBG("completed with status %d [member name domain:"
 			"%p/%.*s/%.*s]\n",ps->code, ps->param,
-			((del_member_t *)(*ps->param))->member_name.len,
-			((del_member_t *)(*ps->param))->member_name.s,
-			((del_member_t *)(*ps->param))->member_domain.len,
-			((del_member_t *)(*ps->param))->member_domain.s);
+			cb_param->member_name.len,
+			cb_param->member_name.s,
+			cb_param->member_domain.len,
+			cb_param->member_domain.s);
 	if(ps->code < 300)
+	{
+		if(type & TMCB_LOCAL_COMPLETED)
+			goto done;
 		return;
+	}
 	else
 	{
-		room= imc_get_room(&((del_member_t *)(*ps->param))->room_name,
-						&((del_member_t *)(*ps->param))->room_domain );
+		room= imc_get_room(&cb_param->room_name, &cb_param->room_domain);
 		if(room==NULL)
 		{
 			LM_ERR("the room does not exist!\n");
@@ -1166,17 +1226,14 @@ void imc_inv_callback( struct cell *t, int type, struct tmcb_params *ps)
 		/*verify if the user who sent the request is a member in the room
 		 * and has the right to remove other users */
 		member= imc_get_member(room,
-				&((del_member_t *)(*ps->param))->member_name,
-				&((del_member_t *)(*ps->param))->member_domain);
+				&cb_param->member_name, &cb_param->member_domain);
 
 		if(member== NULL)
 		{
 			LM_ERR("the user is not a member of the room!\n");
 			goto error;
 		}
-		imc_del_member(room,
-				&((del_member_t *)(*ps->param))->member_name,
-				&((del_member_t *)(*ps->param))->member_domain);
+		del_member = 1;
 		goto build_inform;
 
 	}
@@ -1184,29 +1241,37 @@ void imc_inv_callback( struct cell *t, int type, struct tmcb_params *ps)
 
 build_inform:
 
-	body_final.s = body_buf;
-	body_final.len = member->uri.len - 4 /* sip: part of URI */ + 20;
+	if(member->uri.len < 4 ||
+			member->uri.len - 4 > INT_MAX - IMC_NOT_REGISTERED_MSG_LEN)
+	{
+		LM_ERR("member uri too large [%d]\n", member->uri.len);
+		goto error;
+	}
+	body_final.len = member->uri.len - 4 /* sip: part of URI */
+			+ IMC_NOT_REGISTERED_MSG_LEN;
+	body_final.s = pkg_malloc(body_final.len);
+	if(body_final.s == NULL)
+	{
+		LM_ERR("no more pkg memory\n");
+		goto error;
+	}
 	memcpy(body_final.s, member->uri.s + 4, member->uri.len - 4);
-	memcpy(body_final.s+member->uri.len-4," is not registered.  ",21);
+	memcpy(body_final.s + member->uri.len - 4, IMC_NOT_REGISTERED_MSG,
+			IMC_NOT_REGISTERED_MSG_LEN);
 
 	goto send_message;
 
 send_message:
 
-	from_uri_s.s = from_uri_buf;
-	from_uri_s.len = room->uri.len;
-	strncpy(from_uri_s.s, room->uri.s, room->uri.len);
+	from_uri_s = room->uri;
 
 	LM_DBG("sending message\n");
 
-	to_uri_s.s = to_uri_buf;
-	to_uri_s.len = ((del_member_t *)(*ps->param))->inv_uri.len;
-	strncpy(to_uri_s.s,((del_member_t *)(*ps->param))->inv_uri.s ,
-			((del_member_t *)(*ps->param))->inv_uri.len);
+	to_uri_s = cb_param->inv_uri;
 
 	LM_DBG("to: %.*s\nfrom: %.*s\nbody: %.*s\n", to_uri_s.len, to_uri_s.s,
 			from_uri_s.len, from_uri_s.s, body_final.len, body_final.s);
-	tmb.t_request(&imc_msg_type,							/* Request method*/
+	run_tm_api(&tmb, t_request, &imc_msg_type,							/* Request method*/
 					NULL,									/* Request-URI */
 					&to_uri_s,								/* To */
 					&from_uri_s,							/* From */
@@ -1216,24 +1281,31 @@ send_message:
 					NULL,								/* callback function */
 					NULL,								/* callback parameter*/
 					NULL
-				);
+					);
+done:
+	if(del_member)
+		imc_del_member(room, &cb_param->member_name, &cb_param->member_domain);
 	if(room!=NULL)
 	{
 		imc_release_room(room);
 	}
 
-	if((del_member_t *)(*ps->param))
-		shm_free(*ps->param);
+	if(body_final.s)
+		pkg_free(body_final.s);
+
+	shm_free(cb_param);
 
 	return;
 
 error:
+	if(del_member)
+		imc_del_member(room, &cb_param->member_name, &cb_param->member_domain);
 	if(room!=NULL)
 	{
 		imc_release_room(room);
 	}
-	if((del_member_t *)(*ps->param))
-		shm_free(*ps->param);
+	if(body_final.s)
+		pkg_free(body_final.s);
+	shm_free(cb_param);
 	return;
 }
-

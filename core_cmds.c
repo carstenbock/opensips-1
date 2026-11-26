@@ -27,6 +27,7 @@
 #include "dprint.h"
 #include "proxy.h"
 #include "forward.h"
+#include "socket_info.h"
 #include "parser/msg_parser.h"
 #include "parser/parse_uri.h"
 #include "ut.h"
@@ -39,6 +40,7 @@
 #include "status_report.h"
 #include "cachedb/cachedb.h"
 #include "msg_translator.h"
+#include "net/net_tcp.h"
 #include "mod_fix.h"
 /* needed by tcpconn_add_alias() */
 #include "net/tcp_conn_defs.h"
@@ -52,6 +54,7 @@ static int fixup_qvalue(void** param);
 static int fixup_branch_keep(void** param);
 static int fixup_branch_index(void** param);
 static int fixup_f_send_sock(void** param);
+static int fixup_bond_sock(void** param);
 static int fixup_blacklist_name(void** param);
 static int fixup_blacklist(void** param);
 static int fixup_blacklist_ip(void** param);
@@ -102,9 +105,12 @@ static int w_isdsturiset(struct sip_msg *msg);
 static int w_force_rport(struct sip_msg *msg);
 static int w_add_local_rport(struct sip_msg *msg);
 static int w_force_tcp_alias(struct sip_msg *msg, int *port);
+static int w_tcp_close_conn(struct sip_msg *msg, str *ipport);
 static int w_set_adv_address(struct sip_msg *msg, str *adv_addr);
 static int w_set_adv_port(struct sip_msg *msg, str *adv_port);
 static int w_f_send_sock(struct sip_msg *msg, struct socket_info *si);
+static int w_socket_belongs_to_bond(struct sip_msg *msg, str *sock_desc,
+		struct socket_info *bond_sock);
 static int w_serialize_branches(struct sip_msg *msg, int *clear_prev,
 					int *keep_ord);
 static int w_next_branches(struct sip_msg *msg);
@@ -248,6 +254,9 @@ const cmd_export_t core_cmds[]={
 	{"force_tcp_alias", (cmd_function)w_force_tcp_alias, {
 		{CMD_PARAM_INT|CMD_PARAM_OPT, 0, 0}, {0,0,0}},
 		ALL_ROUTES},
+	{"tcp_close_conn", (cmd_function)w_tcp_close_conn, {
+		{CMD_PARAM_STR, 0, 0}, {0,0,0}},
+		ALL_ROUTES},
 	{"set_advertised_address", (cmd_function)w_set_adv_address, {
 		{CMD_PARAM_STR, 0, 0}, {0,0,0}},
 		ALL_ROUTES},
@@ -256,6 +265,10 @@ const cmd_export_t core_cmds[]={
 		ALL_ROUTES},
 	{"force_send_socket", (cmd_function)w_f_send_sock, {
 		{CMD_PARAM_STR, fixup_f_send_sock, 0}, {0,0,0}},
+		ALL_ROUTES},
+	{"socket_belongs_to_bond", (cmd_function)w_socket_belongs_to_bond, {
+		{CMD_PARAM_STR, 0, 0},
+		{CMD_PARAM_STR, fixup_bond_sock, 0}, {0,0,0}},
 		ALL_ROUTES},
 	{"serialize_branches", (cmd_function)w_serialize_branches, {
 		{CMD_PARAM_INT, 0, 0},
@@ -554,6 +567,21 @@ static int fixup_f_send_sock(void** param)
 error:
 	pkg_free(host_nt.s);
 	return E_BAD_ADDRESS;
+}
+
+static int fixup_bond_sock(void** param)
+{
+	str *s = (str *)*param;
+	const struct socket_info *si;
+
+	si = grep_internal_sock_info(s, 0, PROTO_BOND);
+	if (!si) {
+		LM_ERR("invalid bond socket <%.*s>\n", s->len, s->s);
+		return E_CFG;
+	}
+
+	*(const struct socket_info **)param = si;
+	return 0;
 }
 
 static int fixup_blacklist_name(void** param)
@@ -1093,6 +1121,19 @@ static int w_force_tcp_alias(struct sip_msg *msg, int *port)
 	return 1;	
 }
 
+static int w_tcp_close_conn(struct sip_msg *_, str *ipport)
+{
+	int rc;
+
+	rc = tcp_close_connection(ipport);
+	if (rc < 0)
+		return E_UNSPEC;
+	if (rc == 0)
+		return -1;
+
+	return 1;
+}
+
 static int w_set_adv_address(struct sip_msg *msg, str *adv_addr)
 {
 	LM_DBG("setting adv address = [%.*s]\n", adv_addr->len, adv_addr->s);
@@ -1136,6 +1177,26 @@ static int w_f_send_sock(struct sip_msg *msg, struct socket_info *si)
 	msg->force_send_socket=(const struct socket_info *)si;
 
 	return 1;
+}
+
+static int w_socket_belongs_to_bond(struct sip_msg *msg, str *sock_desc,
+		struct socket_info *bond_sock)
+{
+	const struct socket_info *si;
+	struct socket_info_ref *bond_ref;
+
+	si = parse_sock_info(sock_desc);
+	if (!si) {
+		LM_ERR("socket to check [%.*s] does not exist\n",
+			sock_desc->len,sock_desc->s);
+		return -1;
+	}
+
+	for (bond_ref = bond_sock->bond_sis; bond_ref; bond_ref = bond_ref->next)
+		if (bond_ref->si == si)
+			return 1;
+
+	return -1;
 }
 
 static int w_serialize_branches(struct sip_msg *msg, int *clear_prev,
@@ -1571,4 +1632,3 @@ static int w_set_via_handling(struct sip_msg* msg, int flags)
 
 	return 1;
 }
-

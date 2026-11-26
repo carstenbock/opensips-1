@@ -86,7 +86,7 @@ struct cpl_enviroment    cpl_env = {
 		{0,0},   /* original TZ \0 terminated "TZ=value" format */
 		0,   /* udomain */
 		0,   /* no branches on lookup */
-		0    /* use_domain */
+		1    /* use_domain */
 };
 
 struct cpl_functions  cpl_fct;
@@ -157,17 +157,17 @@ static const param_export_t params[] = {
  * Exported MI functions
  */
 static const mi_export_t mi_cmds[] = {
-	{ "LOAD_CPL", 0, 0, 0, {
+	{ "load", 0, 0, 0, {
 		{mi_cpl_load, {"username", "cpl_filename", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"LOAD_CPL", 0}
 	},
-	{ "REMOVE_CPL", 0, 0, 0, {
+	{ "remove", 0, 0, 0, {
 		{mi_cpl_remove, {"username", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"REMOVE_CPL", 0}
 	},
-	{ "GET_CPL", 0, 0, 0, {
+	{ "get", 0, 0, 0, {
 		{mi_cpl_get, {"username", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"GET_CPL", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };

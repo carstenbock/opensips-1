@@ -27,16 +27,22 @@
 
 #include <unistd.h>
 
+#include <strings.h>
+#include <sys/utsname.h>
 #include "../ipc.h"
+#include "../locking.h"
+#include "../mem/shm_mem.h"
+#ifdef __OS_linux
+#include <linux/filter.h>
+#endif
 #include "../daemonize.h"
 #include "../reactor.h"
 #include "../timer.h"
 #include "../pt_load.h"
 #include "../cfg_reload.h"
+#include "../profiling.h"
 #include "net_udp.h"
 
-
-#define UDP_SELECT_TIMEOUT  1
 
 /* if the UDP network layer is used or not by some protos */
 static int udp_disabled = 1;
@@ -44,9 +50,13 @@ static int udp_disabled = 1;
 extern void handle_sigs(void);
 
 /* initializes the UDP network layer */
+static void udp_rx_mode_resolve(void);
+
 int udp_init(void)
 {
 	unsigned int i;
+
+	udp_rx_mode_resolve();
 
 	/* first we do auto-detection to see if there are any UDP based
 	 * protocols loaded */
@@ -139,7 +149,101 @@ static int setup_mcast_rcvr(int sock, union sockaddr_union* addr)
  *
  * @status_flags - extra status flags to be set for the socket fd
  */
-int udp_init_listener(struct socket_info *si, int status_flags)
+int udp_rx_mode = UDP_RX_AUTO;
+/* the mode actually in use, resolved once in udp_init() */
+static int udp_rx_mode_eff = UDP_RX_SHARED;
+
+int os_kernel_at_least(int major, int minor)
+{
+#ifdef __OS_linux
+	struct utsname u;
+	int ma, mi;
+
+	if (uname(&u) < 0 || sscanf(u.release, "%d.%d", &ma, &mi) != 2)
+		return 0;
+	return ma > major || (ma == major && mi >= minor);
+#else
+	return 0;
+#endif
+}
+
+/* Per-worker SO_REUSEPORT sockets with a cBPF selector exist on Linux only
+ * (SO_ATTACH_REUSEPORT_CBPF, 4.5+).  Keep this overrideable so builds for a
+ * known-incompatible kernel can disable the feature explicitly. */
+#ifndef UDP_RX_REUSEPORT_BUILD
+#if defined(__OS_linux) && defined(SO_REUSEPORT) && defined(SO_ATTACH_REUSEPORT_CBPF)
+#define UDP_RX_REUSEPORT_BUILD 1
+#else
+#define UDP_RX_REUSEPORT_BUILD 0
+#endif
+#endif
+
+int parse_udp_rx_mode(const char *s)
+{
+	if (!strcasecmp(s, "auto")) udp_rx_mode = UDP_RX_AUTO;
+	else if (!strcasecmp(s, "shared")) udp_rx_mode = UDP_RX_SHARED;
+	else if (!strcasecmp(s, "exclusive")) udp_rx_mode = UDP_RX_EXCLUSIVE;
+#if UDP_RX_REUSEPORT_BUILD
+	else if (!strcasecmp(s, "reuseport")) udp_rx_mode = UDP_RX_REUSEPORT;
+#endif
+	else return -1;
+	return 0;
+}
+
+/* SO_ATTACH_REUSEPORT_CBPF is 4.5+, EPOLLEXCLUSIVE without the "woken but not
+ * running process absorbs the next events" behaviour is 6.0+ (commit
+ * "epoll: autoremove wakers even more aggressively") */
+#if UDP_RX_REUSEPORT_BUILD
+#define UDP_RX_HAVE_REUSEPORT (os_kernel_at_least(4, 5))
+#else
+#define UDP_RX_HAVE_REUSEPORT 0
+#endif
+#if defined(HAVE_EPOLL) && defined(EPOLLEXCLUSIVE)
+#define UDP_RX_HAVE_EXCLUSIVE \
+	(io_poll_method == POLL_EPOLL && os_kernel_at_least(6, 0))
+#else
+#define UDP_RX_HAVE_EXCLUSIVE 0
+#endif
+
+static void udp_rx_mode_resolve(void)
+{
+	static const char *names[] = { "auto", "shared", "exclusive", "reuseport" };
+
+	switch (udp_rx_mode) {
+	case UDP_RX_AUTO:
+		udp_rx_mode_eff = UDP_RX_HAVE_REUSEPORT ?
+			UDP_RX_REUSEPORT : UDP_RX_SHARED;
+		break;
+	case UDP_RX_EXCLUSIVE:
+		if (UDP_RX_HAVE_EXCLUSIVE) {
+			udp_rx_mode_eff = UDP_RX_EXCLUSIVE;
+		} else {
+			LM_WARN("udp_rx_mode=exclusive needs the epoll reactor on a 6.0+ "
+				"Linux kernel (older ones serialize packet bursts on one "
+				"worker), using 'shared'\n");
+			udp_rx_mode_eff = UDP_RX_SHARED;
+		}
+		break;
+	case UDP_RX_REUSEPORT:
+		if (UDP_RX_HAVE_REUSEPORT) {
+			udp_rx_mode_eff = UDP_RX_REUSEPORT;
+		} else {
+			LM_WARN("udp_rx_mode=reuseport needs SO_REUSEPORT with a cBPF "
+				"selector (Linux 4.5+), not available here, using 'shared'\n");
+			udp_rx_mode_eff = UDP_RX_SHARED;
+		}
+		break;
+	default:
+		udp_rx_mode_eff = UDP_RX_SHARED;
+	}
+	LM_INFO("UDP receive mode: %s (configured: %s)\n",
+		names[udp_rx_mode_eff], names[udp_rx_mode]);
+}
+
+
+/* creates and configures ONE UDP socket for the listener into si->socket */
+static int udp_setup_socket(struct socket_info *si, int status_flags,
+		int reuseport)
 {
 	union sockaddr_union* addr;
 	int optval;
@@ -181,7 +285,7 @@ int udp_init_listener(struct socket_info *si, int status_flags)
 		goto error;
 	}
 
-	if (si->flags & SI_REUSEPORT) {
+	if (reuseport || (si->flags & SI_REUSEPORT)) {
 		optval=1;
 		if (setsockopt(si->socket, SOL_SOCKET, SO_REUSEPORT ,
 						(void*)&optval, sizeof(optval)) ==-1){
@@ -194,11 +298,19 @@ int udp_init_listener(struct socket_info *si, int status_flags)
 		/* no DF */
 #if defined(IP_MTU_DISCOVER)
 		optval = IP_PMTUDISC_DONT;
-		setsockopt(si->socket, IPPROTO_IP, IP_MTU_DISCOVER, (void*)&optval, sizeof(optval));
+		if (setsockopt(si->socket, IPPROTO_IP, IP_MTU_DISCOVER,
+				(void*)&optval, sizeof(optval)) == -1) {
+			LM_ERR("setsockopt: %s\n", strerror(errno));
+			goto error;
+		}
 #else
 #if defined(IP_DONTFRAG)
 		optval = 1;
-		setsockopt(si->socket, IPPROTO_IP, IP_DONTFRAG, (void*)&optval, sizeof(optval));
+		if (setsockopt(si->socket, IPPROTO_IP, IP_DONTFRAG,
+				(void*)&optval, sizeof(optval)) == -1) {
+			LM_ERR("setsockopt: %s\n", strerror(errno));
+			goto error;
+		}
 #else
 		LM_ERR("DF flag is not supported by your system\n");
 		goto error;
@@ -283,11 +395,207 @@ error:
 	return -1;
 }
 
-int udp_bind_listener(struct socket_info *si)
+
+/* how many sockets this listener gets: 1 (shared) or one per worker */
+static inline int udp_listener_socks(struct socket_info *si)
+{
+	int n = si->workers;
+
+	if (udp_rx_mode_eff != UDP_RX_REUSEPORT)
+		return 1;
+	if (si->s_profile && si->s_profile->max_procs > n)
+		n = si->s_profile->max_procs;
+	return n > 1 ? n : 1;
+}
+
+
+/* reuseport + auto-scaling: which socket slot has a reader. Slot i belongs
+ * to socket worker_socks[i]; proc[i] is the process-table index of the
+ * worker reading it, 0 = no reader. Lives in shm: the attendant assigns a
+ * slot when it forks a dynamic worker, the worker frees it when it is
+ * ripped, and whoever changes the set re-attaches the selector program. */
+struct udp_worker_slots {
+	gen_lock_t lock;
+	int proc[0];
+};
+
+
+int udp_init_listener(struct socket_info *si, int status_flags)
+{
+	int n = udp_listener_socks(si), i, fd0;
+
+	if (udp_setup_socket(si, status_flags, n > 1) < 0)
+		return -1;
+	if (n == 1)
+		return 0;
+
+	si->worker_socks = pkg_malloc(n * sizeof(int));
+	if (!si->worker_socks) {
+		LM_ERR("no more pkg memory for %d worker sockets\n", n);
+		return -1;
+	}
+	fd0 = si->worker_socks[0] = si->socket;
+	for (i = 1; i < n; i++) {
+		if (udp_setup_socket(si, status_flags, 1) < 0) {
+			LM_ERR("failed to create worker socket %d for %.*s\n", i,
+				si->sock_str.len, si->sock_str.s);
+			return -1;
+		}
+		si->worker_socks[i] = si->socket;
+	}
+	si->socket = fd0;
+	si->worker_socks_no = n;
+	si->worker_slots = shm_malloc(sizeof(struct udp_worker_slots) +
+		n * sizeof(int));
+	if (!si->worker_slots) {
+		LM_ERR("no more shm memory for %d worker slots\n", n);
+		return -1;
+	}
+	memset(si->worker_slots, 0, sizeof(struct udp_worker_slots) +
+		n * sizeof(int));
+	lock_init(&((struct udp_worker_slots *)si->worker_slots)->lock);
+	LM_INFO("listener %.*s: %d per-worker SO_REUSEPORT sockets (%d at start)\n",
+		si->sock_str.len, si->sock_str.s, n, (int)si->workers);
+	return 0;
+}
+
+
+#if UDP_RX_REUSEPORT_BUILD
+/* classic BPF program for the SO_REUSEPORT group: pick the socket index
+ * uniformly at random per packet (A = prandom; A %= n; return A). The
+ * kernel's default is a 4-tuple hash, which for SIP (a handful of fat
+ * sources: SBCs, PBXs, trunks) pins whole sources to single workers. */
+static int udp_attach_random_select(int fd, const int *slots, int n)
+{
+	/* A = prandom; A %= n; then map A -> slots[A] (a plain "ret A" when
+	 * the active slots are exactly 0..n-1) */
+	struct sock_filter *prog;
+	struct sock_fprog fprog;
+	int i, dense = 1, len;
+
+	if (n < 1) {
+		LM_ERR("no active worker slot to select\n");
+		return -1;
+	}
+	for (i = 0; i < n; i++)
+		if (slots[i] != i) { dense = 0; break; }
+	len = dense ? 3 : 2 + 2 * n + 1;
+	prog = pkg_malloc(len * sizeof(*prog));
+	if (!prog) {
+		LM_ERR("no more pkg memory for the selector program\n");
+		return -1;
+	}
+	prog[0] = (struct sock_filter)
+		{ BPF_LD  | BPF_W   | BPF_ABS, 0, 0, SKF_AD_OFF + SKF_AD_RANDOM };
+	prog[1] = (struct sock_filter){ BPF_ALU | BPF_MOD | BPF_K, 0, 0, (unsigned)n };
+	if (dense) {
+		prog[2] = (struct sock_filter){ BPF_RET | BPF_A, 0, 0, 0 };
+	} else {
+		for (i = 0; i < n; i++) {
+			prog[2 + 2 * i] = (struct sock_filter)
+				{ BPF_JMP | BPF_JEQ | BPF_K, 0, 1, (unsigned)i };
+			prog[3 + 2 * i] = (struct sock_filter)
+				{ BPF_RET | BPF_K, 0, 0, (unsigned)slots[i] };
+		}
+		prog[2 + 2 * n] = (struct sock_filter)
+			{ BPF_RET | BPF_K, 0, 0, (unsigned)slots[0] };
+	}
+	fprog.len = len; fprog.filter = prog;
+	if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF,
+			&fprog, sizeof(fprog)) < 0) {
+		LM_ERR("SO_ATTACH_REUSEPORT_CBPF failed: %s\n", strerror(errno));
+		pkg_free(prog);
+		return -1;
+	}
+	pkg_free(prog);
+	return 0;
+}
+
+
+/* re-attach the selector from the slot table; the lock must be held */
+static int udp_reselect_from_slots(const struct socket_info *si)
+{
+	struct udp_worker_slots *ws = si->worker_slots;
+	int *active, i, n = 0, rc;
+
+	active = pkg_malloc(si->worker_socks_no * sizeof(int));
+	if (!active) {
+		LM_ERR("no more pkg memory for the active slot list\n");
+		return -1;
+	}
+	for (i = 0; i < si->worker_socks_no; i++)
+		if (ws->proc[i])
+			active[n++] = i;
+	rc = udp_attach_random_select(si->worker_socks[0], active, n);
+	pkg_free(active);
+	return rc;
+}
+
+
+/* attendant: reserve the lowest free slot for a worker about to be forked */
+static int udp_slot_reserve(struct socket_info *si)
+{
+	struct udp_worker_slots *ws = si->worker_slots;
+	int i;
+
+	lock_get(&ws->lock);
+	for (i = 0; i < si->worker_socks_no; i++)
+		if (ws->proc[i] == 0) {
+			ws->proc[i] = -1; /* reserved, counts as active */
+			break;
+		}
+	lock_release(&ws->lock);
+	return i < si->worker_socks_no ? i : -1;
+}
+
+
+/* attendant: the worker is forked (or the fork failed: proc_idx = 0) */
+static void udp_slot_commit(struct socket_info *si, int slot, int proc_idx)
+{
+	struct udp_worker_slots *ws = si->worker_slots;
+
+	lock_get(&ws->lock);
+	ws->proc[slot] = proc_idx;
+	if (udp_reselect_from_slots(si) < 0)
+		LM_ERR("failed to re-attach the UDP selector after slot %d change\n",
+			slot);
+	lock_release(&ws->lock);
+}
+
+
+/* ripped worker: leave the group, then drain what already reached its
+ * socket so nothing is stranded in a socket without a reader */
+static void udp_slot_release(const struct socket_info *si)
+{
+	struct udp_worker_slots *ws = si->worker_slots;
+	int i, n, left = 100000;
+	char c;
+
+	lock_get(&ws->lock);
+	for (i = 0; i < si->worker_socks_no; i++)
+		if (ws->proc[i] == process_no)
+			ws->proc[i] = 0;
+	if (udp_reselect_from_slots(si) < 0)
+		LM_ERR("failed to re-attach the UDP selector on worker exit\n");
+	lock_release(&ws->lock);
+	while (left-- > 0 &&
+	recv(si->socket, &c, 1, MSG_PEEK | MSG_DONTWAIT) > 0)
+		protos[si->proto].net.dgram.read(si, &n);
+}
+#else
+/* reuseport is never selected here (udp_rx_mode_resolve()), so no listener
+ * has worker sockets and the dynamic-fork path never reaches these */
+static inline int udp_slot_reserve(struct socket_info *si) { return -1; }
+static inline void udp_slot_commit(struct socket_info *si, int slot,
+		int proc_idx) { }
+#endif
+
+
+static int udp_bind_fd(struct socket_info *si, int fd)
 {
 	union sockaddr_union* addr = &si->su;
-	if (bind(si->socket,  &addr->s, sockaddru_len(*addr))==-1){
-		LM_ERR("bind(%x, %p, %d) on %s: %s\n", si->socket, &addr->s,
+	if (bind(fd,  &addr->s, sockaddru_len(*addr))==-1){
+		LM_ERR("bind(%x, %p, %d) on %s: %s\n", fd, &addr->s,
 				(unsigned)sockaddru_len(*addr),	si->address_str.s,
 				strerror(errno));
 		if (addr->s.sa_family==AF_INET6)
@@ -295,6 +603,36 @@ int udp_bind_listener(struct socket_info *si)
 					" local address, try site local or global\n");
 		return -1;
 	}
+	return 0;
+}
+
+
+int udp_bind_listener(struct socket_info *si)
+{
+	int n = si->worker_socks ? si->worker_socks_no : 1, i;
+
+	for (i = 0; i < n; i++)
+		if (udp_bind_fd(si, si->worker_socks ? si->worker_socks[i]
+				: si->socket) < 0)
+			return -1;
+#if UDP_RX_REUSEPORT_BUILD
+	/* the group exists once the sockets are bound; the program attached to
+	 * any member applies to the whole group */
+	/* at start only the static workers (slots 0..workers-1) read */
+	if (n > 1) {
+		int *slots = pkg_malloc(si->workers * sizeof(int));
+		if (!slots) {
+			LM_ERR("no more pkg memory for the slot list\n");
+			return -1;
+		}
+		for (i = 0; i < si->workers; i++)
+			slots[i] = i;
+		i = udp_attach_random_select(si->worker_socks[0], slots, si->workers);
+		pkg_free(slots);
+		if (i < 0)
+			return -1;
+	}
+#endif
 	return 0;
 }
 
@@ -308,26 +646,44 @@ inline static int handle_io(struct fd_map* fm, int idx,int event_type)
 
 	pre_run_handle_script_reload(fm->app_flags);
 
+	profiling_proc_start( LEVEL_SIP, 1);
+
 	switch(fm->type){
 		case F_UDP_READ:
+			profiling_proc_enter( LEVEL_SIP,
+				ss_merge256(
+					protos[((struct socket_info*)fm->data)->proto].name,
+					" proto reading"),
+				1 );
 			n = protos[((struct socket_info*)fm->data)->proto].net.
 				dgram.read( fm->data /*si*/, &read);
+			profiling_proc_exit( LEVEL_SIP, "reading done", n );
 			break;
 		case F_TIMER_JOB:
+			profiling_proc_enter( LEVEL_FULL, "timer_job", 1 );
 			handle_timer_job();
+			profiling_proc_exit( LEVEL_FULL, "timer_job", n);
 			break;
 		case F_SCRIPT_ASYNC:
-			async_script_resume_f( fm->fd, fm->data,
+			profiling_proc_enter( LEVEL_SIP, "async_script", 0 );
+			n = async_script_resume_f( fm->fd, fm->data,
 				(event_type==IO_WATCH_TIMEOUT)?1:0 );
+			profiling_proc_exit( LEVEL_SIP, "async_script", n);
 			break;
 		case F_FD_ASYNC:
-			async_fd_resume( fm->fd, fm->data);
+			profiling_proc_enter( LEVEL_SIP, "async_fd", 0 );
+			n = async_fd_resume( fm->fd, fm->data);
+			profiling_proc_exit( LEVEL_SIP, "async_fd", n);
 			break;
 		case F_LAUNCH_ASYNC:
-			async_launch_resume( fm->fd, fm->data);
+			profiling_proc_enter( LEVEL_SIP, "async_launch", 0 );
+			n = async_launch_resume( fm->fd, fm->data);
+			profiling_proc_exit( LEVEL_SIP, "async_launch", n);
 			break;
 		case F_IPC:
+			profiling_proc_enter( LEVEL_SIP, "ipc_job", 1 );
 			ipc_handle_job(fm->fd);
+			profiling_proc_exit( LEVEL_SIP, "ipc_job", n);
 			break;
 		default:
 			LM_CRIT("unknown fd type %d in UDP worker\n", fm->type);
@@ -341,6 +697,8 @@ inline static int handle_io(struct fd_map* fm, int idx,int event_type)
 		if (reactor_is_empty())
 			dynamic_process_final_exit();
 	}
+
+	profiling_proc_end( LEVEL_SIP, n );
 
 	post_run_handle_script_reload();
 
@@ -377,7 +735,9 @@ int udp_proc_reactor_init( struct socket_info *si )
 	}
 
 	/* init: start watching the SIP UDP fd */
-	if (reactor_add_reader( si->socket, F_UDP_READ, RCT_PRIO_NET, si)<0) {
+	if ((udp_rx_mode_eff == UDP_RX_EXCLUSIVE && !si->worker_socks) ?
+	reactor_add_reader_excl( si->socket, F_UDP_READ, RCT_PRIO_NET, si)<0 :
+	reactor_add_reader( si->socket, F_UDP_READ, RCT_PRIO_NET, si)<0) {
 		LM_CRIT("failed to add UDP listen socket to reactor\n");
 		goto error;
 	}
@@ -393,14 +753,23 @@ static int fork_dynamic_udp_process(void *si_filter)
 {
 	struct socket_info *si = (struct socket_info*)si_filter;
 	int p_id;
+	int slot = -1;
 	const struct internal_fork_params ifp_udp_rcv = {
 		.proc_desc = "UDP receiver",
 		.flags = OSS_PROC_DYNAMIC|OSS_PROC_NEEDS_SCRIPT,
 		.type = TYPE_UDP,
 	};
 
+	if (si->worker_socks && (slot = udp_slot_reserve(si)) < 0) {
+		LM_ERR("no free worker socket slot for a new UDP process on %.*s\n",
+			si->sock_str.len, si->sock_str.s);
+		return -1;
+	}
+
 	if ((p_id=internal_fork(&ifp_udp_rcv))<0) {
 		LM_CRIT("cannot fork UDP process\n");
+		if (slot >= 0)
+			udp_slot_commit(si, slot, 0);
 		return(-1);
 	} else if (p_id==0) {
 		/* new UDP process */
@@ -409,17 +778,20 @@ static int fork_dynamic_udp_process(void *si_filter)
 			si->sock_str.len, si->sock_str.s);
 		pt[process_no].pg_filter = si;
 		bind_address=si; /* shortcut */
+		if (slot >= 0)
+			si->socket = si->worker_socks[slot];
 		/* we first need to init the reactor to be able to add fd
 		 * into it in child_init routines */
 		if (udp_proc_reactor_init(si) < 0 ||
-		init_child(10000/*FIXME*/) < 0) {
+		init_child(10000/*FIXME*/) < 0 ||
+		self_update_routing_script() < 0) {
 			goto error;
 		}
 		report_conditional_status( 1, 0); /*report success*/
 		/* the child proc is done read&write) dealing with the status pipe */
 		clean_read_pipeend();
 
-		reactor_main_loop(UDP_SELECT_TIMEOUT, error, );
+		reactor_main_loop( worker_reactor_timeout, error, );
 		destroy_worker_reactor();
 error:
 		report_failure_status();
@@ -428,6 +800,8 @@ error:
 		exit( -1);
 	} else {
 		/*parent/main*/
+		if (slot >= 0)
+			udp_slot_commit(si, slot, p_id);
 		return p_id;
 	}
 }
@@ -450,7 +824,11 @@ static void udp_process_graceful_terminate(int sender, void *param)
 	/*remove IPC dispatcher pipe */
 	reactor_del_reader( IPC_FD_READ_SHARED, -1, 0);
 
-	/*remove network interface */
+	/*remove network interface - leave the reuseport group first */
+#if UDP_RX_REUSEPORT_BUILD
+	if (bind_address->worker_socks)
+		udp_slot_release(bind_address);
+#endif
 	reactor_del_reader( bind_address->socket, -1, 0);
 
 	/*remove private IPC pipe */
@@ -471,7 +849,7 @@ static void udp_process_graceful_terminate(int sender, void *param)
 
 
 /* starts all UDP related processes */
-int udp_start_processes(int *chd_rank, int *startup_done)
+int udp_start_processes(int *chd_rank, atomic_t *startup_done)
 {
 	struct socket_info_full *sif;
 	int p_id;
@@ -511,26 +889,31 @@ int udp_start_processes(int *chd_rank, int *startup_done)
 						si->sock_str.len, si->sock_str.s);
 					pt[process_no].pg_filter = si;
 					bind_address=si; /* shortcut */
+					/* per-worker sockets: this worker reads (and sends) on
+					 * its own member of the SO_REUSEPORT group; si is pkg
+					 * memory, so the swap is private to this process */
+					if (si->worker_socks)
+						si->socket = si->worker_socks[i];
 					/* we first need to init the reactor to be able to add fd
 					 * into it in child_init routines */
 					if (udp_proc_reactor_init(si) < 0 ||
 							init_child(*chd_rank) < 0) {
 						report_failure_status();
 						if (*chd_rank == 1 && startup_done)
-							*startup_done = -1;
+							atomic_store(startup_done, -1);
 						exit(-1);
 					}
 
-					/* first UDP proc runs statup_route (if defined) */
+					/* Only the first SIP worker owns the startup flag. */
 					if(*chd_rank == 1 && startup_done!=NULL) {
 						LM_DBG("running startup for first UDP\n");
 						if(run_startup_route()< 0) {
 							report_failure_status();
-							*startup_done = -1;
+							atomic_store(startup_done, -1);
 							LM_ERR("Startup route processing failed\n");
 							exit(-1);
 						}
-						*startup_done = 1;
+						atomic_store(startup_done, 1);
 					}
 
 					report_conditional_status( (!no_daemon_mode), 0);
@@ -544,17 +927,22 @@ int udp_start_processes(int *chd_rank, int *startup_done)
 					 * \see receive_msg
 					 * \see main_loop
 					 */
-					reactor_main_loop(UDP_SELECT_TIMEOUT, error, );
+					reactor_main_loop( worker_reactor_timeout, error, );
 					destroy_worker_reactor();
 					exit(-1);
 				} else {
 					/*parent*/
+					if (si->worker_slots)
+						((struct udp_worker_slots *)si->worker_slots)->proc[i] = p_id;
 					/* wait for first proc to finish the startup route */
-					if (*chd_rank == 1 && startup_done)
-						while(!(*startup_done)) {
+					if (*chd_rank == 1 && startup_done) {
+						while (atomic_load(startup_done) == 0) {
 							usleep(5);
 							handle_sigs();
 						}
+						if (atomic_load(startup_done) != 1)
+							goto error;
+					}
 				}
 			} /* procs per listener */
 		} /* looping through the listeners per proto */
@@ -564,4 +952,3 @@ int udp_start_processes(int *chd_rank, int *startup_done)
 error:
 	return -1;
 }
-

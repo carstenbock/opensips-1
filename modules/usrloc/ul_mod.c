@@ -92,7 +92,6 @@ static int mi_child_init(void);
 int ul_init_globals(void);
 int ul_check_config(void);
 int ul_check_db(void);
-int ul_deprec_shp(modparam_t _, void *modparam);
 
 /*! \brief Fixup functions */
 static int domain_fixup(void** param);
@@ -138,7 +137,6 @@ str params_col      = str_init(PARAMS_COL);
 
 str db_url          = STR_NULL;					/*!< Database URL */
 str cdb_url         = STR_NULL;					/*!< Cache Database URL */
-enum usrloc_modes db_mode = NOT_SET;   /*!< XXX: DEPRECATED: DB sync scheme */
 char *runtime_preset;
 
 /*!< Clustering scheme */
@@ -156,7 +154,7 @@ char *sql_wmode_str;
 enum ul_pinging_mode pinging_mode = PMD_COOPERATION;
 char *pinging_mode_str;
 
-int use_domain      = 0;   /*!< Whether usrloc should use domain part of aor */
+int use_domain      = 1;   /*!< Whether usrloc should use domain part of aor */
 int desc_time_order = 0;   /*!< By default do not enable timestamp ordering */
 
 int ul_hash_size = 9;
@@ -239,12 +237,10 @@ static const param_export_t params[] = {
 	{"timer_interval",     INT_PARAM, &timer_interval    },
 
 	/* runtime behavior selection */
-	{"db_mode",            INT_PARAM, &db_mode           }, /* bw-compat */
 	{"working_mode_preset",STR_PARAM, &runtime_preset    },
 	{"cluster_mode",       STR_PARAM, &cluster_mode_str  },
 	{"restart_persistency",STR_PARAM, &rr_persist_str    },
 	{"sql_write_mode",     STR_PARAM, &sql_wmode_str     },
-	{"shared_pinging",     INT_PARAM|USE_FUNC_PARAM, ul_deprec_shp },
 	{"pinging_mode",       STR_PARAM, &pinging_mode_str  },
 
 	{"use_domain",         INT_PARAM, &use_domain        },
@@ -285,53 +281,44 @@ static const stat_export_t mod_stats[] = {
 	{"registered_users" ,  STAT_IS_FUNC, (stat_var**)get_number_of_users  },
 	{0,0,0}
 };
-
 static const mi_export_t mi_cmds[] = {
 	{ MI_USRLOC_RM, 0, 0, mi_child_init, {
 		{mi_usrloc_rm_aor, {"table_name", "aor", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"ul_rm", 0}
 	},
 	{ MI_USRLOC_RM_CONTACT, 0, 0, mi_child_init, {
 		{mi_usrloc_rm_contact, {"table_name", "aor", "contact", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"ul_rm_contact", 0}
 	},
 	{ MI_USRLOC_DUMP, 0, 0, 0, {
 		{w_mi_usrloc_dump, {0}},
 		{w_mi_usrloc_dump_1, {"brief", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"ul_dump", 0}
 	},
 	{ MI_USRLOC_FLUSH, 0, 0, mi_child_init, {
 		{mi_usrloc_flush, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"ul_flush", 0}
 	},
 	{ MI_USRLOC_ADD, 0, 0, mi_child_init, {
 		{mi_usrloc_add, {"table_name", "aor", "contact", "expires", "q",
 						 "flags", "cflags", "methods", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"ul_add", 0}
 	},
 	{ MI_USRLOC_SHOW_CONTACT, 0, 0, mi_child_init, {
 		{mi_usrloc_show_contact, {"table_name", "aor", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"ul_show_contact", 0}
 	},
 	{ MI_USRLOC_SYNC, 0, 0, mi_child_init, {
 		{mi_usrloc_sync_1, {"table_name", 0}},
 		{mi_usrloc_sync_2, {"table_name", "aor", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"ul_sync", 0}
 	},
 	{ MI_USRLOC_CL_SYNC, 0, 0, mi_child_init, {
 		{mi_usrloc_cl_sync, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"ul_cluster_sync", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };
-
-static module_dependency_t *get_deps_db_mode(const param_export_t *param)
-{
-	if (*(int *)param->param_pointer <= NO_DB)
-		return NULL;
-
-	return alloc_module_dep(MOD_TYPE_SQLDB, NULL, DEP_ABORT);
-}
 
 static module_dependency_t *get_deps_wmode_preset(const param_export_t *param)
 {
@@ -359,7 +346,6 @@ static const dep_export_t deps = {
 		{ MOD_TYPE_NULL, NULL, 0 },
 	},
 	{ /* modparam dependencies */
-		{"db_mode", get_deps_db_mode},
 		{"cachedb_url", get_deps_cachedb_url},
 		{"working_mode_preset", get_deps_wmode_preset},
 		{"cluster_mode", get_deps_wmode_preset},
@@ -562,34 +548,6 @@ static void destroy(void)
 
 int ul_check_config(void)
 {
-	if (db_mode >= NO_DB && db_mode <= DB_ONLY) {
-		if (runtime_preset) {
-			LM_ERR("both 'db_mode' and 'working_mode_preset' are present "
-			       "-- please pick one!\n");
-			return -1;
-		}
-
-		LM_WARN("'db_mode' is now deprecated, use 'working_mode_preset'!\n");
-
-		switch (db_mode) {
-		case NOT_SET:
-		case NO_DB:
-			runtime_preset = "single-instance-no-db";
-			break;
-		case WRITE_THROUGH:
-			runtime_preset = "single-instance-sql-write-through";
-			break;
-		case WRITE_BACK:
-			runtime_preset = "single-instance-sql-write-back";
-			break;
-		case DB_ONLY:
-			runtime_preset = "sql-only";
-			break;
-		}
-	} else if (db_mode != NOT_SET) {
-		LM_WARN("ignoring unknown db_mode: %d\n", db_mode);
-	}
-
 	if (runtime_preset) {
 		if (!strcasecmp(runtime_preset, "single-instance-no-db")) {
 			cluster_mode = CM_NONE;
@@ -823,23 +781,10 @@ int ul_check_config(void)
 		break;
 	}
 
-	LM_DBG("ul config: db_mode=%d, cluster_mode=%d, rrp=%d, sql_wm=%d\n",
-	       db_mode, cluster_mode, rr_persist, sql_wmode);
+	LM_DBG("ul config: cluster_mode=%d, rrp=%d, sql_wm=%d\n",
+	       cluster_mode, rr_persist, sql_wmode);
 
 	return 0;
-}
-
-int ul_deprec_shp(modparam_t _, void *modparam)
-{
-	LM_NOTICE("the 'shared_pinging' module parameter has been deprecated "
-				"in favour of 'pinging_mode'\n");
-
-	if ((int *)modparam == 0)
-		pinging_mode = PMD_OWNERSHIP;
-	else
-		pinging_mode = PMD_COOPERATION;
-
-	return 1;
 }
 
 int ul_init_globals(void)

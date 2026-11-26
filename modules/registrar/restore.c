@@ -154,7 +154,7 @@ int restore_contact(struct sip_msg *msg, void *domain, str *aor_uri,
 
 	ul.lock_udomain(d, &aor);
 	if (ul.get_urecord(d, &aor, &r) > 0) {
-		if (ul.insert_urecord(d, &aor, &r, 0) < 0) {
+		if (ul.insert_urecord(d, &aor, &r, 0, NULL, NULL) < 0) {
 			LM_ERR("failed to insert the record of <%.*s>\n", aor.len, aor.s);
 			goto error_unlock;
 		}

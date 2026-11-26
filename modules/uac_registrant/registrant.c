@@ -176,35 +176,35 @@ static const param_export_t params[]= {
 
 /** MI commands */
 static const mi_export_t mi_cmds[] = {
-	{ "reg_list", 0, 0, 0, {
+	{ "list", 0, 0, 0, {
 		{mi_reg_list, {0}},
 		{mi_reg_list_record, {"aor", "contact", "registrar", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"reg_list", 0}
 	},
-	{ "reg_reload", 0, 0, 0, {
+	{ "reload", 0, 0, 0, {
 		{mi_reg_reload, {0}},
 		{mi_reg_reload_record, {"aor", "contact", "registrar", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"reg_reload", 0}
 	},
-	{ "reg_enable", 0, 0, 0, {
+	{ "enable", 0, 0, 0, {
 		{mi_reg_enable, {"aor", "contact", "registrar", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"reg_enable", 0}
 	},
-	{ "reg_disable", 0, 0, 0, {
+	{ "disable", 0, 0, 0, {
 		{mi_reg_disable, {"aor", "contact", "registrar", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"reg_disable", 0}
 	},
-	{ "reg_force_register", 0, 0, 0, {
+	{ "force_register", 0, 0, 0, {
 		{mi_reg_force_register, {"aor", "contact", "registrar", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"reg_force_register", 0}
 	},
-	{"reg_upsert", 0, 0, 0, {
+	{"upsert", 0, 0, 0, {
 		{mi_reg_upsert, {"aor", "contact", "registrar","proxy","third_party_registrant","username","password","binding_params","expiry","forced_socket","cluster_shtag","state", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"reg_upsert", 0}
 	},
-	{ "reg_delete", 0, 0, 0, {
+	{ "delete", 0, 0, 0, {
 		{mi_reg_delete, {"aor", "contact", "registrar", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"reg_delete", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };
@@ -232,7 +232,7 @@ struct module_exports exports= {
 	0,					/* exported functions */
 	0,					/* exported async functions */
 	params,				/* exported parameters */
-	NULL,				/* exported statistics */
+	reg_stats,			/* exported statistics */
 	mi_cmds,			/* exported MI functions */
 	NULL,				/* exported pseudo-variables */
 	0,					/* exported transformations */
@@ -728,8 +728,10 @@ int run_reg_tm_cback(void *e_data, void *data, void *r_data)
 			LM_ERR("FAKED_REPLY\n");
 			goto done;
 		}
-		if (0 == parse_min_expires(msg)) {
-			rec->expires = (unsigned int)(long)msg->min_expires->parsed;
+		/* do we have a Min-Expires with a resonable value (a shorter than
+		 * 5 seconds registration is not considered resonable) */
+		if (0 == parse_min_expires(msg) && 5<=(unsigned int)(long)msg->min_expires->parsed) {
+			rec->wanted_expires = (unsigned int)(long)msg->min_expires->parsed;
 			if(send_register(cb_param->hash_index, rec, NULL)==1) {
 				reg_change_state(rec,REGISTERING_STATE);
 			} else {
@@ -831,7 +833,7 @@ int send_register(unsigned int hash_index, reg_record_t *rec, str *auth_hdr)
 	cb_param->uac = rec;
 
 	/* get the string version of expires */
-	expires = int2str((unsigned long)(rec->expires), &expires_len);
+	expires = int2str((unsigned long)(rec->wanted_expires), &expires_len);
 
 	p = extra_hdrs.s;
 	memcpy(p, contact_hdr.s, contact_hdr.len);
@@ -876,7 +878,7 @@ int send_register(unsigned int hash_index, reg_record_t *rec, str *auth_hdr)
 		memset( current_processing_ctx, 0, context_size(CONTEXT_GLOBAL) );
 
 		/* send the request within the new context */
-		result=tmb.t_request_within(
+		result=run_tm_api(&tmb, t_request_within,
 			&register_method,	/* method */
 			&extra_hdrs,		/* extra headers*/
 			NULL,			/* body */
@@ -946,7 +948,7 @@ int send_unregister(unsigned int hash_index, reg_record_t *rec, str *auth_hdr,
 	LM_DBG("extra_hdrs=[%p][%d]->[%.*s]\n",
 		extra_hdrs.s, extra_hdrs.len, extra_hdrs.len, extra_hdrs.s);
 
-	result=tmb.t_request_within(
+	result=run_tm_api(&tmb, t_request_within,
 		&register_method,	/* method */
 		&extra_hdrs,		/* extra headers*/
 		NULL,			/* body */
@@ -1737,7 +1739,7 @@ static mi_response_t *mi_reg_upsert(const mi_params_t *params,
 	}
 	uac_param.hash_code = core_hash(&uac_param.to_uri, NULL, reg_hsize);
 
-	uac_param.from_uri = third_party_registrant;	
+	uac_param.from_uri = third_party_registrant;
 	if (uac_param.from_uri.len) {
 		if (parse_uri(uac_param.from_uri.s,
 		uac_param.from_uri.len, &uri)<0) {
@@ -1856,7 +1858,7 @@ static mi_response_t *mi_reg_upsert(const mi_params_t *params,
 	uac_param.cluster_id,
 	state);
 
-	coords.aor = aor; 
+	coords.aor = aor;
 	coords.contact = contact;
 	coords.registrar = registrar;
 

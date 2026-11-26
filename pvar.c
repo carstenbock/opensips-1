@@ -1507,7 +1507,7 @@ static int pv_get_content_type(struct sip_msg *msg, pv_param_t *param,
 	int idx=-1;
 	int idxf=-1;
 	int distance=0;
-	char buf[BUFLEN];
+	static char buf[BUFLEN];
 	struct sip_msg_body* sbody;
 	struct body_part* body_part;
 	struct body_part* neg_index[2];
@@ -1580,25 +1580,31 @@ static int pv_get_content_type(struct sip_msg *msg, pv_param_t *param,
 		}
 	} else {
 		/* copy main content type */
+		if (msg->content_type->body.len < 0) {
+			LM_ERR("Invalid Content-Type header length (%d)\n",
+				msg->content_type->body.len);
+			return pv_get_null(msg, param, res);
+		}
+		if (msg->content_type->body.len >= BUFLEN) {
+			LM_ERR("Content-Type header too long for pvar buffer (%d >= %d)\n",
+				msg->content_type->body.len, BUFLEN);
+			return pv_get_null(msg, param, res);
+		}
 		memcpy(buf, msg->content_type->body.s, msg->content_type->body.len);
-		buf[msg->content_type->body.len] = ',';
-		s.len = msg->content_type->body.len+1;
+		s.len = msg->content_type->body.len;
 
 		/* copy all the other contenttypes */
 		body_part = &sbody->first;
 		while (body_part) {
 			s.s = convert_mime2string_CT(body_part->mime);
-			if (s.len + strlen(s.s) >= BUFLEN) {
+			if (1 + s.len + strlen(s.s) >= BUFLEN) {
 				LM_CRIT("buffer overflow! Too many contenttypes!\n");
 				return pv_get_null(msg, param, res);
 			}
 
+			buf[s.len++] = ',';
 			memcpy( buf+s.len, s.s, strlen(s.s));
 			s.len += strlen(s.s);
-
-			/* delimiter only if something follows */
-			if(body_part->next)
-				buf[s.len++] = ',';
 
 			body_part = body_part->next;
 		}
@@ -2462,6 +2468,57 @@ static int pv_parse_socket_name(pv_spec_p sp, const str *in)
 	return 0;
 }
 
+#define PROXY_PROTOCOL_SRC_IP_S         "src_ip"
+#define PROXY_PROTOCOL_SRC_IP_LEN       (sizeof(PROXY_PROTOCOL_SRC_IP_S)-1)
+#define PROXY_PROTOCOL_SRC_IP_ID        0
+#define PROXY_PROTOCOL_SRC_PORT_S       "src_port"
+#define PROXY_PROTOCOL_SRC_PORT_LEN     (sizeof(PROXY_PROTOCOL_SRC_PORT_S)-1)
+#define PROXY_PROTOCOL_SRC_PORT_ID      1
+#define PROXY_PROTOCOL_DST_IP_S         "dst_ip"
+#define PROXY_PROTOCOL_DST_IP_LEN       (sizeof(PROXY_PROTOCOL_DST_IP_S)-1)
+#define PROXY_PROTOCOL_DST_IP_ID        2
+#define PROXY_PROTOCOL_DST_PORT_S       "dst_port"
+#define PROXY_PROTOCOL_DST_PORT_LEN     (sizeof(PROXY_PROTOCOL_DST_PORT_S)-1)
+#define PROXY_PROTOCOL_DST_PORT_ID      3
+#define PROXY_PROTOCOL_AF_S             "af"
+#define PROXY_PROTOCOL_AF_LEN           (sizeof(PROXY_PROTOCOL_AF_S)-1)
+#define PROXY_PROTOCOL_AF_ID            4
+
+static int pv_parse_proxy_protocol(pv_spec_p sp, const str *in)
+{
+	if (sp==NULL || in==NULL || in->s==NULL || in->len==0)
+		return -1;
+
+	sp->pvp.pvn.type = PV_NAME_INTSTR;
+	sp->pvp.pvn.u.isname.type = 0;
+
+	if (in->len==PROXY_PROTOCOL_SRC_IP_LEN &&
+	strncasecmp(in->s, PROXY_PROTOCOL_SRC_IP_S, PROXY_PROTOCOL_SRC_IP_LEN)==0 ) {
+		sp->pvp.pvn.u.isname.name.n = PROXY_PROTOCOL_SRC_IP_ID;
+	} else
+	if (in->len==PROXY_PROTOCOL_SRC_PORT_LEN &&
+	strncasecmp(in->s, PROXY_PROTOCOL_SRC_PORT_S, PROXY_PROTOCOL_SRC_PORT_LEN)==0 ) {
+		sp->pvp.pvn.u.isname.name.n = PROXY_PROTOCOL_SRC_PORT_ID;
+	} else
+	if (in->len==PROXY_PROTOCOL_DST_IP_LEN &&
+	strncasecmp(in->s, PROXY_PROTOCOL_DST_IP_S, PROXY_PROTOCOL_DST_IP_LEN)==0 ) {
+		sp->pvp.pvn.u.isname.name.n = PROXY_PROTOCOL_DST_IP_ID;
+	} else
+	if (in->len==PROXY_PROTOCOL_DST_PORT_LEN &&
+	strncasecmp(in->s, PROXY_PROTOCOL_DST_PORT_S, PROXY_PROTOCOL_DST_PORT_LEN)==0 ) {
+		sp->pvp.pvn.u.isname.name.n = PROXY_PROTOCOL_DST_PORT_ID;
+	} else
+	if (in->len==PROXY_PROTOCOL_AF_LEN &&
+	strncasecmp(in->s, PROXY_PROTOCOL_AF_S, PROXY_PROTOCOL_AF_LEN)==0 ) {
+		sp->pvp.pvn.u.isname.name.n = PROXY_PROTOCOL_AF_ID;
+	} else {
+		LM_ERR("unsupported $proxy_protocol field <%.*s>\n",in->len,in->s);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int pv_parse_socket_out_name(pv_spec_p sp, const str *in)
 {
 	if (sp==NULL || in==NULL || in->s==NULL || in->len==0)
@@ -2591,6 +2648,55 @@ static int pv_get_socket_out_fields(struct sip_msg *msg, pv_param_t *param,
 	return get_socket_field( si, &param->pvn, res);
 }
 
+static int pv_get_proxy_protocol(struct sip_msg *msg, pv_param_t *param,
+															pv_value_t *res)
+{
+	if(msg==NULL || res==NULL)
+		return -1;
+
+	if (msg->rcv.real_ep.flags != PP_OK)
+		return pv_get_null(msg, NULL, res);
+
+	switch (param->pvn.u.isname.name.n) {
+		case PROXY_PROTOCOL_SRC_IP_ID:
+			res->rs.s = ip_addr2a(&msg->rcv.real_ep.src_ip);
+			res->rs.len = strlen(res->rs.s);
+			res->flags = PV_VAL_STR;
+			break;
+		case PROXY_PROTOCOL_SRC_PORT_ID:
+			res->ri = msg->rcv.real_ep.src_port;
+			res->rs.s = int2str((uint64_t)msg->rcv.real_ep.src_port, &res->rs.len);
+			res->flags = PV_VAL_STR|PV_VAL_INT|PV_TYPE_INT;
+			break;
+		case PROXY_PROTOCOL_DST_IP_ID:
+			res->rs.s = ip_addr2a(&msg->rcv.real_ep.dst_ip);
+			res->rs.len = strlen(res->rs.s);
+			res->flags = PV_VAL_STR;
+			break;
+		case PROXY_PROTOCOL_DST_PORT_ID:
+			res->ri = msg->rcv.real_ep.dst_port;
+			res->rs.s = int2str((uint64_t)msg->rcv.real_ep.dst_port, &res->rs.len);
+			res->flags = PV_VAL_STR|PV_VAL_INT|PV_TYPE_INT;
+			break;
+		case PROXY_PROTOCOL_AF_ID:
+			if (msg->rcv.real_ep.src_ip.af == AF_INET) {
+				res->rs.s = "INET";
+				res->rs.len = 4;
+			} else if (msg->rcv.real_ep.src_ip.af == AF_INET6) {
+				res->rs.s = "INET6";
+				res->rs.len = 5;
+			} else {
+				return pv_get_null(msg, NULL, res);
+			}
+			res->flags = PV_VAL_STR;
+			break;
+		default:
+			LM_CRIT("BUG - unsupported proxy_protocol ID %d\n",
+					param->pvn.u.isname.name.n);
+			return pv_get_null(NULL, NULL, res);
+	}
+	return 0;
+}
 
 
 
@@ -2641,7 +2747,12 @@ static int pv_get_avp(struct sip_msg *msg,  pv_param_t *param, pv_value_t *res)
 		} else if(avp->flags & AVP_VAL_NULL) {
 			res->flags |= PV_VAL_NULL;
 		} else {
-			res->rs.s = sint2str(avp_value.n, &res->rs.len);
+			if (avp->flags & AVP_VAL_BOOL) {
+				res->rs = avp_value.n ? str_init("true") : str_init("false");
+				res->flags |= PV_VAL_BOOL;
+			} else {
+				res->rs.s = sint2str(avp_value.n, &res->rs.len);
+			}
 			res->ri = avp_value.n;
 			res->flags |= PV_VAL_INT|PV_TYPE_INT;
 		}
@@ -2658,6 +2769,8 @@ static int pv_get_avp(struct sip_msg *msg,  pv_param_t *param, pv_value_t *res)
 			res->rs = avp_value.s;
 		} else if(avp->flags & AVP_VAL_NULL) {
 			memset(&res->rs, 0, sizeof res->rs);
+		} else if(avp->flags & AVP_VAL_BOOL) {
+			res->rs = avp_value.n ? str_init("true") : str_init("false");
 		} else {
 			res->rs.s = sint2str(avp_value.n, &res->rs.len);
 		}
@@ -2677,6 +2790,8 @@ static int pv_get_avp(struct sip_msg *msg,  pv_param_t *param, pv_value_t *res)
 				res->rs = avp_value.s;
 			} else if(avp->flags & AVP_VAL_NULL) {
 				memset(&res->rs, 0, sizeof res->rs);
+			} else if(avp->flags & AVP_VAL_BOOL) {
+				res->rs = avp_value.n ? str_init("true") : str_init("false");
 			} else {
 				res->rs.s = sint2str(avp_value.n, &res->rs.len);
 			}
@@ -2725,7 +2840,12 @@ static int pv_get_avp(struct sip_msg *msg,  pv_param_t *param, pv_value_t *res)
 			} else if(avp->flags & AVP_VAL_NULL) {
 				res->flags |= PV_VAL_NULL;
 			} else {
-				res->rs.s = sint2str(avp_value.n, &res->rs.len);
+				if (avp->flags & AVP_VAL_BOOL) {
+					res->rs = avp_value.n ? str_init("true") : str_init("false");
+					res->flags |= PV_VAL_BOOL;
+				} else {
+					res->rs.s = sint2str(avp_value.n, &res->rs.len);
+				}
 				res->ri = avp_value.n;
 				res->flags |= PV_VAL_INT|PV_TYPE_INT;
 			}
@@ -2744,7 +2864,12 @@ static int pv_get_avp(struct sip_msg *msg,  pv_param_t *param, pv_value_t *res)
 		} else if(avp->flags & AVP_VAL_NULL) {
 			res->flags |= PV_VAL_NULL;
 		} else {
-			res->rs.s = sint2str(avp_value.n, &res->rs.len);
+			if (avp->flags & AVP_VAL_BOOL) {
+				res->rs = avp_value.n ? str_init("true") : str_init("false");
+				res->flags |= PV_VAL_BOOL;
+			} else {
+				res->rs.s = sint2str(avp_value.n, &res->rs.len);
+			}
 			res->ri = avp_value.n;
 			res->flags |= PV_VAL_INT|PV_TYPE_INT;
 		}
@@ -3111,13 +3236,18 @@ static int pv_get_scriptvar(struct sip_msg *msg,  pv_param_t *param,
 		res->rs = sv->v.value.s;
 		res->flags = PV_VAL_STR;
 	} else {
-		sval = sint2str(sv->v.value.n, &ival);
-
-		res->rs.s = sval;
-		res->rs.len = ival;
+		if (sv->v.flags & VAR_VAL_BOOL) {
+			res->rs = sv->v.value.n ? str_init("true") : str_init("false");
+			res->flags = PV_VAL_BOOL;
+		} else {
+			sval = sint2str(sv->v.value.n, &ival);
+			res->rs.s = sval;
+			res->rs.len = ival;
+			res->flags = 0;
+		}
 
 		res->ri = sv->v.value.n;
-		res->flags = PV_VAL_STR|PV_VAL_INT|PV_TYPE_INT;
+		res->flags |= PV_VAL_STR|PV_VAL_INT|PV_TYPE_INT;
 	}
 	return 0;
 }
@@ -3171,6 +3301,8 @@ static int pv_set_avp(struct sip_msg* msg, pv_param_t *param,
 	if(val->flags&PV_TYPE_INT)
 	{
 		avp_val.n = val->ri;
+		if (val->flags & PV_VAL_BOOL)
+			flags |= AVP_VAL_BOOL;
 	} else {
 		avp_val.s = val->rs;
 		flags |= AVP_VAL_STR;
@@ -3230,7 +3362,7 @@ static int pv_set_scriptvar(struct sip_msg* msg, pv_param_t *param,
 	if(val->flags&PV_TYPE_INT)
 	{
 		avp_val.n = val->ri;
-		flags = 0;
+		flags = val->flags & PV_VAL_BOOL ? VAR_VAL_BOOL : 0;
 	} else {
 		avp_val.s = val->rs;
 		flags = VAR_VAL_STR;
@@ -4644,6 +4776,9 @@ const pv_export_t _pv_names_table[] = {
 	{str_const_init("pU"), /* */
 		PVT_PPI_USERNAME, pv_get_ppi_attr, 0,
 		0, 0, pv_init_iname, 2},
+	{str_const_init("proxy_protocol"),
+		PVT_PROXY_PROTOCOL, pv_get_proxy_protocol, 0,
+		pv_parse_proxy_protocol, 0, 0, 0},
 	{str_const_init("rb"), /* */
 		PVT_MSG_BODY, pv_get_msg_body, 0,
 		0, pv_parse_index, 0, 0},
@@ -5665,6 +5800,8 @@ void pv_spec_free(pv_spec_t *spec)
 	/* TODO: free name if it is PV */
 	if(spec->trans)
 		free_transformation((trans_t*)spec->trans);
+	if ((spec->pvp.pvv_flags & PV_PARAM_PVV_SHM) && spec->pvp.pvv.s)
+		shm_free(spec->pvp.pvv.s);
 	pkg_free(spec);
 }
 

@@ -19,6 +19,7 @@
  */
 
 #include <freeDiameter/extension.h>
+#include <stdint.h>
 
 #include "../../sr_module.h"
 #include "../../lib/list.h"
@@ -123,8 +124,7 @@ static const param_export_t params[] =
 static const mi_export_t mi_cmds[] = {
 	{ "fd_log_level", 0, 0, 0, {
 		{NULL, {"log_level", 0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{EMPTY_MI_EXPORT}
 };
 
@@ -374,9 +374,8 @@ static int dm_send_request(struct sip_msg *msg, int *app_id, int *cmd_code,
 		}
 		if (pv_set_value(msg, rpl_avps_pv, 0, &val) != 0)
 			LM_ERR("failed to set output rpl_avps pv\n");
-		if (rpl_avps)
-			_dm_release_message_response(rpl, rpl_avps);
 	}
+	_dm_release_message_response(rpl, rpl_avps);
 
 	if (rc != 0) {
 		LM_ERR("Diameter request failed (rc: %d)\n", rc);
@@ -463,7 +462,8 @@ static int dm_send_answer(struct sip_msg *msg, str *avp_json, int *is_error)
 		reverse_hex2int64(res.rs.s, res.rs.len, 1, &fd_req);
 	}
 
-	dmsg = _dm_create_message(NULL, AAA_CUSTOM_RPL, appid, cmdcode, (void *)fd_req);
+	dmsg = _dm_create_message(NULL, AAA_CUSTOM_RPL, appid, cmdcode,
+		(void *)(uintptr_t)fd_req);
 	if (!dmsg) {
 		LM_ERR("oom\n");
 		goto error;
@@ -518,13 +518,14 @@ static struct dm_async_msg *dm_get_async_msg(pv_spec_t *rpl_avps_pv, struct dm_c
 	memset(msg, 0, sizeof *msg);
 	msg->ret = rpl_avps_pv;
 	msg->cond = cond;
+	dm_cond_ref(cond);
 	return msg;
 }
 
 static void dm_free_sync_msg(struct dm_async_msg *amsg)
 {
 	if (amsg->cond)
-		shm_free(amsg->cond);
+		dm_cond_unref(amsg->cond);
 	pkg_free(amsg);
 }
 
@@ -570,8 +571,7 @@ static int dm_send_request_async_reply(int fd,
 error:
 	if (amsg->ret && pv_set_value(msg, amsg->ret, 0, &val) != 0)
 		LM_ERR("failed to set output rpl_avps pv to NULL\n");
-	if (rpl_avps)
-		_dm_release_message_response(amsg->cond, rpl_avps);
+	_dm_release_message_response(amsg->cond, rpl_avps);
 	dm_free_sync_msg(amsg);
 	return ret;
 }
@@ -582,16 +582,22 @@ static int dm_send_request_async_tout(int fd,
 	struct dm_async_msg *amsg = (struct dm_async_msg *)param;
 	pv_value_t val = {STR_NULL, 0, PV_VAL_NULL};
 
+	async_status = ASYNC_DONE_CLOSE_FD;
+
 	if (amsg->ret && pv_set_value(msg, amsg->ret, 0, &val) != 0)
 		LM_ERR("failed to set output rpl_avps pv to NULL\n");
 
-	/* The answer may still arrive and write into the cond, so do not free
-	 * it here: abandoning it hands it over to the answer path. Close the
-	 * eventfd now; a late resume will not write to it. */
-	if (amsg->cond)
-		dm_cond_abandon(amsg->cond);
-	async_status = ASYNC_DONE_CLOSE_FD;
-	pkg_free(amsg);
+	/* The answer may still arrive and write into the cond: abandoning it
+	 * tells the answer path that nobody waits anymore, and a late resume
+	 * will not write to the eventfd, which is closed now. The request is
+	 * not in the pending replies table (see dm_send_custom_req()), so there
+	 * is nothing to drop from it; the reference of the in-flight request is
+	 * released by its answer or by dm_custom_req_expired(). If the answer
+	 * is already here, nobody else will release it. */
+	if (amsg->cond && dm_cond_abandon(amsg->cond))
+		_dm_release_message_response(amsg->cond, NULL);
+
+	dm_free_sync_msg(amsg);
 	return -2;
 }
 
@@ -602,7 +608,7 @@ static int dm_send_request_async(struct sip_msg *msg, async_ctx *ctx,
 	struct dict_object *req;
 	cJSON *avps;
 	struct dm_async_msg *amsg;
-	struct dm_cond *cond = NULL;
+	struct dm_cond *cond;
 
 	if (fd_dict_search(fd_g_config->cnf_dict, DICT_COMMAND, CMD_BY_CODE_R,
 	      cmd_code, &req, ENOENT) == ENOENT) {
@@ -642,10 +648,6 @@ static int dm_send_request_async(struct sip_msg *msg, async_ctx *ctx,
 		_dm_destroy_message(dmsg);
 		goto error;
 	}
-	/* The cond is taken from the send call, not read back from @dmsg: once
-	 * queued, the Diameter process may have sent and freed the message
-	 * already, and the pointer read from it was then whatever reused that
-	 * memory (P-CSCF segfault in dm_send_request_async_reply). */
 	if (_dm_send_message_async(NULL, dmsg, &async_status, &cond) < 0) {
 		LM_ERR("cannot send async message!\n");
 		goto error;
@@ -656,7 +658,7 @@ static int dm_send_request_async(struct sip_msg *msg, async_ctx *ctx,
 		goto error;
 	cJSON_Delete(avps);
 
-	ctx->resume_f = dm_send_request_async_reply;
+	ASYNC_SET_RESUME_F(ctx, dm_send_request_async_reply);
 	ctx->resume_param = amsg;
 	ctx->timeout_s = dm_answer_timeout / 1000;
 	ctx->timeout_f = dm_send_request_async_tout;

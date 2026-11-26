@@ -36,6 +36,8 @@
 #include <freeDiameter/extension.h>
 
 #include "ctype.h"
+#include <errno.h>
+#include <limits.h>
 
 #include "avps.h"
 
@@ -46,6 +48,22 @@
 #else
 extern int dm_store_enumval(const char *name, int value);
 #endif
+
+static int parse_uint(char *p, char **newp, unsigned int *value)
+{
+	unsigned long parsed;
+
+	if (*p == '-')
+		return -1;
+
+	errno = 0;
+	parsed = strtoul(p, newp, 10);
+	if (*newp == p || errno == ERANGE || parsed > UINT_MAX)
+		return -1;
+
+	*value = (unsigned int)parsed;
+	return 0;
+}
 
 #ifdef PKG_MALLOC
 #include "../../../dprint.h"
@@ -559,9 +577,10 @@ int parse_attr_def(char *line, FILE *fp)
 	struct dm_avp_def avps[128];
 	int avp_count = 0;
 	unsigned int vendor_id = -1;
+	int mandatory = 1;
+	int vendor_set = 0, mandatory_set = 0;
 	size_t buflen = strlen(line);
 	int i, len = buflen, attr_len = strlen("ATTRIBUTE"), name_len, avp_code;
-	int mandatory = 1;
 	char *name, *nt_name = NULL, *newp, *p = line, *end = p + len;
 	enum dict_avp_basetype avp_type;
 	enum dict_avp_enc_type enc_type = AVP_ENC_TYPE_NONE;
@@ -638,22 +657,48 @@ int parse_attr_def(char *line, FILE *fp)
 
 	/* skip over the type */
 	while (len > 0 && !isspace(*p)) { p++; len--; }
+	while (len > 0) {
+		char *token, *token_end, *equals, *value;
+		unsigned int parsed;
 
-	if (len > 0 && *p != '\r' && *p != '\n') {
-		vendor_id = strtol(p, &newp, 10);
-		if (vendor_id < 0)
+		while (len > 0 && isspace(*p)) { p++; len--; }
+		if (!len)
+			break;
+		token = p;
+		while (len > 0 && !isspace(*p)) { p++; len--; }
+		token_end = p;
+		/* fork: the keyword "non-mandatory" of the fork's dictionaries
+		 * before the merge with upstream's "mandatory=0|1"; it means
+		 * mandatory=0, so that dictionary and image need not change
+		 * in the same step */
+		if (token_end - token == strlen("non-mandatory") &&
+				!strncasecmp(token, "non-mandatory", token_end - token)) {
+			if (mandatory_set)
+				goto error;
+			mandatory = 0;
+			mandatory_set = 1;
+			continue;
+		}
+		equals = memchr(token, '=', token_end - token);
+		value = equals ? equals + 1 : token;
+		if (parse_uint(value, &newp, &parsed) < 0 || newp != token_end)
 			goto error;
 
-		len -= newp - p;
-		p = newp;
-
-		/* "non-mandatory": the AVP is sent with the M bit cleared, as
-		 * required for AVPs that belong to an optional feature (e.g. 3GPP
-		 * TS 29.229 clause 7.1), so that a peer without the feature can
-		 * ignore them instead of rejecting the request */
-		while (len > 0 && (*p == ' ' || *p == '\t')) { p++; len--; }
-		if (len >= strlen("non-mandatory") && !strncasecmp(p, STR_L("non-mandatory")))
-			mandatory = 0;
+		if (!equals || (equals - token == strlen("vendor-id") &&
+				!strncasecmp(token, "vendor-id", equals - token))) {
+			if (vendor_set)
+				goto error;
+			vendor_id = parsed;
+			vendor_set = 1;
+		} else if (equals - token == strlen("mandatory") &&
+				!strncasecmp(token, "mandatory", equals - token)) {
+			if (mandatory_set || parsed > 1)
+				goto error;
+			mandatory = parsed;
+			mandatory_set = 1;
+		} else {
+			goto error;
+		}
 	}
 
 	if (avp_type != AVP_TYPE_GROUPED)
@@ -715,7 +760,8 @@ create_avp:;
 		(vendor_id != -1?vendor_id:0),			/* Vendor */
 		nt_name,	/* Name */
 		AVP_FLAG_VENDOR | AVP_FLAG_MANDATORY, 	/* Fixed flags */
-		(vendor_id != -1?AVP_FLAG_VENDOR:0)|(mandatory?AVP_FLAG_MANDATORY:0), /* Fixed flag values */
+		(vendor_id != -1?AVP_FLAG_VENDOR:0) |
+			(mandatory ? AVP_FLAG_MANDATORY : 0),
 		avp_type 	/* base type of data */
 	};
 
@@ -762,8 +808,7 @@ int parse_app_vendor(char *line, FILE *fp)
 
 	while (isspace(*p)) { p++; len--; }
 
-	vendor_id = (unsigned int)strtoul(p, &newp, 10);
-	if (vendor_id < 0) {
+	if (parse_uint(p, &newp, &vendor_id) < 0) {
 		LOG_ERROR("bad Vendor ID: '... | %s'\n", p);
 		return -1;
 	}
@@ -830,8 +875,7 @@ int parse_app_def(char *line, FILE *fp)
 		while (isspace(*p)) { p++; len--; }
 	}
 
-	app_id = (unsigned int)strtoul(p, &newp, 10);
-	if (app_id < 0) {
+	if (parse_uint(p, &newp, &app_id) < 0) {
 		LOG_ERROR("bad Application ID: '... | %s'\n", p);
 		return -1;
 	}
@@ -847,8 +891,7 @@ int parse_app_def(char *line, FILE *fp)
 		len--;
 		while (isspace(*p)) { p++; len--; }
 
-		vendor_id = (unsigned int)strtoul(p, &newp, 10);
-		if (vendor_id < 0) {
+		if (parse_uint(p, &newp, &vendor_id) < 0) {
 			LOG_ERROR("bad Vendor ID: '... | %s'\n", p);
 			return -1;
 		}
@@ -923,8 +966,7 @@ int parse_command_def(char *line, FILE *fp, int cmd_type)
 		break;
 	}
 
-	cmd_code = (unsigned int)strtoul(p, &newp, 10);
-	if (cmd_code < 0) {
+	if (parse_uint(p, &newp, &cmd_code) < 0) {
 		LOG_ERROR("bad AVP cmd code: '... | %s'\n", p);
 		return -1;
 	}

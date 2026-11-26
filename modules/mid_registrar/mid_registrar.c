@@ -110,7 +110,7 @@ int gruu_legacy_host = 0;
 int gruu_domain_avp_name = -1;
 unsigned short gruu_domain_avp_type = 0;
 str realm_prefix = str_init("");
-int reg_use_domain = 0;
+int reg_use_domain = 1;
 
 static int mod_init(void);
 static int child_init(int rank);

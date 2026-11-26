@@ -35,13 +35,7 @@
 #include "sca_hash.h"
 #include "add_events.h"
 
-static struct sca_hash *sca_table = NULL;
-
-#define sca_lock(_entry) \
-		lock_set_get( sca_table->locks, sca_table->entries[_entry].lock_idx)
-
-#define sca_unlock(_entry) \
-		lock_set_release( sca_table->locks, sca_table->entries[_entry].lock_idx)
+struct sca_hash *sca_table;
 
 #define sca_hash(_line) core_hash(_line, NULL, sca_table->size)
 
@@ -143,7 +137,7 @@ static struct sca_line* create_sca_line(str *line, unsigned int hash)
 	scal->line.s = (char*)(scal+1);
 	scal->line.len = line->len;
 	memcpy( scal->line.s, line->s, line->len);
-	/* user anf host, just as pointers */
+	/* user and host, just offset the old pointers relative to new buf! */
 	scal->user.s = scal->line.s + (puri.user.s - line->s);
 	scal->user.len = puri.user.len;
 	scal->domain.s = scal->line.s + (puri.host.s - line->s);
@@ -198,36 +192,74 @@ struct sca_line* get_sca_line(str *line, int create)
 }
 
 
-/*
- * sets a new state for an index - it assumes the line is locked
- */
-int set_sca_index_state(struct sca_line *line, unsigned int idx,
-														unsigned int state)
+struct sca_idx *get_sca_index(struct sca_line *line, unsigned int idx)
 {
 	struct sca_idx *scai;
 	struct sca_idx *prev;
+
+	if (idx == 0) {
+		LM_ERR("invalid index: 0 !!\n");
+		return NULL;
+	}
 
 	/* search for the index */
 	for( scai=line->indexes,prev=NULL ; scai ; prev=scai,scai=scai->next)
 		if (scai->idx>=idx) break;
 
 	/* if not found, add it to the right position */
-	if (scai==NULL || scai->idx!=idx) {
-		scai = (struct sca_idx*)shm_malloc(sizeof(struct sca_idx));
-		if (scai==NULL) {
+	if (!scai || scai->idx != idx) {
+		scai = shm_malloc(sizeof *scai);
+		if (!scai) {
 			LM_ERR("not enough shm mem for a new sca index\n");
-			return -1;
+			return NULL;
 		}
+		memset(scai, 0, sizeof *scai);
 		scai->idx = idx;
 		/* insert it after prev */
-		if (prev==NULL) {
+		if (!prev) {
 			scai->next = line->indexes;
 			line->indexes = scai;
 		} else {
 			scai->next = prev->next;
 			prev->next = scai;
 		}
+
+		scai->state = SCA_STATE_NONE;
 	}
+
+	return scai;
+}
+
+/*
+ * returns the state of an index, without creating it if missing
+ * (SCA_STATE_NONE if the index is unknown) - it assumes the line is locked
+ */
+unsigned int get_sca_index_state(struct sca_line *line, unsigned int idx)
+{
+	struct sca_idx *scai = find_sca_index(line, idx);
+
+	return scai ? scai->state : SCA_STATE_NONE;
+}
+
+/* The caller must hold the line lock. Does not allocate a missing index. */
+struct sca_idx *find_sca_index(struct sca_line *line, unsigned int idx)
+{
+	struct sca_idx *scai;
+
+	for (scai = line->indexes; scai && scai->idx < idx; scai = scai->next);
+	return (scai && scai->idx == idx) ? scai : NULL;
+}
+
+/*
+ * sets a new state for an index - it assumes the line is locked
+ */
+int set_sca_index_state(struct sca_line *line, unsigned int idx,
+														unsigned int state)
+{
+	struct sca_idx *scai = get_sca_index(line, idx);
+
+	if (!scai)
+		return -1;
 
 	/* set the state */
 	scai->state = state;
@@ -291,6 +323,9 @@ char * sca_print_line_status(struct sca_line *line, int *l)
 			case SCA_STATE_ACTIVE:
 				memcpy( p, "active", 6); p += 6 ;
 				break;
+			case SCA_STATE_HELD:
+				memcpy( p, "held", 4); p += 4 ;
+				break;
 			default:
 				LM_ERR("unsupported state %d for index %d line %.*s\n",
 					scai->state, scai->idx, line->line.len, line->line.s);
@@ -313,6 +348,24 @@ char * sca_print_line_status(struct sca_line *line, int *l)
 	return buf;
 }
 
+char *sca_line_state_to_str(int state)
+{
+	char *states[] = {
+		"NONE",
+		"idle",
+		"seized",
+		"progressing",
+		"alerting",
+		"active",
+		"held",
+	}; _Static_assert(sizeof states/sizeof *states == SCA_STATE_LAST+1,
+			"SCA states changed -> update strings array");
+
+	if (state < SCA_STATE_NONE || state > SCA_STATE_LAST)
+		return "unknown-state";
+
+	return states[state];
+}
 
 
 void unlock_sca_line(struct sca_line *scal)
@@ -329,6 +382,7 @@ void free_sca_line(struct sca_line *scal)
 	for( idx=scal->indexes ; idx ; ) {
 		tmp = idx;
 		idx = idx->next;
+		shm_free(tmp->seize_callid.s);
 		shm_free(tmp);
 	}
 	/* free main structure */

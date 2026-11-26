@@ -274,7 +274,7 @@ static inline int insert_contacts(struct sip_msg* _m, contact_t* _c,
 		}
 
 		if (r==0) {
-			if (ul.insert_urecord(_d, _a, &r, 0) < 0) {
+			if (ul.insert_urecord(_d, _a, &r, 0, NULL, NULL) < 0) {
 				rerrno = R_UL_NEW_R;
 				LM_ERR("failed to insert new record structure\n");
 				goto error;
@@ -292,7 +292,7 @@ static inline int insert_contacts(struct sip_msg* _m, contact_t* _c,
 		store_gruu(ci, _sctx);
 
 		if ( r->contacts==0 ||
-		ul.get_ucontact(r, &_c->uri, ci->callid, ci->cseq+1, &_sctx->cmatch,
+		ul.get_ucontact(r, &_c->uri, ci->callid, REG_CSEQ_ADJUST(ci->cseq), &_sctx->cmatch,
 		&c)!=0 ){
 			if (ul.insert_ucontact( r, &_c->uri, ci, &_sctx->cmatch,
 				    0, &c) < 0) {
@@ -415,7 +415,7 @@ static inline int update_contacts(struct sip_msg* _m, urecord_t* _r,
 		calc_contact_expires(_m, _c->expires, &e, _sctx);
 
 		/* search for the contact*/
-		ret = ul.get_ucontact( _r, &_c->uri, ci->callid, ci->cseq,
+		ret = ul.get_ucontact( _r, &_c->uri, ci->callid, REG_CSEQ_ADJUST(ci->cseq),
 			&_sctx->cmatch, &c);
 		if (ret==-1) {
 			LM_ERR("invalid cseq for aor <%.*s>\n",_r->aor.len,_r->aor.s);

@@ -89,14 +89,14 @@ char* get_hdr_field_aux(char* buf, char* end, struct hdr_field* hdr,int sip_well
 
 	tmp=parse_hname(buf, end, hdr);
 	if (hdr->type==HDR_ERROR_T){
-		LM_ERR("bad header\n");
+		LM_PARSE("bad header\n");
 		goto error_bad_hdr;
 	}
 
 	/* eliminate leading whitespace */
 	tmp=eat_lws_end(tmp, end);
 	if (tmp>=end) {
-		LM_ERR("hf empty\n");
+		LM_PARSE("hf empty\n");
 		goto error_bad_hdr;
 	}
 
@@ -108,7 +108,8 @@ char* get_hdr_field_aux(char* buf, char* end, struct hdr_field* hdr,int sip_well
 		case HDR_VIA_T:
 			/* keep number of vias parsed -- we want to report it in
 			   replies for diagnostic purposes */
-			via_cnt++;
+			if (sip_well_known_parse)
+				via_cnt++;
 			if (sip_well_known_parse) {
 				vb=pkg_malloc(sizeof(struct via_body));
 				if (vb==0){
@@ -119,7 +120,7 @@ char* get_hdr_field_aux(char* buf, char* end, struct hdr_field* hdr,int sip_well
 				hdr->body.s=tmp;
 				tmp=parse_via(tmp, end, vb);
 				if (vb->error==PARSE_ERROR){
-					LM_ERR("bad via\n");
+					LM_PARSE("bad via\n");
 					free_via_list(vb);
 					set_err_info(OSER_EC_PARSER, OSER_EL_MEDIUM,
 						"error parsing Via");
@@ -140,7 +141,7 @@ char* get_hdr_field_aux(char* buf, char* end, struct hdr_field* hdr,int sip_well
 					if (match){
 						match++;
 					}else {
-						LM_ERR("bad body for <%.*s>(%d)\n",
+						LM_PARSE("bad body for <%.*s>(%d)\n",
 							 hdr->name.len, hdr->name.s, hdr->type);
 						tmp=end;
 						goto error_bad_hdr;
@@ -162,7 +163,7 @@ char* get_hdr_field_aux(char* buf, char* end, struct hdr_field* hdr,int sip_well
 				hdr->body.s=tmp;
 				tmp=parse_cseq(tmp, end, cseq_b);
 				if (cseq_b->error==PARSE_ERROR){
-					LM_ERR("bad cseq\n");
+					LM_PARSE("bad cseq\n");
 					pkg_free(cseq_b);
 					set_err_info(OSER_EC_PARSER, OSER_EL_MEDIUM,
 						"error parsing CSeq`");
@@ -185,7 +186,7 @@ char* get_hdr_field_aux(char* buf, char* end, struct hdr_field* hdr,int sip_well
 					if (match){
 						match++;
 					}else {
-						LM_ERR("bad body for <%.*s>(%d)\n",
+						LM_PARSE("bad body for <%.*s>(%d)\n",
 							 hdr->name.len, hdr->name.s, hdr->type);
 						tmp=end;
 						goto error_bad_hdr;
@@ -207,7 +208,7 @@ char* get_hdr_field_aux(char* buf, char* end, struct hdr_field* hdr,int sip_well
 				hdr->body.s=tmp;
 				tmp=parse_to(tmp, end,to_b);
 				if (to_b->error==PARSE_ERROR){
-					LM_ERR("bad to header\n");
+					LM_PARSE("bad to header\n");
 					pkg_free(to_b);
 					set_err_info(OSER_EC_PARSER, OSER_EL_MEDIUM,
 						"error parsing To header");
@@ -230,7 +231,7 @@ char* get_hdr_field_aux(char* buf, char* end, struct hdr_field* hdr,int sip_well
 					if (match){
 						match++;
 					}else {
-						LM_ERR("bad body for <%.*s>(%d)\n",
+						LM_PARSE("bad body for <%.*s>(%d)\n",
 							 hdr->name.len, hdr->name.s, hdr->type);
 						tmp=end;
 						goto error_bad_hdr;
@@ -246,7 +247,7 @@ char* get_hdr_field_aux(char* buf, char* end, struct hdr_field* hdr,int sip_well
 				hdr->body.s=tmp;
 				tmp=parse_content_length(tmp,end, &integer);
 				if (tmp==0){
-					LM_ERR("bad content_length header\n");
+					LM_PARSE("bad content_length header\n");
 					set_err_info(OSER_EC_PARSER, OSER_EL_MEDIUM,
 						"error parsing Content-Length");
 					set_err_reply(400, "bad Content-Length header");
@@ -356,12 +357,15 @@ char* get_hdr_field_aux(char* buf, char* end, struct hdr_field* hdr,int sip_well
 	return tmp;
 
 error_bad_hdr:
-	set_err_info(OSER_EC_PARSER, OSER_EL_MEDIUM,
-		"error parsing headers");
-	set_err_reply(400, "bad headers");
+	if (sip_well_known_parse) {
+		set_err_info(OSER_EC_PARSER, OSER_EL_MEDIUM,
+			"error parsing headers");
+		set_err_reply(400, "bad headers");
+	}
 error:
 	LM_DBG("error exit\n");
-	update_stat( bad_msg_hdr, 1);
+	if (sip_well_known_parse)
+		update_stat(bad_msg_hdr, 1);
 	hdr->type=HDR_ERROR_T;
 	hdr->len=tmp-hdr->name.s;
 	return tmp;
@@ -379,7 +383,7 @@ error:
    give you the first occurrence of a header you are interested in,
    look at check_transaction_quadruple
 */
-int parse_headers_aux(struct sip_msg* msg, hdr_flags_t flags, int next, int sip_well_known_parse)
+int parse_headers(struct sip_msg *msg, hdr_flags_t flags, int next)
 {
 	struct hdr_field *hf;
 	char* tmp;
@@ -408,7 +412,7 @@ int parse_headers_aux(struct sip_msg* msg, hdr_flags_t flags, int next, int sip_
 		}
 		memset(hf,0, sizeof(struct hdr_field));
 		hf->type=HDR_ERROR_T;
-		rest=get_hdr_field_aux(tmp, msg->buf+msg->len, hf,sip_well_known_parse);
+		rest=get_hdr_field_aux(tmp, msg->buf+msg->len, hf, 1);
 		switch (hf->type){
 			case HDR_ERROR_T:
 				LM_INFO("bad header field\n");
@@ -590,21 +594,19 @@ int parse_headers_aux(struct sip_msg* msg, hdr_flags_t flags, int next, int sip_
 				link_sibling_hdr(h_via1,hf);
 				msg->parsed_flag|=HDR_VIA_F;
 				LM_DBG("via found, flags=%llx\n", (unsigned long long)flags);
-				if (sip_well_known_parse) {
-					if (msg->via1==0) {
-						LM_DBG("this is the first via\n");
-						msg->h_via1=hf;
-						msg->via1=hf->parsed;
-						if (msg->via1->next){
-							msg->via2=msg->via1->next;
-							msg->parsed_flag|=HDR_VIA2_F;
-						}
-					} else
+				if (msg->via1==0) {
+					LM_DBG("this is the first via\n");
+					msg->h_via1=hf;
+					msg->via1=hf->parsed;
+					if (msg->via1->next){
+						msg->via2=msg->via1->next;
+						msg->parsed_flag|=HDR_VIA2_F;
+					}
+				} else
 					if (msg->via2==0) {
 						msg->via2=hf->parsed;
 						msg->parsed_flag|=HDR_VIA2_F;
 					}
-				}
 				break;
 			case HDR_FEATURE_CAPS_T:
 				link_sibling_hdr(feature_caps, hf);
@@ -942,7 +944,7 @@ parse_error:
 
 error:
 	/* more debugging, msg->orig is/should be null terminated*/
-	LM_ERR("message=<%.*s>\n", (int)len, ZSW(buf));
+	LM_PARSE("message=<%.*s>\n", (int)len, ZSW(buf));
 	return -1;
 }
 
@@ -988,7 +990,10 @@ void free_sip_msg(struct sip_msg* msg)
 		free_reply_lump(msg->reply_lump);
 	if (msg->body )
 		free_sip_body(msg->body);
-	/* don't free anymore -- now a pointer to a static buffer */
+	/* Parsed fields and callbacks may still point into this buffer. */
+	if (msg->pkg_buf)
+		pkg_free(msg->pkg_buf);
+	/* msg->buf is otherwise owned by the caller. */
 }
 
 
@@ -1231,7 +1236,7 @@ int rewrite_ruri(struct sip_msg *msg, str *sval, int ival,
 	if (crt+len>end) goto error;
 	memcpy(crt,tmp,len);crt+=len;
 
-	if (part==RW_RURI_PREFIX) {
+	if (part==RW_RURI_PREFIX && sval->len) {
 		if (crt+sval->len>end) goto error;
 		memcpy( crt, sval->s, sval->len);
 		crt+=sval->len;

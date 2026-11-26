@@ -88,12 +88,10 @@ static const param_export_t params[] = {
 };
 
 static const mi_export_t mi_cmds[] = {
-	{ "msrp_trace", 0, 0, 0, {
+	{ "trace", 0, 0, 0, {
 		{w_msrp_trace_mi, {0}},
 		{w_msrp_trace_mi_1, {"trace_mode", 0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
+		{EMPTY_MI_RECIPE}}, {"msrp_trace", 0}},
 	{EMPTY_MI_EXPORT}
 };
 
@@ -143,6 +141,8 @@ static int proto_msrp_init(struct proto_info *pi)
 
 	pi->net.flags			= PROTO_NET_USE_TCP;
 	pi->net.stream.read		= msrp_read_req;
+	pi->net.stream.handle		= msrp_dispatch_msg;
+	pi->net.stream.write		= tcp_async_write;
 	pi->net.stream.conn.init	= NULL;
 	pi->net.report			= msrp_report;
 
@@ -161,6 +161,8 @@ static int proto_msrps_init(struct proto_info *pi)
 
 	pi->net.flags			= PROTO_NET_USE_TCP;
 	pi->net.stream.read		= msrp_read_req;
+	pi->net.stream.handle		= msrp_dispatch_msg;
+	pi->net.stream.write		= msrps_async_write;
 	pi->net.stream.conn.init	= proto_msrps_conn_init;
 	pi->net.stream.conn.clean	= proto_msrps_conn_clean;
 	if (msrp_check_cert_on_reusage)

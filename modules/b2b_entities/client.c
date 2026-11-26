@@ -85,7 +85,7 @@ str* _client_new(client_info_t* ci,b2b_notify_t b2b_cback,
 {
 	int result;
 	b2b_dlg_t* dlg;
-	unsigned int hash_index;
+	unsigned int hash_index, local_index;
 	str* callid = NULL;
 	int size;
 	str ehdr = {0, 0};
@@ -170,7 +170,7 @@ str* _client_new(client_info_t* ci,b2b_notify_t b2b_cback,
 	}
 
 	if(b2breq_complete_ehdr(ci->extra_headers, ci->client_headers,
-			&ehdr, ci->body, &ci->local_contact)< 0)
+			&ehdr, ci->body, &ci->local_contact, ci->contact_hdr_params)< 0)
 	{
 		LM_ERR("Failed to complete extra headers\n");
 		goto error;
@@ -228,20 +228,22 @@ str* _client_new(client_info_t* ci,b2b_notify_t b2b_cback,
 
 	td.avps = ci->avps;
 
+	local_index = dlg->id;
 	tmb.setlocalTholder(&dlg->uac_tran);
 
 	if (dlg->tracer)
 		b2b_arm_uac_tracing( &td, dlg->tracer);
 
 	/* send request */
-	result= tmb.t_request_within
-		(&ci->method,          /* method*/
+	result= run_tm_api(&tmb, t_request_within,
+		&ci->method,           /* method*/
 		&ehdr,                 /* extra headers*/
 		ci->body,              /* body*/
 		&td,                   /* dialog structure*/
 		b2b_client_tm_cback,   /* callback function*/
 		b2b_key_shm,
 		shm_free_param);       /* function to release the parameter*/
+	tmb.setlocalTholder(NULL);
 
 	if(td.route_set)
 		pkg_free(td.route_set);
@@ -252,9 +254,14 @@ str* _client_new(client_info_t* ci,b2b_notify_t b2b_cback,
 		shm_free(b2b_key_shm);
 		return NULL;
 	}
-	/* update the dialog sock with actual socket used when sending the req */
-	dlg->send_sock = td.send_sock;
-	tmb.setlocalTholder(NULL);
+	/* update the dialog sock with actual socket used when sending the req;
+	 * the reply may have already been handled by another process, which
+	 * replaces (and frees) the dlg, so look up the current record */
+	B2BE_LOCK_GET(client_htable, hash_index);
+	dlg = b2b_search_htable(client_htable, hash_index, local_index);
+	if (dlg)
+		dlg->send_sock = td.send_sock;
+	B2BE_LOCK_RELEASE(client_htable, hash_index);
 
 	LM_DBG("new client entity [%p] callid=[%.*s] tag=[%.*s] param=[%.*s]"
 			" last method=[%.*s]\n",
@@ -358,4 +365,3 @@ error:
 
 	return 0;
 }
-

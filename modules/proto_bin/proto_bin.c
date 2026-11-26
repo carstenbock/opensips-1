@@ -48,19 +48,16 @@ static int proto_bin_init(struct proto_info *pi);
 static int proto_bin_init_listener(struct socket_info *si);
 static int proto_bin_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id);
+		unsigned int id, struct sip_msg *msg);
 static int bin_read_req(struct tcp_connection* con, int* bytes_read);
 
 static int bin_port = 5555;
 static int bin_send_timeout = 100;
-static struct tcp_req bin_current_req;
 static int bin_max_msg_chunks = 32;
 static int bin_async = 1;
 static int bin_async_max_postponed_chunks = 1024;
-static int bin_async_local_connect_timeout = 100;
 static int bin_async_local_write_timeout = 10;
 
-#define _bin_common_current_req  bin_current_req
 #include "bin_common.h"
 
 static const cmd_export_t cmds[] = {
@@ -75,8 +72,6 @@ static const param_export_t params[] = {
 	{ "bin_async",                       INT_PARAM, &bin_async              },
 	{ "bin_async_max_postponed_chunks",  INT_PARAM,
 											&bin_async_max_postponed_chunks },
-	{ "bin_async_local_connect_timeout", INT_PARAM,
-											&bin_async_local_connect_timeout},
 	{ "bin_async_local_write_timeout",   INT_PARAM,
 											&bin_async_local_write_timeout  },
 	{0, 0, 0}
@@ -118,6 +113,7 @@ static int proto_bin_init(struct proto_info *pi)
 
 	pi->net.flags			= PROTO_NET_USE_TCP;
 	pi->net.stream.read		= bin_read_req;
+	pi->net.stream.handle		= bin_receive_msg;
 	pi->net.stream.write		= tcp_async_write;
 
 	if (bin_async != 0)
@@ -147,48 +143,26 @@ static int proto_bin_init_listener(struct socket_info *si)
  * postponed chunks, and the next write then fails, which drops the connection
  * together with everything still queued on it. So while the queue is full,
  * wait up to bin_send_timeout milliseconds for room in it.
- * With a usable fd the queued chunks are flushed right here, in order and
- * under the write lock, as soon as the socket takes data again: relying on
- * the TCP main process to hand the connection to a TCP worker is not enough,
- * since the waiting process may be that very worker. A connection which is
- * still connecting (no fd) can only be waited for.
+ * All writes are queued as chunks and written by the TCP main process, so
+ * the sender has no fd to flush on and can only wait for the queue to drain.
  * The queue is peeked at without the write lock: a stale value costs one more
  * round or falls through to the regular write. */
-static void bin_async_wait_room(struct tcp_connection *c, int fd)
+static void bin_async_wait_room(struct tcp_connection *c)
 {
-	struct pollfd pf;
-	int waited, n;
+	int waited;
 
 	if (!c->async)
 		return;
 
 	for (waited = 0; waited < bin_send_timeout &&
 		c->async->pending == c->async->allocated &&
-		c->state != S_CONN_BAD; waited++) {
-		if (fd < 0) {
-			usleep(1000);
-			continue;
-		}
-
-		pf.fd = fd;
-		pf.events = POLLOUT;
-		n = poll(&pf, 1, 1);
-		if (n < 0 && errno != EINTR)
-			return;
-		if (n <= 0)
-			continue;
-
-		lock_get(&c->write_lock);
-		n = tcp_async_write(c, fd);
-		lock_release(&c->write_lock);
-		if (n < 0)
-			return;
-	}
+		c->state != S_CONN_BAD; waited++)
+		usleep(1000);
 }
 
 static int proto_bin_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id)
+		unsigned int id, struct sip_msg *msg)
 {
 	struct tcp_connection *c;
 	struct ip_addr ip;
@@ -200,9 +174,11 @@ static int proto_bin_send(const struct socket_info* send_sock,
 	if (to){
 		su2ip_addr(&ip, to);
 		port=su_getport(to);
-		n = tcp_conn_get(id, &ip, port, PROTO_BIN, NULL, &c, &fd, send_sock);
+		fd = -1;
+		n = tcp_conn_get(id, &ip, port, PROTO_BIN, NULL, &c, send_sock);
 	}else if (id){
-		n = tcp_conn_get(id, 0, 0, PROTO_NONE, NULL, &c, &fd, NULL);
+		fd = -1;
+		n = tcp_conn_get(id, 0, 0, PROTO_NONE, NULL, &c, NULL);
 	}else{
 		LM_CRIT("tcp_send called with null id & to\n");
 		return -1;
@@ -229,34 +205,28 @@ static int proto_bin_send(const struct socket_info* send_sock,
 		LM_DBG("no open tcp connection found, opening new one, async = %d\n",bin_async);
 		/* create tcp connection */
 		if (bin_async) {
-			n = tcp_async_connect(send_sock, to, &prof,
-					bin_async_local_connect_timeout, &c, &fd, 1);
+			n = tcp_async_connect(send_sock, to, &prof, &c, &fd);
 			if ( n<0 ) {
 				LM_ERR("async TCP connect failed\n");
 				return -1;
 			}
-			/* connect succeeded, we have a connection */
-			if (n==0) {
-				/* attach the write buffer to it */
-				if (tcp_async_add_chunk(c, buf, len, 1) < 0) {
-					LM_ERR("Failed to add the initial write chunk\n");
-					len = -1; /* report an error - let the caller decide what to do */
-				}
-
-				/* mark the ID of the used connection (tracing purposes) */
-				last_outgoing_tcp_id = c->id;
-				send_sock->last_real_ports->local = c->rcv.dst_port;
-				send_sock->last_real_ports->remote = c->rcv.src_port;
-
-				/* connect is still in progress, break the sending
-				 * flow now (the actual write will be done when 
-				 * connect will be completed */
-				LM_DBG("Successfully started async connection \n");
-				tcp_conn_release(c, 0);
-				return len;
+			/* attach the write buffer to it */
+			if (tcp_async_add_chunk(c, buf, len, 1) < 0) {
+				LM_ERR("Failed to add the initial write chunk\n");
+				len = -1; /* report an error - let the caller decide what to do */
 			}
-			/* our first connect attempt succeeded - go ahead as normal */
-		} else if ((c=tcp_sync_connect(send_sock, to, &prof, &fd, 1))==0) {
+
+			/* mark the ID of the used connection (tracing purposes) */
+			last_outgoing_tcp_id = c->id;
+			send_sock->last_real_ports->local = c->rcv.dst_port;
+			send_sock->last_real_ports->remote = c->rcv.src_port;
+
+			/* connect is still in progress, break the sending
+			 * flow now (the actual write will be done when
+			 * connect will be completed */
+			tcp_conn_release(c, 0);
+			return len;
+		} else if ((c=tcp_sync_connect(send_sock, to, &prof, &fd))==0) {
 			LM_ERR("connect failed\n");
 			return -1;
 		}
@@ -266,65 +236,51 @@ static int proto_bin_send(const struct socket_info* send_sock,
 
 	/* now we have a connection, let's see what we can do with it */
 	/* BE CAREFUL now as we need to release the conn before exiting !!! */
-	if (fd==-1) {
-		/* connection is not writable because of its state - can we append
-		 * data to it for later writting (async writting)? */
-		if (c->state==S_CONN_CONNECTING) {
-			/* the connection is currently in the process of getting
-			 * connected - let's append our send chunk as well - just in
-			 * case we ever manage to get through */
-			LM_DBG("We have acquired a TCP connection which is still "
-				"pending to connect - delaying write \n");
-			bin_async_wait_room(c, -1);
-			n = tcp_async_add_chunk(c,buf,len,1);
-			if (n < 0) {
-				LM_ERR("Failed to add another write chunk to %p\n",c);
-				/* we failed due to internal errors - put the
-				 * connection back */
-				tcp_conn_release(c, 0);
-				return -1;
-			}
-
-			/* mark the ID of the used connection (tracing purposes) */
-			last_outgoing_tcp_id = c->id;
-			send_sock->last_real_ports->local = c->rcv.dst_port;
-			send_sock->last_real_ports->remote = c->rcv.src_port;
-
-			/* we successfully added our write chunk - success */
-			tcp_conn_release(c, 0);
-			return len;
-		} else {
-			/* return error, nothing to do about it */
+	if (c->state==S_CONN_CONNECTING) {
+		/* the connection is currently in the process of getting
+		 * connected - let's append our send chunk as well - just in
+		 * case we ever manage to get through */
+		LM_DBG("We have acquired a TCP connection which is still "
+			"pending to connect - delaying write \n");
+		bin_async_wait_room(c);
+		n = tcp_async_add_chunk(c,buf,len,1);
+		if (n < 0) {
+			LM_ERR("Failed to add another write chunk to %p\n",c);
+			/* we failed due to internal errors - put the
+			 * connection back */
 			tcp_conn_release(c, 0);
 			return -1;
 		}
-	}
 
+		/* mark the ID of the used connection (tracing purposes) */
+		last_outgoing_tcp_id = c->id;
+		send_sock->last_real_ports->local = c->rcv.dst_port;
+		send_sock->last_real_ports->remote = c->rcv.src_port;
 
-send_it:
-	LM_DBG("sending via fd %d...\n",fd);
-
-	bin_async_wait_room(c, fd);
-	n = tcp_write_on_socket(c, fd, buf, len,
-			bin_send_timeout, bin_async_local_write_timeout);
-
-	tcp_conn_reset_lifetime(c);
-
-	LM_DBG("after write: c= %p n/len=%d/%d fd=%d\n",c, n, len, fd);
-	/* LM_DBG("buf=\n%.*s\n", (int)len, buf); */
-	if (n<0){
-		LM_ERR("failed to send\n");
-		c->state=S_CONN_BAD;
-		if (c->proc_id != process_no)
-			close(fd);
+		/* we successfully added our write chunk - success */
+		tcp_conn_release(c, 0);
+		return len;
+	} else if (c->state != S_CONN_OK) {
+		/* return error, nothing to do about it */
 		tcp_conn_release(c, 0);
 		return -1;
 	}
 
-	/* only close the FD if not already in the context of our process
-	either we just connected, or main sent us the FD */
-	if (c->proc_id != process_no)
-		close(fd);
+
+send_it:
+	LM_DBG("sending on conn %p...\n", c);
+	bin_async_wait_room(c);
+	n = tcp_write_on_socket(c, -1, buf, len,
+			bin_send_timeout, bin_async_local_write_timeout);
+
+	LM_DBG("after write: c=%p n/len=%d/%d\n", c, n, len);
+	/* LM_DBG("buf=\n%.*s\n", (int)len, buf); */
+	if (n<0){
+		LM_ERR("failed to send\n");
+		c->state=S_CONN_BAD;
+		tcp_conn_release(c, 0);
+		return -1;
+	}
 
 	/* mark the ID of the used connection (tracing purposes) */
 	last_outgoing_tcp_id = c->id;
@@ -344,14 +300,12 @@ static int bin_read_req(struct tcp_connection* con, int* bytes_read){
 	bytes = -1;
 	total_bytes = 0;
 
-	if (con->con_req) {
-		req = con->con_req;
-		LM_DBG("Using the per connection buff \n");
-	} else {
-		LM_DBG("Using the global ( per process ) buff \n");
-		init_tcp_req(&bin_current_req, 0);
-		req = &bin_current_req;
-	}
+	req = tcp_conn_get_req(con);
+	if (!req)
+		return -1;
+	if (con->msg_attempts == 0)
+		init_tcp_req(req, 0);
+	LM_DBG("Using the connection buff\n");
 
 	again:
 	if(req->error == TCP_REQ_OK){

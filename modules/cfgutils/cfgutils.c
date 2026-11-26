@@ -243,33 +243,26 @@ static const param_export_t params[]={
 static const mi_export_t mi_cmds[] = {
 	{ FIFO_SET_PROB, 0, 0, 0, {
 		{mi_set_prob, {"prob_proc", 0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{ FIFO_RESET_PROB, 0, 0, 0, {
 		{mi_reset_prob, {0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{ FIFO_GET_PROB, 0, 0, 0, {
 		{mi_get_prob, {0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{ FIFO_GET_HASH, 0, 0, 0, {
 		{mi_get_hash, {0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{ FIFO_CHECK_HASH, 0, 0, 0, {
 		{mi_check_hash, {0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{ "shv_get", 0, 0, 0, {
 		{mi_shvar_get, {0}},
 		{mi_shvar_get_1, {"name", 0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{ "shv_set", 0, 0, 0, {
 		{mi_shvar_set, {"name", "type", "value", 0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{EMPTY_MI_EXPORT}
 };
 
@@ -564,7 +557,7 @@ static int async_sleep(struct sip_msg* msg, async_ctx *ctx, int *seconds)
 	/* start the async wait */
 	ctx->resume_param = (void*)(unsigned long)
 		(((unsigned long)-1) & (get_uticks()+1000000*(*(unsigned int*)seconds)));
-	ctx->resume_f = resume_async_sleep;
+	ASYNC_SET_RESUME_F(ctx, resume_async_sleep);
 	async_status = fd;
 
 	return 1;
@@ -599,7 +592,7 @@ static int async_usleep(struct sip_msg* msg, async_ctx *ctx, int *useconds)
 	/* start the async wait */
 	ctx->resume_param = (void*)(unsigned long)
 		(((unsigned long)-1) & (get_uticks()+*(unsigned int *)useconds));
-	ctx->resume_f = resume_async_sleep;
+	ASYNC_SET_RESUME_F(ctx, resume_async_sleep);
 	async_status = fd;
 
 	return 1;
@@ -922,8 +915,8 @@ static int w_shuffle_avps(struct sip_msg* msg, pv_spec_t *pv_name)
 		src_avp = search_index_avp(avp_type, avp_name, &src_val, (n-1));
 		rnd_avp = search_index_avp(avp_type, avp_name, &rnd_val, rnd_idx);
 
-		if ( replace_avp(avp_type|(rnd_avp->flags&AVP_VAL_STR), avp_name, rnd_val, (n-1))==-1 ||
-					replace_avp(avp_type|(src_avp->flags&AVP_VAL_STR), avp_name, src_val, rnd_idx)==-1 ) {
+		if ( replace_avp(avp_type|(rnd_avp->flags&(AVP_VAL_STR|AVP_VAL_BOOL)), avp_name, rnd_val, (n-1))==-1 ||
+					replace_avp(avp_type|(src_avp->flags&(AVP_VAL_STR|AVP_VAL_BOOL)), avp_name, src_val, rnd_idx)==-1 ) {
 			LM_ERR("failed to swap avp\n");
 			goto error;
 		}

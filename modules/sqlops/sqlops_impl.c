@@ -635,12 +635,6 @@ int ops_sql_avp_store(struct sip_msg* msg, struct fis_param *sp,
 				LM_INFO("no value for P2\n");
 				goto error;
 			}
-			if(xvalue.flags&PV_TYPE_INT)
-			{
-				avp_name = xvalue.ri;
-			} else {
-				avp_name = -1;
-			}
 			if(xvalue.flags&PV_VAL_STR)
 			{
 				if(xvalue.rs.len>=SQLOPS_ATTR_LEN)
@@ -669,7 +663,6 @@ int ops_sql_avp_store(struct sip_msg* msg, struct fis_param *sp,
 	} else {
 		LM_WARN("TODO: avp is not a dynamic name <%.*s> name is %d\n",
 			dbp->sa.len, dbp->sa.s, avp_name);
-		avp_name = -1;
 	}
 
 	/* set uuid/(username and domain) fields */
@@ -984,7 +977,7 @@ int ops_async_sql_query(struct sip_msg* msg, async_ctx *ctx,
 		LM_DBG("sync query \"%.*s\" returned: %d\n", query->len, query->s, rc);
 
 		ctx->resume_param = NULL;
-		ctx->resume_f = NULL;
+		ASYNC_CLEAR_RESUME_F(ctx);
 		async_status = ASYNC_NO_IO;
 
 		/* Empty_set / Other_errors / Success */
@@ -995,7 +988,7 @@ int ops_async_sql_query(struct sip_msg* msg, async_ctx *ctx,
 	if (read_fd < 0)
 	{
 		ctx->resume_param = NULL;
-		ctx->resume_f = NULL;
+		ASYNC_CLEAR_RESUME_F(ctx);
 		return -1;
 	}
 
@@ -1008,7 +1001,7 @@ int ops_async_sql_query(struct sip_msg* msg, async_ctx *ctx,
 	memset(param, '\0', sizeof *param);
 
 	ctx->resume_param = param;
-	ctx->resume_f = resume_async_sqlquery;
+	ASYNC_SET_RESUME_F(ctx, resume_async_sqlquery);
 	/* if supported in the backend */
 	if (url->dbf.async_timeout != NULL)
 		ctx->timeout_f = timeout_async_sqlquery;

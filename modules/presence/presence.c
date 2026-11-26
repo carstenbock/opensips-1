@@ -197,32 +197,26 @@ static const param_export_t params[]={
 };
 
 static const mi_export_t mi_cmds[] = {
-	// refreshWatchers is a deprecated alias for refresh_watchers. To be removed later.
-	{ "refreshWatchers", 0,0,0, {
-		{mi_refresh_watchers, {"presentity_uri", "event", "refresh_type", 0}},
-		{EMPTY_MI_RECIPE}}
-	},
 	{ "refresh_watchers", 0,0,0, {
 		{mi_refresh_watchers, {"presentity_uri", "event", "refresh_type", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "cleanup", 0,0,0, {
 		{mi_cleanup, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
-	{ "pres_expose", 0,0,0, {
+	{ "expose", 0,0,0, {
 		{mi_pres_expose_1, {"event", 0}},
 		{mi_pres_expose_2, {"event", "filter", 0}},
-		{EMPTY_MI_RECIPE}} 
-	},
-	{ "pres_phtable_list", 0,0,0, {
+		{EMPTY_MI_RECIPE}} , {"pres_expose", 0}},
+	{ "phtable_list", 0,0,0, {
 		{mi_list_phtable, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"pres_phtable_list", 0}
 	},
 	{ "subs_phtable_list", 0,0,0, {
 		{mi_list_shtable_1, {0}},
 		{mi_list_shtable_2, {"from", "to", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{EMPTY_MI_EXPORT}
 };
@@ -852,7 +846,7 @@ static mi_response_t *mi_list_shtable(const mi_params_t *params, str *from, str 
 	mi_response_t *resp;
 	mi_item_t *resp_arr;
 	subs_t *s;
-	unsigned int i,j;
+	unsigned int i;
 	char from_w[256], to_w[256];
 	str match_from = {0,0}, match_to = {0,0};
 	int rc;
@@ -873,7 +867,7 @@ static mi_response_t *mi_list_shtable(const mi_params_t *params, str *from, str 
 		to_w[to->len] = 0;
 	}
 
-	for (i = 0, j = 0; i < shtable_size; i++) {
+	for (i = 0; i < shtable_size; i++) {
 
 		lock_get(&subs_htable[i].lock);
 		for (s = subs_htable[i].entries->next; s; s = s->next) {
@@ -888,7 +882,6 @@ static mi_response_t *mi_list_shtable(const mi_params_t *params, str *from, str 
 
 			if (mi_print_shtable_record(resp_arr, s) < 0)
 				goto error;
-			j++;
 		}
 		lock_release(&subs_htable[i].lock);
 	}

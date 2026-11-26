@@ -99,9 +99,9 @@ static event_id_t flatstore_evi_id;
 static const char flat_empty_str[] = "";
 
 static const mi_export_t mi_cmds[] = {
-	{ "evi_flat_rotate", "rotates the files the module dumps events into", 0,0,{
+	{ "rotate", "rotates the files the module dumps events into", 0,0, {
 		{mi_rotate, {"path_to_file", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"evi_flat_rotate", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };
@@ -970,7 +970,7 @@ static void flat_free(evi_reply_sock *sock) {
 		for (it = *list_sockets; it->next && fs != it->next; it = it->next) ;
 		if (it->next) {
 			it->next = it->next->next;
-			shm_free(it->next);
+			shm_free(fs);
 		}
 	}
 

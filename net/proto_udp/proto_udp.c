@@ -34,9 +34,11 @@
 #include "../../timer.h"
 #include "../../socket_info.h"
 #include "../../receive.h"
+#include "../../parser/msg_parser.h"
 #include "../api_proto.h"
 #include "../api_proto_net.h"
 #include "../net_udp.h"
+#include "../proxy_protocol.h"
 #include "proto_udp.h"
 
 
@@ -46,7 +48,7 @@ static int proto_udp_init_listener(struct socket_info *si);
 static int proto_udp_bind_listener(struct socket_info *si);
 static int proto_udp_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id);
+		unsigned int id, struct sip_msg *msg);
 
 static int udp_read_req(const struct socket_info *src, int* bytes_read);
 
@@ -108,7 +110,7 @@ static int proto_udp_init(struct proto_info *pi)
 	pi->tran.bind_listener	= proto_udp_bind_listener;
 	pi->tran.send			= proto_udp_send;
 
-	pi->net.flags			= PROTO_NET_USE_UDP;
+	pi->net.flags			= PROTO_NET_USE_UDP | PROTO_NET_SUPPORTS_PROXY;
 	pi->net.dgram.read		= udp_read_req;
 
 	return 0;
@@ -149,14 +151,6 @@ static int udp_read_req(const struct socket_info *si, int* bytes_read)
 		return -2;
 	}
 
-	if (len<MIN_UDP_PACKET) {
-		LM_DBG("probing packet received len = %d\n", len);
-		return 0;
-	}
-
-	/* we must 0-term the messages, receive_msg expects it */
-	buf[len]=0; /* no need to save the previous char */
-
 	ri.bind_address = si;
 	ri.dst_port = si->port_no;
 	ri.dst_ip = si->address;
@@ -168,6 +162,17 @@ static int udp_read_req(const struct socket_info *si, int* bytes_read)
 
 	msg.s = buf;
 	msg.len = len;
+
+	if (check_udp_proxy_protocol(&msg.s, &msg.len, &ri) < 0)
+		return 0;
+
+	if (msg.len<MIN_UDP_PACKET) {
+		LM_DBG("probing packet received len = %d\n", msg.len);
+		return 0;
+	}
+
+	/* we must 0-term the messages, receive_msg expects it */
+	msg.s[msg.len]=0; /* no need to save the previous char */
 
 	/* run callbacks if looks like non-SIP message*/
 	if( !isalpha(msg.s[0]) ){    /* not-SIP related */
@@ -206,13 +211,51 @@ static int udp_read_req(const struct socket_info *si, int* bytes_read)
  */
 static int proto_udp_send(const struct socket_info* source,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id)
+		unsigned int id, struct sip_msg *msg)
 {
-	int n, tolen;
+	int n, tolen, pp_len = 0;
+	int dst_port, dbg_len;
+	char pp_hdr[128];
+	struct ip_addr dst_ip;
+	struct msghdr mh;
+	struct iovec iov[2];
+
+	if ((source->flags & SI_PROXY_OUT) != 0) {
+		su2ip_addr(&dst_ip, to);
+		dst_port = su_getport(to);
+		pp_len = build_outbound_proxy_protocol_v1_hdr(msg ? &msg->rcv : NULL,
+				&source->address, source->port_no,
+				&dst_ip, dst_port, pp_hdr, sizeof(pp_hdr));
+		if (pp_len < 0) {
+			LM_ERR("failed to build outbound PROXY header\n");
+			return -1;
+		}
+		dbg_len = pp_len;
+		if (dbg_len >= 2 && pp_hdr[dbg_len - 2] == '\r' &&
+				pp_hdr[dbg_len - 1] == '\n')
+			dbg_len -= 2;
+		LM_DBG("sending outbound PROXY header on UDP %s:%hu -> %s:%d: %.*s\n",
+				ip_addr2a((struct ip_addr *)&source->address), source->port_no,
+				ip_addr2a(&dst_ip), dst_port, dbg_len, pp_hdr);
+	}
 
 	tolen=sockaddru_len(*to);
 again:
-	n=sendto(source->socket, buf, len, 0, &to->s, tolen);
+	if (pp_len) {
+		memset(&mh, 0, sizeof(mh));
+		mh.msg_name = (void *)&to->s;
+		mh.msg_namelen = tolen;
+		iov[0].iov_base = pp_hdr;
+		iov[0].iov_len = pp_len;
+		iov[1].iov_base = buf;
+		iov[1].iov_len = len;
+		mh.msg_iov = iov;
+		mh.msg_iovlen = 2;
+		n = sendmsg(source->socket, &mh, 0);
+	} else {
+		n = sendto(source->socket, buf, len, 0, &to->s, tolen);
+	}
+
 	if (n==-1){
 		if (errno==EINTR || errno==EAGAIN) goto again;
 		LM_ERR("sendto(sock,%p,%d,0,%p,%d): %s(%d) [%s:%hu]\n", buf,len,to,
@@ -254,7 +297,3 @@ int register_udprecv_cb(udp_rcv_cb_f* func, void* param, char a, char b)
 
 	return 0;
 }
-
-
-
-

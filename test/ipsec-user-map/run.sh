@@ -9,6 +9,6 @@ dir=$(cd "$(dirname "$0")" && pwd)
 bin=$(mktemp)
 trap 'rm -f "$bin"' EXIT
 # -w: the core headers warn without the build's own flags
-gcc -O2 -w -DMOD_NAME='"proto_ipsec"' -DUSE_PTHREAD_MUTEX -DF_MALLOC \
+gcc -O2 -w -DMOD_NAME='"proto_ipsec"' -DUSE_PTHREAD_MUTEX -DF_MALLOC -DPREFERRED_MALLOC_F_MALLOC \
     -I "$dir/stub" -I "$dir" -o "$bin" "$dir/test.c"
 "$bin" "$@"

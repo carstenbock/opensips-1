@@ -30,6 +30,7 @@
 #include <sys/uio.h>
 #include <poll.h>
 
+#include "../../mem/mem.h"
 #include "../../pt.h"
 #include "../../sr_module.h"
 #include "../../net/net_tcp.h"
@@ -37,6 +38,7 @@
 #include "../../net/api_proto_net.h"
 #include "../../net/net_tcp_report.h"
 #include "../../net/tcp_common.h"
+#include "../../net/proxy_protocol.h"
 #include "../../socket_info.h"
 #include "../../tsend.h"
 #include "../../receive.h"
@@ -49,11 +51,9 @@
 /* parameters*/
 int ws_max_msg_chunks = TCP_CHILD_MAX_MSG_CHUNK;
 
-static struct tcp_req tcp_current_req;
-
-static struct ws_req ws_current_req;
-
 static int ws_require_origin = 1;
+/* comma-separated list of accepted Origin values; empty = any */
+static str ws_allowed_origins = {NULL, 0};
 
 /* in milliseconds */
 int ws_send_timeout = 100;
@@ -65,13 +65,12 @@ int ws_hs_read_tout = 100;
 static str ws_resource = str_init("/");
 
 #define _ws_common_module "ws"
-#define _ws_common_tcp_current_req tcp_current_req
-#define _ws_common_current_req ws_current_req
 #define _ws_common_max_msg_chunks ws_max_msg_chunks
 #define _ws_common_read ws_raw_read
 #define _ws_common_writev ws_raw_writev
 #define _ws_common_read_tout ws_hs_read_tout
 #define _ws_common_write_tout ws_send_timeout
+#define _ws_common_proxy_send_tout ws_send_timeout
 #define _ws_common_resource ws_resource
 #define _ws_common_require_origin ws_require_origin
 #include "ws_handshake_common.h"
@@ -96,9 +95,11 @@ static int proto_ws_init(struct proto_info *pi);
 static int proto_ws_init_listener(struct socket_info *si);
 static int proto_ws_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id);
+		unsigned int id, struct sip_msg *msg);
 static int ws_read_req(struct tcp_connection* con, int* bytes_read);
+static int ws_async_write(struct tcp_connection* con, int fd);
 static int ws_conn_init(struct tcp_connection* c);
+static int ws_conn_connect(struct tcp_connection* c);
 static void ws_conn_clean(struct tcp_connection* c);
 static void ws_report(int type, unsigned long long conn_id, int conn_flags,
 		void *extra);
@@ -123,6 +124,7 @@ static const param_export_t params[] = {
 	{ "ws_send_timeout",   INT_PARAM, &ws_send_timeout   },
 	{ "ws_resource",       STR_PARAM, &ws_resource.s     },
 	{ "require_origin",    INT_PARAM, &ws_require_origin },
+	{ "allowed_origins",   STR_PARAM, &ws_allowed_origins.s },
 	{ "ws_handshake_timeout", INT_PARAM, &ws_hs_read_tout },
 	{ "trace_destination",     STR_PARAM,         &trace_destination_name.s  },
 	{ "trace_on",						 INT_PARAM, &trace_is_on_tmp        },
@@ -141,12 +143,10 @@ static const dep_export_t deps = {
 };
 
 static const mi_export_t mi_cmds[] = {
-	{ "ws_trace", 0, 0, 0, {
+	{ "trace", 0, 0, 0, {
 		{ws_trace_mi, {0}},
 		{ws_trace_mi_1, {"trace_mode", 0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
+		{EMPTY_MI_RECIPE}}, {"ws_trace", 0}},
 	{EMPTY_MI_EXPORT}
 };
 
@@ -186,10 +186,12 @@ static int proto_ws_init(struct proto_info *pi)
 	pi->tran.send			= proto_ws_send;
 	pi->tran.dst_attr		= tcp_conn_fcntl;
 
-	pi->net.flags			= PROTO_NET_USE_TCP;
+	pi->net.flags			= PROTO_NET_USE_TCP | PROTO_NET_SUPPORTS_PROXY;
 	pi->net.stream.read		= ws_read_req;
+	pi->net.stream.write		= ws_async_write;
 
 	pi->net.stream.conn.init	= ws_conn_init;
+	pi->net.stream.conn.connect	= ws_conn_connect;
 	pi->net.stream.conn.clean	= ws_conn_clean;
 	pi->net.report			= ws_report;
 
@@ -202,6 +204,8 @@ static int mod_init(void)
 	LM_INFO("initializing WebSocket protocol\n");
 
 	ws_resource.len = strlen(ws_resource.s);
+	if (ws_parse_allowed_origins(&ws_allowed_origins) < 0)
+		return -1;
 
 	if (trace_destination_name.s) {
 		if ( !net_trace_api ) {
@@ -232,7 +236,7 @@ static int mod_init(void)
 	*trace_is_on = trace_is_on_tmp;
 	if ( trace_filter_route ) {
 		trace_filter_route_ref =
-			ref_script_route_by_name( trace_filter_route, 
+			ref_script_route_by_name( trace_filter_route,
 				sroutes->request, RT_NO, REQUEST_ROUTE, 0);
 	}
 
@@ -244,27 +248,47 @@ static int ws_conn_init(struct tcp_connection* c)
 {
 	struct ws_data *d;
 
-	/* allocate the tcp_data and the array of chunks as a single mem chunk */
-	d = (struct ws_data *)shm_malloc(sizeof(*d));
-	if (d==NULL) {
-		LM_ERR("failed to create ws states in shm mem\n");
-		return -1;
+	d = c->proto_data;
+	if (!d) {
+		/* allocate the tcp_data and the array of chunks as a single mem chunk */
+		d = (struct ws_data *)thread_malloc(sizeof(*d));
+		if (d==NULL) {
+			LM_ERR("failed to create ws states in private mem\n");
+			return -1;
+		}
+		memset( d, 0, sizeof( struct ws_data ) );
+		d->state = WS_CON_INIT;
+		d->type = (c->flags & F_CONN_ACCEPTED) ? WS_NONE : WS_CLIENT;
+		d->code = WS_ERR_NONE;
+		c->proto_data = (void*)d;
 	}
-	memset( d, 0, sizeof( struct ws_data ) );
 
-	if ( t_dst && tprot.create_trace_message ) {
+	if ( t_dst && tprot.create_trace_message && d->tprot == NULL ) {
 		d->tprot = &tprot;
 		d->dest = t_dst;
 		d->net_trace_proto_id = net_trace_proto_id;
 		d->trace_is_on = trace_is_on;
 		d->trace_route_ref = trace_filter_route_ref;
 	}
+	return 0;
+}
 
-	d->state = WS_CON_INIT;
-	d->type = WS_NONE;
-	d->code = WS_ERR_NONE;
+static int ws_conn_connect(struct tcp_connection* c)
+{
+	if (!c->proto_data || WS_TYPE(c) != WS_CLIENT)
+		return 0;
 
-	c->proto_data = (void*)d;
+	if (send_stream_proxy_protocol_v1(c, c->fd, _ws_common_proxy_send_tout, 0,
+			NULL, _ws_common_module) < 0) {
+		LM_ERR("failed to send outbound PROXY header\n");
+		return -1;
+	}
+
+	if (ws_client_handshake(c) < 0) {
+		LM_ERR("cannot complete WebSocket handshake\n");
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -287,7 +311,7 @@ static void ws_conn_clean(struct tcp_connection* c)
 		}
 	}
 
-	shm_free(d);
+	thread_free(d);
 	c->proto_data = NULL;
 }
 
@@ -330,14 +354,13 @@ static void ws_report(int type, unsigned long long conn_id, int conn_flags,
 /*! \brief Finds a tcpconn & sends on it */
 static int proto_ws_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id)
+		unsigned int id, struct sip_msg *msg)
 {
 	struct tcp_connection *c;
 	struct tcp_conn_profile prof;
 	struct timeval get;
 	struct ip_addr ip;
-	struct ws_data* d;
-	int port = 0, fd, n, matched;
+	int port = 0, n, matched;
 
 	matched = tcp_con_get_profile(to, &send_sock->su, send_sock->proto, &prof);
 
@@ -347,9 +370,9 @@ static int proto_ws_send(const struct socket_info* send_sock,
 	if (to){
 		su2ip_addr(&ip, to);
 		port=su_getport(to);
-		n = tcp_conn_get(id, &ip, port, PROTO_WS, NULL, &c, &fd, send_sock);
+		n = tcp_conn_get(id, &ip, port, PROTO_WS, NULL, &c, send_sock);
 	}else if (id){
-		n = tcp_conn_get(id, 0, 0, PROTO_NONE, NULL, &c, &fd, NULL);
+		n = tcp_conn_get(id, 0, 0, PROTO_NONE, NULL, &c, NULL);
 	}else{
 		LM_CRIT("prot_tls_send called with null id & to\n");
 		get_time_difference(get,prof.send_threshold,tcp_timeout_con_get);
@@ -374,31 +397,17 @@ static int proto_ws_send(const struct socket_info* send_sock,
 		}
 		LM_DBG("no open tcp connection found, opening new one\n");
 		/* create tcp connection */
-		if ((c=ws_connect(send_sock, to, &prof, &fd))==0) {
+		if ((c=ws_connect(send_sock, to, &prof, msg))==0) {
 			LM_ERR("connect failed\n");
 			return -1;
 		}
-
-		d = c->proto_data;
-
-		if ( d && d->dest && d->tprot ) {
-			if ( d->message ) {
-				send_trace_message( d->message, t_dst);
-				d->message = NULL;
-			}
-
-			/* don't allow future traces for this cnection */
-			d->tprot = 0;
-			d->dest  = 0;
-		}
-
 		goto send_it;
 	}
 	get_time_difference(get, prof.send_threshold, tcp_timeout_con_get);
 
 	/* now we have a connection, let's what we can do with it */
 	/* BE CAREFUL now as we need to release the conn before exiting !!! */
-	if (fd==-1) {
+	if (c->state != S_CONN_OK && c->state != S_CONN_CONNECTING) {
 		/* connection is not writable because of its state */
 		/* return error, nothing to do about it */
 		tcp_conn_release(c, 0);
@@ -406,26 +415,19 @@ static int proto_ws_send(const struct socket_info* send_sock,
 	}
 
 send_it:
-	LM_DBG("sending via fd %d...\n",fd);
-
-	n = ws_req_write(c, fd, buf, len);
+	LM_DBG("sending on conn %p...\n", c);
+	n = tcp_async_add_chunk(c, buf, len, 1);
+	if (n == 0)
+		n = len;
 	stop_expire_timer(get, prof.send_threshold, "WS ops",buf,(int)len,1);
-	tcp_conn_reset_lifetime(c);
 
-	LM_DBG("after write: c= %p n=%d fd=%d\n",c, n, fd);
+	LM_DBG("after write: c=%p n=%d\n", c, n);
 	if (n<0){
 		LM_ERR("failed to send\n");
 		c->state=S_CONN_BAD;
-		if (c->proc_id != process_no)
-			close(fd);
 		tcp_conn_release(c, 0);
 		return -1;
 	}
-
-	/* only close the FD if not already in the context of our process
-	either we just connected, or main sent us the FD */
-	if (c->proc_id != process_no)
-		close(fd);
 
 	/* mark the ID of the used connection (tracing purposes) */
 	last_outgoing_tcp_id = c->id;
@@ -434,6 +436,26 @@ send_it:
 
 	tcp_conn_release(c, 0);
 	return n;
+}
+
+static int ws_async_write(struct tcp_connection* con, int fd)
+{
+	int n;
+	struct tcp_async_chunk *chunk;
+
+	while ((chunk = tcp_async_get_chunk(con)) != NULL) {
+		LM_DBG("Trying to send %d bytes from chunk %p in conn %p - %d %d \n",
+				chunk->len, chunk, con, chunk->ticks, get_ticks());
+
+		n = ws_req_write(con, fd, chunk->buf, chunk->len);
+		if (n < 0)
+			return -1;
+
+		tcp_async_update_write(con, chunk->len);
+		tcp_conn_reset_lifetime(con);
+	}
+
+	return 0;
 }
 
 
@@ -453,10 +475,20 @@ static int ws_read_req(struct tcp_connection* con, int* bytes_read)
 	int size;
 	struct ws_data* d;
 
+	switch (check_tcp_proxy_protocol(con)) {
+	case 0:
+		goto done;
+	case -1:
+		goto error;
+	case 1:
+		break;
+	}
+
 	if (WS_STATE(con) != WS_CON_HANDSHAKE_DONE) {
 		size = ws_server_handshake(con);
 		if (size < 0) {
-			LM_ERR("cannot complete WebSocket handshake\n");
+			LM_ERR("cannot complete WebSocket handshake from %s:%d\n",
+					ip_addr2a(&con->rcv.src_ip), con->rcv.src_port);
 			goto error;
 		}
 

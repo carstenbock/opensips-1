@@ -202,9 +202,10 @@ ua_pres_t* search_htable(ua_pres_t* pres, unsigned int hash_code)
 
 	if (p && p->expires < (int)time(NULL) &&
 	!(p->expires==0 &&  p->waiting_reply && p->etag.len==0) )
-	/* presentities with expires=0, waiting for reply and no etag are newly added
-	 * presentities which were not yet confirmed (no reply received for first PUBLISH)
-	 * and we should find such records !  -bogdan */
+	/* presentities with expires=0, waiting for reply and no etag are
+	 * newly added presentities which were not yet confirmed (no reply
+	 * received for first PUBLISH) and we should find
+	 * such records !  -bogdan */
 		return NULL;
 
 	LM_DBG("got presentity [%p]\n", p);
@@ -237,8 +238,20 @@ int update_htable(unsigned int hash_index, unsigned int local_index,
 		goto error;
 	}
 
+	/* deal with the SUBSCRIBE records - if in terminate stage (un-subscribe)
+	 * do not update anymore */
+	if (p->watcher_uri && p->subs_state != PUA_SUBS_ACTIVE) {
+		lock_release(&HashT->p_records[hash_index].lock);
+		return 0;
+	}
+
 	if(etag)
 	{
+		if(etag->len < 0 || etag->len > PUA_MAX_ETAG_LEN)
+		{
+			LM_ERR("SIP-ETag is too long\n");
+			goto error;
+		}
 		if(p->etag.s)
 			shm_free(p->etag.s);
 		p->etag.s= (char*)shm_malloc(etag->len);
@@ -579,7 +592,6 @@ void destroy_htable(void)
 					shm_free(q->remote_contact.s);
 			if(q->extra_headers.s) shm_free(q->extra_headers.s);
 			shm_free(q);
-			q= NULL;
 		}
 		shm_free(p);
 	}
@@ -628,7 +640,6 @@ int replace_in_htable(unsigned int hash_index, unsigned int local_index,
 	{
 		if(p->local_index == local_index)
 		{
-			q->next = p->next;
 			q->next = new_pres;
 			new_pres->next = p->next;
 			new_pres->local_index = local_index;
@@ -921,4 +932,3 @@ list_entry_t *get_subs_list(str *did)
 done:
 	return list;
 }
-

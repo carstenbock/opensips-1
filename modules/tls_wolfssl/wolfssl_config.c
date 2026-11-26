@@ -118,6 +118,19 @@ int tls_get_method(str *method_str,
 	return 0;
 }
 
+static int get_wolfssl_verify_mode(struct tls_domain *d)
+{
+	int tls_verify_mode = get_ssl_ctx_verify_mode(d);
+	int verify_mode = SSL_VERIFY_NONE;
+
+	if (tls_verify_mode & TLS_VERIFY_PEER)
+		verify_mode |= SSL_VERIFY_PEER;
+	if (tls_verify_mode & TLS_VERIFY_FAIL_IF_NO_PEER_CERT)
+		verify_mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+
+	return verify_mode;
+}
+
 static int verify_callback(int pre_verify_ok, WOLFSSL_X509_STORE_CTX *ctx) {
 	char buf[256];
 	WOLFSSL_X509 *cert;
@@ -194,12 +207,17 @@ int _wolfssl_reg_sni_cb(tls_sni_cb_f cb)
 
 int _wolfssl_switch_ssl_ctx(struct tls_domain *dom, void *ssl_ctx)
 {
+	int verify_mode = 0;
+
 	wolfSSL_set_SSL_CTX((WOLFSSL *)ssl_ctx, dom->ctx);
 
 	if (!wolfSSL_set_ex_data((WOLFSSL *)ssl_ctx, SSL_EX_DOM_IDX, dom)) {
 		LM_ERR("Failed to store tls_domain pointer in SSL struct\n");
 		return -1;
 	}
+
+	verify_mode = get_wolfssl_verify_mode(dom);
+	wolfSSL_set_verify((WOLFSSL *)ssl_ctx, verify_mode, verify_callback);
 
 	return 0;
 }
@@ -433,11 +451,21 @@ static int load_ca_db(WOLFSSL_CTX * ctx, str *blob)
 static int load_ca_dir(WOLFSSL_CTX * ctx, char *directory)
 {
 	int rc;
+	word32 flags = WOLFSSL_LOAD_FLAG_IGNORE_ERR;
+
+	/*
+	 * wolfSSL only exposes the extra directory-load flags when it is built
+	 * with the matching feature toggles, so include them conditionally.
+	 */
+#ifdef WOLFSSL_LOAD_FLAG_IGNORE_BAD_PATH_ERR
+	flags |= WOLFSSL_LOAD_FLAG_IGNORE_BAD_PATH_ERR;
+#endif
+#ifdef WOLFSSL_LOAD_FLAG_IGNORE_ZEROFILE
+	flags |= WOLFSSL_LOAD_FLAG_IGNORE_ZEROFILE;
+#endif
 
 	if ((rc = wolfSSL_CTX_load_verify_locations_ex(ctx, 0, directory,
-		WOLFSSL_LOAD_FLAG_IGNORE_ERR|WOLFSSL_LOAD_FLAG_IGNORE_BAD_PATH_ERR|
-		WOLFSSL_LOAD_FLAG_IGNORE_ZEROFILE)) !=
-		SSL_SUCCESS) {
+		flags)) != SSL_SUCCESS) {
 		LM_ERR("unable to load ca directory '%s' (ret=%d)\n", directory, rc);
 		return -1;
 	}
@@ -484,30 +512,7 @@ int _wolfssl_init_tls_dom(struct tls_domain *d, int init_flags)
 		wolfSSL_CTX_set_servername_arg(d->ctx, d);
 	}
 
-	if (d->flags & DOM_FLAG_SRV) {
-		if (d->verify_cert ) {
-			verify_mode = SSL_VERIFY_PEER;
-			if (d->require_client_cert ) {
-				LM_INFO("client verification activated. Client "
-						"certificates are mandatory.\n");
-				verify_mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
-			} else {
-				LM_INFO("client verification activated. Client "
-						"certificates are NOT mandatory.\n");
-			}
-		} else {
-			verify_mode = SSL_VERIFY_NONE;
-			LM_INFO("client verification NOT activated. Weaker security.\n");
-		}
-	} else {
-		if (d->verify_cert ) {
-			verify_mode = SSL_VERIFY_PEER;
-			LM_INFO("server verification activated.\n");
-		} else {
-			verify_mode = SSL_VERIFY_NONE;
-			LM_INFO("server verification NOT activated. Weaker security.\n");
-		}
-	}
+	verify_mode = get_wolfssl_verify_mode(d);
 
 	wolfSSL_CTX_set_verify(d->ctx, verify_mode, verify_callback);
 	wolfSSL_CTX_set_verify_depth(d->ctx, VERIFY_DEPTH_S);
@@ -532,12 +537,15 @@ int _wolfssl_init_tls_dom(struct tls_domain *d, int init_flags)
 		goto end;
 	}
 
-	if (!(d->flags & DOM_FLAG_DB) || init_flags & TLS_DOM_CERT_FILE_FL) {
-		if (load_certificate(d->ctx, d->cert.s) < 0)
-			goto end;
-	} else {
-		if (load_certificate_db(d->ctx, &d->cert) < 0)
-			goto end;
+	/* load certificate (optional for client domains per RFC 8446 4.4.2.4) */
+	if (d->cert.s) {
+		if (!(d->flags & DOM_FLAG_DB) || init_flags & TLS_DOM_CERT_FILE_FL) {
+			if (load_certificate(d->ctx, d->cert.s) < 0)
+				goto end;
+		} else {
+			if (load_certificate_db(d->ctx, &d->cert) < 0)
+				goto end;
+		}
 	}
 
 	if (d->crl_directory && load_crl(d->ctx, d->crl_directory,

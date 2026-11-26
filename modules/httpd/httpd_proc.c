@@ -41,12 +41,14 @@
 #include <microhttpd.h>
 #endif
 
+#include "../../globals.h"
 #include "../../pt.h"
 #include "../../sr_module.h"
 #include "../../str.h"
 #include "../../ut.h"
 #include "../../lib/sliblist.h"
 #include "../../reactor_proc.h"
+#include "../../profiling.h"
 #include "httpd_load.h"
 #include "httpd_proc.h"
 
@@ -59,6 +61,9 @@ extern int post_buf_size;
 extern str tls_cert_file;
 extern str tls_key_file;
 extern str tls_ciphers;
+extern str auth_realm;
+extern str auth_username;
+extern str auth_password;
 extern struct httpd_cb *httpd_cb_list;
 static union sockaddr_union httpd_server_info;
 
@@ -67,10 +72,126 @@ extern int receive_buf_size;
 extern char *httpd_receive_buff;
 extern int httpd_receive_buff_pos;
 
+int httpd_listen_fd = -1;
+
+static int httpd_build_sockaddr(str *sip, int sport, struct sockaddr_storage *ss,
+		int *family, int *dual_stack, char **ip_repr, char *reprbuf)
+{
+	struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)ss;
+	struct sockaddr_in *s4 = (struct sockaddr_in *)ss;
+
+	memset(ss, 0, sizeof *ss);
+	*dual_stack = 0;
+
+	if (sip->s && strcmp(sip->s, "*")) {
+		if (q_memchr(sip->s, ':', sip->len)) {
+			if (inet_pton(AF_INET6, sip->s, &s6->sin6_addr) <= 0) {
+				LM_ERR("failed to parse 'ip' modparam: %s\n", sip->s);
+				return -1;
+			}
+			s6->sin6_family = AF_INET6;
+			s6->sin6_port = htons(sport);
+			*family = AF_INET6;
+			sprintf(reprbuf, "[%s]", !strcmp(sip->s, "::0") ? "::" : sip->s);
+			*ip_repr = reprbuf;
+			return sizeof *s6;
+		}
+
+		if (inet_pton(AF_INET, sip->s, &s4->sin_addr) <= 0) {
+			LM_ERR("failed to parse 'ip' modparam: %s\n", sip->s);
+			return -1;
+		}
+		s4->sin_family = AF_INET;
+		s4->sin_port = htons(sport);
+		*family = AF_INET;
+		*ip_repr = sip->s;
+		return sizeof *s4;
+	}
+
+	s6->sin6_addr = in6addr_any;
+	s6->sin6_family = AF_INET6;
+	s6->sin6_port = htons(sport);
+	*family = AF_INET6;
+	*dual_stack = 1;
+	*ip_repr = "*";
+	return sizeof *s6;
+}
+
+static int httpd_open_listen_socket(struct httpd_server *s)
+{
+	struct sockaddr_storage ss;
+	int family, dual, salen, fd, on = 1, off = 0;
+	char *ip_repr, reprbuf[1 + IP_ADDR_MAX_STR_SIZE + 1];
+
+	salen = httpd_build_sockaddr(&s->ip, s->port, &ss, &family, &dual,
+			&ip_repr, reprbuf);
+	if (salen < 0)
+		return -1;
+
+	fd = socket(family, SOCK_STREAM, 0);
+	if (fd < 0) {
+		LM_ERR("failed to create HTTPD socket: %s\n", strerror(errno));
+		return -1;
+	}
+	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on) < 0)
+		LM_WARN("failed to set SO_REUSEADDR: %s\n", strerror(errno));
+	if (dual && setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off,
+			sizeof off) < 0)
+		LM_WARN("failed to disable IPV6_V6ONLY: %s\n", strerror(errno));
+
+	if (bind(fd, (struct sockaddr *)&ss, salen) < 0) {
+		LM_ERR("failed to bind HTTPD socket on %s:%d: %s\n",
+			ip_repr, s->port, strerror(errno));
+		close(fd);
+		return -1;
+	}
+	if (listen(fd, 1024) < 0) {
+		LM_ERR("failed to listen on HTTPD socket: %s\n", strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	return fd;
+}
+
+int httpd_pre_fork(void)
+{
+	int i;
+	struct httpd_server *s;
+
+	for (i = 0; i < httpd_n_servers; i++) {
+		s = &httpd_servers[i];
+		s->listen_fd = -1;
+		if (s->workers <= 1)
+			continue;
+		s->listen_fd = httpd_open_listen_socket(s);
+		if (s->listen_fd < 0)
+			return -1;
+	}
+	return 0;
+}
+
+int httpd_post_fork(void)
+{
+	int i;
+	struct httpd_server *s;
+
+	for (i = 0; i < httpd_n_servers; i++) {
+		s = &httpd_servers[i];
+		if (s->listen_fd >= 0) {
+			close(s->listen_fd);
+			s->listen_fd = -1;
+		}
+	}
+	return 0;
+}
+
 static const str MI_HTTP_U_URL = str_init("<html><body>"
 "Unable to parse URL!</body></html>");
 static const str MI_HTTP_U_METHOD = str_init("<html><body>"
 "Unsupported HTTP request!</body></html>");
+static const str MI_HTTP_UNAUTH = str_init("<html><body>"
+"Unauthorized</body></html>");
 
 static char * load_file(char * );
 
@@ -290,13 +411,18 @@ static MHD_RET post_iterator (void *cls,
 	LM_DBG("[%.*s]->[%.*s]\n", key_len, key, (int)size, value);
 
 	kv = (str_str_t*)slinkedl_append(pr->p_list,
-						sizeof(str_str_t) + key_len + size);
+						sizeof(str_str_t) + key_len + size + 1);
+	if (!kv) {
+		LM_ERR("oom\n");
+		pr->status = -1; return MHD_NO;
+	}
 	p = (char*)(kv + 1);
 	kv->key.len = key_len; kv->key.s = p;
 	memcpy(p, key, key_len);
 	p += key_len;
 	kv->val.len = size; kv->val.s = p;
 	memcpy(p, value, size);
+	p[size] = '\0';
 	LM_DBG("inserting element pr=[%p] pp=[%p] p_list=[%p]\n",
 				pr, pr->pp, pr->p_list);
 
@@ -321,7 +447,8 @@ MHD_RET getConnectionHeader(void *cls, enum MHD_ValueKind kind,
 	struct post_request *pr = (struct post_request*)cls;
 	str content_length;
 	unsigned int len;
-	char *p, bk;
+	const char *p;
+	size_t value_len;
 
 	if (cls == NULL) {
 		LM_ERR("Unable to store return data\n");
@@ -345,24 +472,29 @@ MHD_RET getConnectionHeader(void *cls, enum MHD_ValueKind kind,
 	if (strcasecmp("Content-Type", key) == 0) {
 		LM_DBG("Content-Type=%s\n", value);
 		/* extract only the mime */
+		value_len = strlen(value);
 		if ( (p=strchr(value, ';'))!=NULL ) {
-			while( p>value && (*(p-1)==' ' || *(p-1)=='\t') ) p--;
-			bk = *p;
-			*p = 0;
+			value_len = p - value;
+			while (value_len &&
+					(value[value_len - 1] == ' ' ||
+					 value[value_len - 1] == '\t'))
+				value_len--;
 		}
-		if (strcasecmp("text/xml", value) == 0)
+		if (value_len == 8 && strncasecmp("text/xml", value, value_len) == 0)
 			pr->content_type = HTTPD_TEXT_XML_CNT_TYPE;
-		else if (strncasecmp("application/json", value, 16) == 0)
+		else if (value_len >= 16 &&
+				strncasecmp("application/json", value, 16) == 0)
 			pr->content_type = HTTPD_APPLICATION_JSON_CNT_TYPE;
-		else if (strncasecmp("text/html", value, 9) == 0)
+		else if (value_len >= 9 &&
+				strncasecmp("text/html", value, 9) == 0)
 			pr->content_type = HTTPD_TEXT_HTML_TYPE;
-		else if (strncasecmp("text/plain", value, 10) == 0)
+		else if (value_len >= 10 &&
+				strncasecmp("text/plain", value, 10) == 0)
 			pr->content_type = HTTPD_TEXT_PLAIN_TYPE;
 		else {
 			pr->content_type = HTTPD_UNKNOWN_CNT_TYPE;
 			LM_ERR("Unexpected Content-Type=[%s]\n", value);
 		}
-		if (p) *p = bk;
 		goto done;
 	}
 	if (strcasecmp("Content-Length", key) == 0) {
@@ -464,6 +596,47 @@ MHD_RET answer_to_connection (void *cls, struct MHD_Connection *connection,
 
 	pr = *con_cls;
 	if(pr == NULL){
+		/* first call for this request -- check auth before allocating */
+		if (auth_username.s) {
+			char *user = NULL;
+			char *pass = NULL;
+
+			user = MHD_basic_auth_get_username_password(connection,
+				&pass);
+			if (!user || !pass ||
+					strlen(user) != auth_username.len ||
+					strlen(pass) != auth_password.len ||
+					memcmp(user, auth_username.s,
+						auth_username.len) != 0 ||
+					memcmp(pass, auth_password.s,
+						auth_password.len) != 0) {
+				LM_WARN("rejected unauthenticated HTTP request "
+					"for %s\n", url);
+				response = MHD_create_response_from_buffer(
+					MI_HTTP_UNAUTH.len,
+					(void *)MI_HTTP_UNAUTH.s,
+					MHD_RESPMEM_PERSISTENT);
+				ret = MHD_queue_basic_auth_fail_response(
+					connection, auth_realm.s, response);
+				MHD_destroy_response(response);
+#if MHD_VERSION >= 0x00095600
+				if (user) MHD_free(user);
+				if (pass) MHD_free(pass);
+#else
+				if (user) free(user);
+				if (pass) free(pass);
+#endif
+				return ret;
+			}
+#if MHD_VERSION >= 0x00095600
+			MHD_free(user);
+			MHD_free(pass);
+#else
+			free(user);
+			free(pass);
+#endif
+		}
+
 		pr = pkg_malloc(sizeof(struct post_request));
 		if(pr==NULL) {
 			LM_ERR("oom while allocating post_request structure\n");
@@ -473,6 +646,8 @@ MHD_RET answer_to_connection (void *cls, struct MHD_Connection *connection,
 		*con_cls = pr;
 		pr = NULL;
 	}
+
+	profiling_proc_start( LEVEL_EXTRAPROCS, 1);
 
 	/* we're safe here since this returns a struct sockaddr* and
 	 * sockaddr_union contains sockaddr* inside */
@@ -486,7 +661,7 @@ MHD_RET answer_to_connection (void *cls, struct MHD_Connection *connection,
 	sv_sockfd = MHD_get_connection_info(connection, MHD_CONNECTION_INFO_CONNECTION_FD)->connect_fd;
 	if (getsockname( sv_sockfd, &httpd_server_info.s, &addrlen) < 0) {
 		LM_ERR("cannot resolve server's IP: %s:%d\n", strerror(errno), errno);
-		return MHD_NO;
+		goto mhd_no;
 	}
 
 	/* we could do
@@ -503,7 +678,7 @@ MHD_RET answer_to_connection (void *cls, struct MHD_Connection *connection,
 			pr->p_list = slinkedl_init(&httpd_alloc, &httpd_free);
 			if (pr->p_list==NULL) {
 				LM_ERR("oom while allocating list\n");
-				return MHD_NO;
+				goto mhd_no;
 			}
 			LM_DBG("running MHD_create_post_processor\n");
 			pr->pp = MHD_create_post_processor(connection,
@@ -514,7 +689,7 @@ MHD_RET answer_to_connection (void *cls, struct MHD_Connection *connection,
 					pr, pr->pp, pr->p_list);
 
 			/* We need to wait for the actual data in the POST request */
-			return MHD_YES;
+			goto mhd_yes;
 		} else {
 			if (pr->pp==NULL) {
 				if (*upload_data_size == 0) {
@@ -529,11 +704,14 @@ MHD_RET answer_to_connection (void *cls, struct MHD_Connection *connection,
 							saved_body.len = httpd_receive_buff_pos;
 							saved_body.s = httpd_receive_buff;
 						}
+						profiling_proc_enter( LEVEL_EXTRAPROCS,
+							ss_merge256("HTTPD_CB ",(char*)normalised_url), 0);
 						ret_code = cb->callback(cls, (void*)connection,
 								normalised_url,
 								method, version,
 								saved_body.s, saved_body.len,
 								con_cls, &buffer, &page, cl_socket);
+						profiling_proc_exit( LEVEL_EXTRAPROCS, "HTTPD_CB", ret_code);
 					} else {
 						page = MI_HTTP_U_URL;
 						ret_code = MHD_HTTP_BAD_REQUEST;
@@ -550,12 +728,12 @@ MHD_RET answer_to_connection (void *cls, struct MHD_Connection *connection,
 											&getConnectionHeader, pr);
 				if (pr->content_type==0) {
 					LM_ERR("missing Content-Type header\n");
-					return MHD_NO;
+					goto mhd_no;
 				}
 				if (pr->content_type<0) {
 					/* Unexpected Content-Type header:
 					err log printed in getConnectionHeader() */
-					return MHD_NO;
+					goto mhd_no;
 				}
 				LM_DBG("got ContentType [%d] with len [%d]: %.*s\n",
 					pr->content_type, pr->content_len,
@@ -567,7 +745,11 @@ MHD_RET answer_to_connection (void *cls, struct MHD_Connection *connection,
 					/* Save the entire body as the '1' key */
 					kv = (str_str_t*)slinkedl_append(pr->p_list,
 							sizeof(str_str_t) + 1 +
-							*upload_data_size);
+							*upload_data_size + 1);
+					if (!kv) {
+						LM_ERR("oom\n");
+						goto mhd_no;
+					}
 					p = (char*)(kv + 1);
 					kv->key.len = 1; kv->key.s = p;
 					memcpy(p, "1", 1);
@@ -575,15 +757,16 @@ MHD_RET answer_to_connection (void *cls, struct MHD_Connection *connection,
 					kv->val.len = *upload_data_size;
 					kv->val.s = p;
 					memcpy(p, upload_data, *upload_data_size);
+					p[*upload_data_size] = '\0';
 					break;
 				default:
 					LM_ERR("Unhandled data for ContentType [%d]\n",
 							pr->content_type);
-					return MHD_NO;
+					goto mhd_no;
 				}
 				/* Mark the fact that we consumed all data */
 				*upload_data_size = 0;
-				return MHD_YES;
+				goto mhd_yes;
 			}
 			LM_DBG("running MHD_post_process: "
 					"pp=%p status=%d upload_data_size=%zu\n",
@@ -594,13 +777,13 @@ MHD_RET answer_to_connection (void *cls, struct MHD_Connection *connection,
 				/* FIXME:
 				 * It might be better to reply with an error
 				 * instead of resetting the connection via MHD_NO */
-				return MHD_NO;
+				goto mhd_no;
 			}
 			ret =MHD_post_process(pr->pp, upload_data, *upload_data_size);
 			LM_DBG("ret=%d upload_data_size=%zu\n", ret, *upload_data_size);
 			if(*upload_data_size != 0) {
 				*upload_data_size = 0;
-				return MHD_YES;
+				goto mhd_yes;
 			}
 
 			LM_DBG("running MHD_destroy_post_processor: "
@@ -615,11 +798,14 @@ MHD_RET answer_to_connection (void *cls, struct MHD_Connection *connection,
 			if (cb) {
 				normalised_url = &url[cb->http_root->len+1];
 				LM_DBG("normalised_url=[%s]\n", normalised_url);
+				profiling_proc_enter( LEVEL_EXTRAPROCS,
+					ss_merge256("HTTPD_CB ",(char*)normalised_url), 0 );
 				ret_code = cb->callback(cls, (void*)connection,
 						normalised_url,
 						method, version,
 						upload_data, *upload_data_size, con_cls,
 						&buffer, &page, cl_socket);
+				profiling_proc_exit( LEVEL_EXTRAPROCS, "HTTPD_CB", ret_code);
 			} else {
 				page = MI_HTTP_U_URL;
 				ret_code = MHD_HTTP_BAD_REQUEST;
@@ -637,11 +823,14 @@ MHD_RET answer_to_connection (void *cls, struct MHD_Connection *connection,
 		if (cb) {
 			normalised_url = &url[cb->http_root->len+1];
 			LM_DBG("normalised_url=[%s]\n", normalised_url);
+			profiling_proc_enter( LEVEL_EXTRAPROCS,
+				ss_merge256("HTTPD_CB ",(char*)normalised_url), 0 );
 			ret_code = cb->callback(cls, (void*)connection,
 					normalised_url,
 					method, version,
 					upload_data, *upload_data_size, con_cls,
 					&buffer, &page, cl_socket);
+			profiling_proc_exit( LEVEL_EXTRAPROCS, "HTTPD_CB", ret_code);
 		} else {
 			page = MI_HTTP_U_URL;
 			ret_code = MHD_HTTP_BAD_REQUEST;
@@ -677,7 +866,7 @@ send_response:
 							(void*)async_data,
 							NULL);
 	} else {
-		return MHD_NO;
+		goto mhd_no;
 	}
 
 	if (cb && cb->type>0) {
@@ -706,7 +895,16 @@ send_response:
 	ret = MHD_queue_response (connection, ret_code, response);
 	MHD_destroy_response (response);
 
+	profiling_proc_end( LEVEL_EXTRAPROCS, ret );
 	return ret;
+
+mhd_yes:
+	profiling_proc_end( LEVEL_EXTRAPROCS, MHD_YES );
+	return MHD_YES;
+
+mhd_no:
+	profiling_proc_end( LEVEL_EXTRAPROCS, MHD_NO );
+	return MHD_NO;
 }
 #endif
 
@@ -733,6 +931,40 @@ int httpd_callback(int fd, void *dmn, int was_timeout)
 void httpd_proc(int rank)
 {
 	struct httpd_cb *cb = httpd_cb_list;
+	struct httpd_server *s = NULL, *o;
+	int i, acc = 0;
+
+	for (i = 0; i < httpd_n_servers; i++) {
+		o = &httpd_servers[i];
+		if (rank < acc + o->workers) {
+			s = o;
+			break;
+		}
+		acc += o->workers;
+	}
+	if (!s) {
+		LM_ERR("cannot map HTTPD worker rank %d to a server\n", rank);
+		return;
+	}
+
+	ip = s->ip;
+	port = s->port;
+	buffer.len = s->buf_size;
+	hd_conn_timeout_s = s->conn_timeout;
+	post_buf_size = s->post_buf_size;
+	receive_buf_size = s->receive_buf_size;
+	tls_cert_file = s->tls_cert_file;
+	tls_key_file = s->tls_key_file;
+	tls_ciphers = s->tls_ciphers;
+	httpd_listen_fd = s->listen_fd;
+
+	for (i = 0; i < httpd_n_servers; i++) {
+		o = &httpd_servers[i];
+		if (o != s && o->listen_fd >= 0) {
+			close(o->listen_fd);
+			o->listen_fd = -1;
+		}
+	}
 
 	/*child's initial settings*/
 	if (init_mi_child()!=0) {
@@ -740,10 +972,19 @@ void httpd_proc(int rank)
 		return;
 	}
 
+	if (buffer.len == 0)
+		buffer.len = (pkg_mem_size/4);
+
 	/* Allocating http response buffer */
 	buffer.s = (char*)malloc(sizeof(char)*buffer.len);
 	if (buffer.s==NULL) {
 		LM_ERR("oom\n");
+		return;
+	}
+
+	httpd_receive_buff = pkg_malloc(receive_buf_size);
+	if (httpd_receive_buff == NULL) {
+		LM_ERR("oom for receive buffer\n");
 		return;
 	}
 
@@ -760,7 +1001,7 @@ void httpd_proc(int rank)
 	char *key_pem, *cert_pem, *ip_repr, ip6buf[1+IP_ADDR_MAX_STR_SIZE+1];
 	void *saddr;
 	struct sockaddr_in saddr4;
-	struct MHD_OptionItem mhd_opts[4];
+	struct MHD_OptionItem mhd_opts[5];
 	const union MHD_DaemonInfo *dmni;
 	int fd;
 
@@ -796,10 +1037,6 @@ void httpd_proc(int rank)
 
 	} else
 		mhd_flags = mhd_flags | MHD_NO_FLAG;
-
-	mhd_opts[mhd_opt_n].option = MHD_OPTION_END;
-	mhd_opts[mhd_opt_n].value = 0;
-	mhd_opts[mhd_opt_n].ptr_value = NULL;
 
 	#if (MHD_VERSION <= 0x00095000)
 	mhd_flags = mhd_flags | MHD_USE_EPOLL_LINUX_ONLY;
@@ -869,12 +1106,28 @@ void httpd_proc(int rank)
 	httpd_server_info.sin.sin_port = port;
 #endif
 
+	if (httpd_listen_fd >= 0) {
+		mhd_flags &= ~(MHD_USE_IPv6 | MHD_USE_DUAL_STACK);
+		mhd_opts[mhd_opt_n].option = MHD_OPTION_LISTEN_SOCKET;
+		mhd_opts[mhd_opt_n].value = httpd_listen_fd;
+		mhd_opts[mhd_opt_n].ptr_value = NULL;
+		mhd_opt_n++;
+	} else {
+		mhd_opts[mhd_opt_n].option = MHD_OPTION_SOCK_ADDR;
+		mhd_opts[mhd_opt_n].value = 0;
+		mhd_opts[mhd_opt_n].ptr_value = saddr;
+		mhd_opt_n++;
+	}
+
+	mhd_opts[mhd_opt_n].option = MHD_OPTION_END;
+	mhd_opts[mhd_opt_n].value = 0;
+	mhd_opts[mhd_opt_n].ptr_value = NULL;
+
 	LM_DBG("init_child [%d] - [%d] HTTP Server init [%s:%d]\n",
 		rank, getpid(), ip_repr, port);
 	set_proc_attrs("HTTPD %s:%d", ip_repr, port);
 	dmn = MHD_start_daemon(mhd_flags, port, NULL, NULL,
 			&(answer_to_connection), NULL,
-			MHD_OPTION_SOCK_ADDR, saddr,
 			MHD_OPTION_ARRAY, mhd_opts,
 			MHD_OPTION_END);
 
@@ -945,7 +1198,10 @@ static char * load_file(char * filename)
 	if(!f)
 		return NULL;
 
-	fseek(f, 0, SEEK_END);
+	if (fseek(f, 0, SEEK_END) != 0) {
+		fclose(f);
+		return NULL;
+	}
 	long fsize = ftell(f);
 
 	if(fsize <= 0) {
@@ -953,7 +1209,10 @@ static char * load_file(char * filename)
 		return NULL;
 	}
 
-	fseek(f, 0, SEEK_SET);
+	if (fseek(f, 0, SEEK_SET) != 0) {
+		fclose(f);
+		return NULL;
+	}
 
 	char *string = malloc(fsize + 1);
 	size_t bread;

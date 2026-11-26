@@ -1129,7 +1129,7 @@ static void drop_connecting_conn(node_info_t *node, union sockaddr_union *su)
 	struct ip_addr ip;
 
 	su2ip_addr(&ip, su);
-	if (tcp_conn_get(0, &ip, su_getport(su), node->proto, NULL, &c, NULL,
+	if (tcp_conn_get(0, &ip, su_getport(su), node->proto, NULL, &c,
 		node->cluster->send_sock) <= 0 || !c)
 		return;
 

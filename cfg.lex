@@ -200,6 +200,8 @@ SCRIPTVAR_START	"$"
 /* config vars. */
 DEBUG_MODE	debug_mode
 UDP_WORKERS	udp_workers
+UDP_RX_MODE	udp_rx_mode
+TCP_DISPATCH_MODE	tcp_dispatch_mode
 CHROOT		"chroot"
 WDIR		"workdir"|"wdir"
 DISABLE_CORE		"disable_core_dump"
@@ -207,24 +209,23 @@ OPEN_FD_LIMIT		"open_files_limit"
 ENABLE_ASSERTS	enable_asserts
 ABORT_ON_ASSERT	abort_on_assert
 LOGLEVEL	log_level
+PI_FRAMEWORK	pi_framework
 LOGPREFIX	log_prefix
 LOGSTDOUT	log_stdout
-LOGSTDERROR	log_stderror
 STDERROR_ENABLED	stderror_enabled
 SYSLOG_ENABLED	    syslog_enabled
 LOG_EVENT_ENABLED	log_event_enabled
 STDERROR_LEVEL_FILTER	stderror_level_filter
 SYSLOG_LEVEL_FILTER	    syslog_level_filter
 LOG_EVENT_LEVEL_FILTER	log_event_level_filter
+PARSE_ERR_LOG_LEVEL	parse_err_log_level
 STDERROR_FORMAT stderror_log_format
 SYSLOG_FORMAT   syslog_log_format
 LOG_JSON_BUF_SIZE	"log_json_buf_size"
 LOG_MSG_BUF_SIZE    "log_msg_buf_size"
-LOGFACILITY	log_facility
+LOG_RATELIMIT_PERIOD	"log_ratelimit_period"
 SYSLOG_FACILITY	syslog_facility
-LOGNAME		log_name
 SYSLOG_NAME	syslog_name
-LISTEN		listen
 SOCKET		socket
 MEMGROUP	mem-group
 ALIAS		alias
@@ -251,6 +252,7 @@ MEMLOG		"memlog"|"mem_log"
 MEMDUMP		"memdump"|"mem_dump"
 SHM_MEMLOG_SIZE			"shm_memlog_size"
 EXECMSGTHRESHOLD		"execmsgthreshold"|"exec_msg_threshold"
+WORKER_REACTOR_TIMEOUT	"workerreactortimeout"|"worker_reactor_timeout"
 EXECDNSTHRESHOLD		"execdnsthreshold"|"exec_dns_threshold"
 TCPTHRESHOLD			"tcpthreshold"|"tcp_threshold"
 EVENT_SHM_THRESHOLD		"event_shm_threshold"
@@ -272,11 +274,12 @@ TCP_MAX_CONNECTIONS "tcp_max_connections"
 TCP_NO_NEW_CONN_BFLAG "tcp_no_new_conn_bflag"
 TCP_NO_NEW_CONN_RPLFLAG "tcp_no_new_conn_rplflag"
 TCP_KEEPALIVE           "tcp_keepalive"
+REACTOR_DBG_FD_CHECK    "REACTOR_DBG_FD_CHECK"
 TCP_KEEPCOUNT           "tcp_keepcount"
 TCP_KEEPIDLE            "tcp_keepidle"
 TCP_KEEPINTERVAL        "tcp_keepinterval"
 TCP_MAX_MSG_TIME		"tcp_max_msg_time"
-TCP_PARALLEL_READ_ON_WORKERS "tcp_parallel_read_on_workers"
+TCP_THREADS             "tcp_threads"
 ADVERTISED_ADDRESS	"advertised_address"
 ADVERTISED_PORT		"advertised_port"
 MCAST_LOOPBACK		"mcast_loopback"
@@ -345,6 +348,10 @@ ANYCAST	("anycast"|"ANYCAST")
 ACCEPT_SUBDOMAIN ("accept_subdomain"|"ACCEPT_SUBDOMAIN")
 FRAG	("frag"|"FRAG")
 REUSE_PORT	("reuse_port"|"REUSE_PORT")
+ALLOW_PROXY_PROTOCOL	("allow"|"ALLOW")[-_]("proxy"|"PROXY")([-_]("protocol"|"PROTOCOL"))?
+SEND_PROXY_PROTOCOL	("send"|"SEND")[-_]("proxy"|"PROXY")([-_]("protocol"|"PROTOCOL"))?
+PROXY_PROTOCOL	("proxy"|"PROXY")([-_]("protocol"|"PROTOCOL"))?
+BOND	("bond"|"BOND")
 
 
 COM_LINE	#
@@ -420,6 +427,9 @@ SPACE		[ ]
 
 <INITIAL>{DEBUG_MODE}	{ count(); yylval.strval=yytext; return DEBUG_MODE; }
 <INITIAL>{UDP_WORKERS}	{ count(); yylval.strval=yytext; return UDP_WORKERS; }
+<INITIAL>{UDP_RX_MODE}	{ count(); yylval.strval=yytext; return UDP_RX_MODE; }
+<INITIAL>{TCP_DISPATCH_MODE}	{ count(); yylval.strval=yytext; return TCP_DISPATCH_MODE; }
+<INITIAL>{PI_FRAMEWORK}	{ count(); yylval.strval=yytext; return PI_FRAMEWORK; }
 <INITIAL>{CHROOT}	{ count(); yylval.strval=yytext; return CHROOT; }
 <INITIAL>{WDIR}	{ count(); yylval.strval=yytext; return WDIR; }
 <INITIAL>{DISABLE_CORE}		{	count(); yylval.strval=yytext;
@@ -432,24 +442,23 @@ SPACE		[ ]
 <INITIAL>{LOGLEVEL} { count(); yylval.strval=yytext; return LOGLEVEL; }
 <INITIAL>{LOGPREFIX} { count(); yylval.strval=yytext; return LOGPREFIX; }
 <INITIAL>{LOGSTDOUT}	{ yylval.strval=yytext; return LOGSTDOUT; }
-<INITIAL>{LOGSTDERROR} { yylval.strval=yytext; return LOGSTDERROR; }
 <INITIAL>{STDERROR_ENABLED}	{ yylval.strval=yytext; return STDERROR_ENABLED; }
 <INITIAL>{SYSLOG_ENABLED}	{ yylval.strval=yytext; return SYSLOG_ENABLED; }
 <INITIAL>{LOG_EVENT_ENABLED}	{ yylval.strval=yytext; return LOG_EVENT_ENABLED; }
 <INITIAL>{STDERROR_LEVEL_FILTER}	{ count(); yylval.strval=yytext; return STDERROR_LEVEL_FILTER; }
 <INITIAL>{SYSLOG_LEVEL_FILTER}	{ count(); yylval.strval=yytext; return SYSLOG_LEVEL_FILTER; }
 <INITIAL>{LOG_EVENT_LEVEL_FILTER}	{ count(); yylval.strval=yytext; return LOG_EVENT_LEVEL_FILTER; }
+<INITIAL>{PARSE_ERR_LOG_LEVEL}	{ count(); yylval.strval=yytext; return PARSE_ERR_LOG_LEVEL; }
 <INITIAL>{STDERROR_FORMAT} { count(); yylval.strval=yytext; return STDERROR_FORMAT; }
 <INITIAL>{SYSLOG_FORMAT} { count(); yylval.strval=yytext; return SYSLOG_FORMAT; }
 <INITIAL>{LOG_JSON_BUF_SIZE}	{	count(); yylval.strval=yytext;
 									return LOG_JSON_BUF_SIZE; }
 <INITIAL>{LOG_MSG_BUF_SIZE}    {	count(); yylval.strval=yytext;
 									return LOG_MSG_BUF_SIZE; }
-<INITIAL>{LOGFACILITY}	{ yylval.strval=yytext; return LOGFACILITY; }
+<INITIAL>{LOG_RATELIMIT_PERIOD}	{	count(); yylval.strval=yytext;
+									return LOG_RATELIMIT_PERIOD; }
 <INITIAL>{SYSLOG_FACILITY}	{ yylval.strval=yytext; return SYSLOG_FACILITY; }
-<INITIAL>{LOGNAME}	{ yylval.strval=yytext; return LOGNAME; }
 <INITIAL>{SYSLOG_NAME}	{ yylval.strval=yytext; return SYSLOG_NAME; }
-<INITIAL>{LISTEN}	{ count(); yylval.strval=yytext; return LISTEN; }
 <INITIAL>{SOCKET}	{ count(); yylval.strval=yytext; return SOCKET; }
 <INITIAL>{MEMGROUP}	{ count(); yylval.strval=yytext; return MEMGROUP; }
 <INITIAL>{ALIAS}	{ count(); yylval.strval=yytext; return ALIAS; }
@@ -484,6 +493,7 @@ SPACE		[ ]
 <INITIAL>{MEMDUMP}	{ count(); yylval.strval=yytext; return MEMDUMP; }
 <INITIAL>{SHM_MEMLOG_SIZE}	{ count(); yylval.strval=yytext; return SHM_MEMLOG_SIZE; }
 <INITIAL>{EXECMSGTHRESHOLD}	{ count(); yylval.strval=yytext; return EXECMSGTHRESHOLD; }
+<INITIAL>{WORKER_REACTOR_TIMEOUT}	{ count(); yylval.strval=yytext; return WORKER_REACTOR_TIMEOUT; }
 <INITIAL>{EXECDNSTHRESHOLD}	{ count(); yylval.strval=yytext; return EXECDNSTHRESHOLD; }
 <INITIAL>{TCPTHRESHOLD}	{ count(); yylval.strval=yytext; return TCPTHRESHOLD; }
 <INITIAL>{EVENT_SHM_THRESHOLD}	{ count(); yylval.strval=yytext; return EVENT_SHM_THRESHOLD; }
@@ -508,11 +518,12 @@ SPACE		[ ]
 <INITIAL>{TCP_MAX_CONNECTIONS}  { count(); yylval.strval=yytext;
 									return TCP_MAX_CONNECTIONS; }
 <INITIAL>{TCP_KEEPALIVE}       { count(); yylval.strval=yytext; return TCP_KEEPALIVE; }
+<INITIAL>{REACTOR_DBG_FD_CHECK} { count(); yylval.strval=yytext; return REACTOR_DBG_FD_CHECK; }
 <INITIAL>{TCP_KEEPCOUNT}       { count(); yylval.strval=yytext; return TCP_KEEPCOUNT; }
 <INITIAL>{TCP_KEEPIDLE}        { count(); yylval.strval=yytext; return TCP_KEEPIDLE; }
 <INITIAL>{TCP_KEEPINTERVAL}    { count(); yylval.strval=yytext; return TCP_KEEPINTERVAL; }
 <INITIAL>{TCP_MAX_MSG_TIME}    { count(); yylval.strval=yytext; return TCP_MAX_MSG_TIME; }
-<INITIAL>{TCP_PARALLEL_READ_ON_WORKERS}  { count(); yylval.strval=yytext; return TCP_PARALLEL_READ_ON_WORKERS; }
+<INITIAL>{TCP_THREADS}  { count(); yylval.strval=yytext; return TCP_THREADS; }
 <INITIAL>{SERVER_SIGNATURE}	{ count(); yylval.strval=yytext; return SERVER_SIGNATURE; }
 <INITIAL>{SERVER_HEADER}	{ count(); yylval.strval=yytext; return SERVER_HEADER; }
 <INITIAL>{USER_AGENT_HEADER}	{ count(); yylval.strval=yytext; return USER_AGENT_HEADER; }
@@ -620,7 +631,11 @@ SPACE		[ ]
 <INITIAL>{ANYCAST}	{ count(); return ANYCAST; }
 <INITIAL>{ACCEPT_SUBDOMAIN}	{ count(); return ACCEPT_SUBDOMAIN; }
 <INITIAL>{REUSE_PORT}	{ count(); return REUSE_PORT; }
+<INITIAL>{ALLOW_PROXY_PROTOCOL}	{ count(); return ALLOW_PROXY_PROTOCOL; }
+<INITIAL>{SEND_PROXY_PROTOCOL}	{ count(); return SEND_PROXY_PROTOCOL; }
+<INITIAL>{PROXY_PROTOCOL}		{ count(); return PROXY_PROTOCOL; }
 <INITIAL>{FRAG}		{ count(); return FRAG; }
+<INITIAL>{BOND}		{ count(); return BOND; }
 <INITIAL>{SLASH}	{ count(); return SLASH; }
 <INITIAL>{SCALE_UP_TO}		{ count(); return SCALE_UP_TO; }
 <INITIAL>{SCALE_DOWN_TO}	{ count(); return SCALE_DOWN_TO; }

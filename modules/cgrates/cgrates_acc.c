@@ -19,6 +19,8 @@
  *
  */
 
+#include <sys/time.h>
+
 #include "../../ut.h"
 #include "../../mod_fix.h"
 #include "cgrates_acc.h"
@@ -30,6 +32,9 @@
 struct dlg_binds cgr_dlgb;
 struct tm_binds cgr_tmb;
 
+char *cgr_usage_precision_s = "ms";
+static int cgr_usage_precision = CGR_USAGE_MS;
+
 static gen_lock_t *cgrates_contexts_lock;
 static struct list_head *cgrates_contexts;
 
@@ -37,6 +42,8 @@ static inline void cgr_free_acc_ctx(struct cgr_acc_ctx *ctx);
 static void cgr_tmcb_func( struct cell* t, int type, struct tmcb_params *ps);
 static void cgr_tmcb_func_free(void *param);
 static void cgr_dlg_callback(struct dlg_cell *dlg, int type,
+		struct dlg_cb_params *_params);
+static void cgr_dlg_process_vars(struct dlg_cell *dlg, int type,
 		struct dlg_cb_params *_params);
 
 static str cgr_ctx_str = str_init("cgrX_ctx");
@@ -57,7 +64,43 @@ int cgr_acc_init(void)
 	}
 	INIT_LIST_HEAD(cgrates_contexts);
 
+	if (!strcmp(cgr_usage_precision_s, "s"))
+		cgr_usage_precision = CGR_USAGE_S;
+	else if (!strcmp(cgr_usage_precision_s, "ms"))
+		cgr_usage_precision = CGR_USAGE_MS;
+	else if (!strcmp(cgr_usage_precision_s, "us"))
+		cgr_usage_precision = CGR_USAGE_US;
+	else {
+		LM_ERR("invalid usage_precision \"%s\": expected s, ms or us\n",
+				cgr_usage_precision_s);
+		return -1;
+	}
+
 	return 0;
+}
+
+static int cgr_restore_acc_ctx(struct dlg_cell *dlg, struct cgr_acc_ctx *ctx)
+{
+	int_str ctxstr;
+	int_str new_ctxstr;
+	int val_type;
+	struct cgr_acc_ctx *stored_ctx = NULL;
+
+	if (cgr_dlgb.fetch_dlg_value(dlg, &cgr_ctx_str, &val_type,
+				&ctxstr, 0) == 0 &&
+			val_type == DLG_VAL_TYPE_STR &&
+			ctxstr.s.len == sizeof(struct cgr_acc_ctx *)) {
+		stored_ctx = *(struct cgr_acc_ctx **)ctxstr.s.s;
+		if (stored_ctx == ctx)
+			return 0;
+	}
+
+	LM_DBG("resetting dialog acc ctx from %p to %p\n", stored_ctx, ctx);
+	new_ctxstr.s.len = sizeof(ctx);
+	new_ctxstr.s.s = (char *)&ctx;
+
+	return cgr_dlgb.store_dlg_value(dlg, &cgr_ctx_str, &new_ctxstr,
+			DLG_VAL_TYPE_STR);
 }
 
 static inline struct cgr_acc_ctx *cgr_new_acc_ctx(struct dlg_cell *dlg)
@@ -473,14 +516,36 @@ error:
 	return NULL;
 }
 
+/* pushes the Usage node as a Go duration */
+static int cgr_push_usage(json_object *params, struct cgr_acc_ctx *ctx,
+		char *buf, int buf_len)
+{
+	str tmp;
+
+	switch (cgr_usage_precision) {
+	case CGR_USAGE_S:
+		tmp.len = snprintf(buf, buf_len, "%llus", ctx->duration / 1000000);
+		break;
+	case CGR_USAGE_US:
+		tmp.len = snprintf(buf, buf_len, "%lluus", ctx->duration);
+		break;
+	default:
+		tmp.len = snprintf(buf, buf_len, "%llums", ctx->duration / 1000);
+		break;
+	}
+	tmp.s = buf;
+	return cgr_obj_push_str(params, "Usage", &tmp);
+}
+
 static json_object *cgr_get_stop_acc_msg(struct sip_msg *msg,
 		struct cgr_acc_ctx *ctx, struct cgr_session *s)
 {
 	struct cgr_acc_sess *si = (struct cgr_acc_sess *)s->acc_info;
 	struct dlg_cell *dlg;
 	struct cgr_msg *cmsg = NULL;
-	char int2str_buf[INT2STR_MAX_LEN + 1];
-	time_t now = time(NULL);
+	char usage_buf[INT2STR_MAX_LEN + 3];
+	struct timeval now;
+	long long dur_us;
 	static str cmd_compat = str_init("SMGenericV1.TerminateSession");
 	static str cmd_ng = str_init("SessionSv1.TerminateSession");
 	str *cmd = (cgre_compat_mode ? &cmd_compat: &cmd_ng);
@@ -492,7 +557,10 @@ static json_object *cgr_get_stop_acc_msg(struct sip_msg *msg,
 		return NULL;
 	}
 
-	ctx->duration = now - ctx->answer_time;
+	/* call duration in microseconds */
+	gettimeofday(&now, NULL);
+	dur_us = (long long)(now.tv_sec - ctx->answer_time) * 1000000LL + (long long)(now.tv_usec - (long)ctx->answer_usec);
+	ctx->duration = dur_us > 0 ? (unsigned long long)dur_us : 0;
 
 	/* OriginID */
 	if ((dlg = cgr_dlgb.get_dlg()) == NULL) {
@@ -546,12 +614,7 @@ static json_object *cgr_get_stop_acc_msg(struct sip_msg *msg,
 		goto error;
 	}
 
-	tmp.s = int2bstr(ctx->duration, int2str_buf, &tmp.len);
-	/* add an s at the end */
-	tmp.s[tmp.len] = 's';
-	tmp.len++;
-	tmp.s[tmp.len] = 0;
-	if (cgr_obj_push_str(cmsg->params, "Usage", &tmp) < 0) {
+	if (cgr_push_usage(cmsg->params, ctx, usage_buf, sizeof(usage_buf)) < 0) {
 		LM_ERR("cannot add Usage node\n");
 		goto error;
 	}
@@ -568,7 +631,7 @@ static json_object *cgr_get_cdr_acc_msg(struct sip_msg *msg,
 {
 	str tmp;
 	struct cgr_msg *cmsg = NULL;
-	char int2str_buf[INT2STR_MAX_LEN + 1];
+	char usage_buf[INT2STR_MAX_LEN + 3];
 	static str cmd_compat = str_init("SMGenericV1.ProcessCDR");
 	static str cmd_ng = str_init("SessionSv1.ProcessCDR");
 	struct cgr_acc_sess *si = (struct cgr_acc_sess *)s->acc_info;
@@ -596,12 +659,7 @@ static json_object *cgr_get_cdr_acc_msg(struct sip_msg *msg,
 		goto error;
 	}
 
-	tmp.s = int2bstr(ctx->duration, int2str_buf, &tmp.len);
-	/* add an s at the end */
-	tmp.s[tmp.len] = 's';
-	tmp.len++;
-	tmp.s[tmp.len] = 0;
-	if (cgr_obj_push_str(cmsg->params, "Usage", &tmp) < 0) {
+	if (cgr_push_usage(cmsg->params, ctx, usage_buf, sizeof(usage_buf)) < 0) {
 		LM_ERR("cannot add Usage node\n");
 		goto error;
 	}
@@ -762,7 +820,8 @@ static void cgr_dlg_onwrite(struct dlg_cell *dlg, int type,
 			/* tag */
 			memcpy(p, &s->tag.len, sizeof(unsigned));
 			p += sizeof(unsigned);
-			memcpy(p, s->tag.s, s->tag.len);
+			if (s->tag.len)
+				memcpy(p, s->tag.s, s->tag.len);
 			p += s->tag.len;
 
 			/* acc */
@@ -979,6 +1038,12 @@ int w_cgr_acc(struct sip_msg* msg, void *flag_c, str* acc_c, str *dst_c,
 			return -1;
 		}
 
+		if (cgr_dlgb.register_dlgcb(dlg, DLGCB_PROCESS_VARS,
+					cgr_dlg_process_vars, ctx, NULL) != 0) {
+			LM_ERR("cannot register callback for context replication!\n");
+			return -1;
+		}
+
 		if (cgr_dlgb.register_dlgcb(dlg, DLGCB_DESTROY,
 					cgr_dlg_destroy, NULL, NULL) != 0)
 			LM_ERR("cannot register callback for context release! context might leak!\n");
@@ -1002,6 +1067,7 @@ static void cgr_tmcb_func(struct cell* t, int type, struct tmcb_params *ps)
 	struct list_head *l;
 	json_object *jmsg;
 	str terminate_str;
+	struct timeval now;
 	int branch;
 	str callid;
 
@@ -1034,16 +1100,18 @@ static void cgr_tmcb_func(struct cell* t, int type, struct tmcb_params *ps)
 				BRANCH_BM_RST_ALL( si->branch_mask );
 			}
 		}
-		goto unref;
+		return;
 	}
 
 	/* we start a session only for successful calls */
 	dlg = cgr_dlgb.get_dlg();
 	if (!dlg) {
 		LM_ERR("cannot find dialog!\n");
-		goto unref;
+		return;
 	}
-	time(&ctx->answer_time);
+	gettimeofday(&now, NULL);
+	ctx->answer_time = now.tv_sec;
+	ctx->answer_usec = now.tv_usec;
 	list_for_each(l, ctx->sessions) {
 		s = list_entry(l, struct cgr_session, list);
 		si = s->acc_info;
@@ -1066,17 +1134,15 @@ static void cgr_tmcb_func(struct cell* t, int type, struct tmcb_params *ps)
 		si->flags |= CGRF_ENGAGED;
 	}
 
-	/* should have reffed engaged and unref tm, so we simply exit :D */
+	/* the tm ref is released by the callback release hook */
 	return;
 error:
 	/* TODO: should we close all the started sessions now? */
 	terminate_str.s = "CGRateS Accounting Denied";
 	terminate_str.len = strlen(terminate_str.s);
-	if (cgr_dlgb.terminate_dlg(NULL, dlg->h_entry, dlg->h_id, &terminate_str) >= 0)
+	if (run_dlg_api(&cgr_dlgb, terminate_dlg, NULL, dlg->h_entry, dlg->h_id, &terminate_str) >= 0)
 		return;
 	LM_ERR("cannot terminate the dialog!\n");
-unref:
-	cgr_ref_acc_ctx(ctx, -1, "tm");
 }
 
 static void cgr_cdr_cb(struct cell* t, int type, struct tmcb_params *ps)
@@ -1100,6 +1166,8 @@ static void cgr_cdr_cb(struct cell* t, int type, struct tmcb_params *ps)
 			continue;
 		cgr_cdr(ps->req, ctx, s, &dlg->callid);
 	}
+	if (cgr_restore_acc_ctx(dlg, NULL) < 0)
+		LM_ERR("cannot reset context %p in dialog %p\n", ctx, dlg);
 	cgr_ref_acc_ctx(ctx, -1, "engaged");
 }
 
@@ -1166,18 +1234,26 @@ void cgr_loaded_callback(struct dlg_cell *dlg, int type,
 			continue;
 
 		CGR_CTX_COPY(&tmp1.len, sizeof(unsigned), "tag.len");
-		if (!(tmp1.s = pkg_malloc(tmp1.len))) {
-			LM_ERR("cannot allocate account in ctx=%p len=%d!\n", ctx, tmp1.len);
-			goto internal_error;
+		if (tmp1.len) {
+			if (!(tmp1.s = pkg_malloc(tmp1.len))) {
+				LM_ERR("cannot allocate account in ctx=%p len=%d!\n", ctx, tmp1.len);
+				goto internal_error;
+			}
+			CGR_CTX_COPY(tmp1.s, tmp1.len, "tag.s");
+		} else {
+			tmp1.s = NULL;
 		}
-		CGR_CTX_COPY(tmp1.s, tmp1.len, "tag.s");
 
 		s = cgr_new_sess(&tmp1);
-		pkg_free(tmp1.s);
 		if (!s) {
-			LM_ERR("cannot allocate new session for tag %.*s\n", tmp1.len, tmp1.s);
+			LM_ERR("cannot allocate new session for tag %.*s\n",
+				tmp1.len, tmp1.s ? tmp1.s : "");
+			if (tmp1.s)
+				pkg_free(tmp1.s);
 			goto internal_error;
 		}
+		if (tmp1.s)
+			pkg_free(tmp1.s);
 		list_add(&s->list, ctx->sessions);
 
 		CGR_CTX_COPY(&tmp1.len, sizeof(unsigned), "acc.len");
@@ -1303,6 +1379,12 @@ store:
 		goto internal_error;
 	}
 
+	if (cgr_dlgb.register_dlgcb(dlg, DLGCB_PROCESS_VARS,
+				cgr_dlg_process_vars, ctx, NULL) != 0) {
+		LM_ERR("cannot register callback for context replication!\n");
+		goto internal_error;
+	}
+
 	if (cgr_dlgb.register_dlgcb(dlg, DLGCB_DESTROY,
 				cgr_dlg_destroy, NULL, NULL) != 0)
 		LM_ERR("cannot register callback for context release! context might leak!\n");
@@ -1313,6 +1395,28 @@ internal_error:
 	cgr_free_acc_ctx(ctx);
 }
 #undef CGR_CTX_COPY
+
+static void cgr_dlg_process_vars(struct dlg_cell *dlg, int type,
+		struct dlg_cb_params *_params)
+{
+	struct cgr_acc_ctx *ctx;
+	str *name;
+
+	if (!_params || !_params->param || !*_params->param) {
+		LM_ERR("no context specified to process replicated vars\n");
+		return;
+	}
+
+	ctx = *_params->param;
+	name = (str *)_params->dlg_data;
+
+	if (name && (name->len != cgr_ctx_str.len ||
+				memcmp(name->s, cgr_ctx_str.s, name->len) != 0))
+		return;
+
+	if (cgr_restore_acc_ctx(dlg, ctx) < 0)
+		LM_ERR("cannot restore context %p in dialog %p\n", ctx, dlg);
+}
 
 static void cgr_dlg_callback(struct dlg_cell *dlg, int type,
 		struct dlg_cb_params *_params)
@@ -1370,8 +1474,11 @@ static void cgr_dlg_callback(struct dlg_cell *dlg, int type,
 			}
 		}
 	}
-	if (!registered)
+	if (!registered) {
+		if (cgr_restore_acc_ctx(dlg, NULL) < 0)
+			LM_ERR("cannot reset context %p in dialog %p\n", ctx, dlg);
 		cgr_ref_acc_ctx(ctx, -1, "dialog");
+	}
 }
 
 int cgr_acc_terminate(json_object *param, json_object **ret)
@@ -1425,7 +1532,7 @@ int cgr_acc_terminate(json_object *param, json_object **ret)
 		terminate_str.s = terminate_str_pre.s;
 		terminate_str.len = terminate_str_pre.len - 2 /* skip the ': ' */;
 	}
-	if (cgr_dlgb.terminate_dlg(NULL, h_entry, h_id, &terminate_str) < 0) {
+	if (run_dlg_api(&cgr_dlgb, terminate_dlg, NULL, h_entry, h_id, &terminate_str) < 0) {
 		if (terminate_str.s != terminate_str_pre.s)
 			pkg_free(terminate_str.s);
 		err = "cannot terminate dialog";

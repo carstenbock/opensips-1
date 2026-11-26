@@ -52,6 +52,7 @@ extern int max_contacts;
 extern int max_username_len;
 extern int max_domain_len;
 extern int max_aor_len;
+extern int allow_dup_cseq;
 extern int max_contact_len;
 
 #define reg_modparams \
@@ -60,6 +61,7 @@ extern int max_contact_len;
 	{"max_domain_len",        INT_PARAM, &max_domain_len}, \
 	{"max_aor_len",           INT_PARAM, &max_aor_len}, \
 	{"max_contact_len",       INT_PARAM, &max_contact_len}, \
+	{"allow_dup_cseq",        INT_PARAM, &allow_dup_cseq}, \
 	{"expires_max_deviation", INT_PARAM, &expires_max_deviation}
 
 /* common registrar init code */
@@ -73,22 +75,33 @@ static inline time_t randomize_expires(unsigned int expires_ts)
 		return expires_ts;
 
 	int expires_dur = expires_ts - get_act_time();
-	int expires_adj = rand() % (expires_max_deviation * 2 + 1)
-						- expires_max_deviation;
+	int lo = expires_dur - expires_max_deviation;
+	int hi = expires_dur + expires_max_deviation;
 
-	expires_dur += expires_adj;
-	if (expires_dur < min_expires)
-		expires_dur = min_expires;
+	/* Clamp the deviation band to the configured limits BEFORE drawing from
+	 * it.  Drawing first and clamping the result folds the whole
+	 * out-of-range tail onto a single value, so a contact registering near
+	 * min_expires or max_expires is not randomized at all - the opposite of
+	 * what this parameter is for. */
+	if (lo < min_expires)
+		lo = min_expires;
 
-	if (max_expires && expires_dur > max_expires)
-		expires_dur = max_expires;
+	if (max_expires && hi > max_expires)
+		hi = max_expires;
+
+	if (hi < lo)
+		hi = lo;
+
+	expires_dur = lo + rand() % (hi - lo + 1);
 
 	ret = expires_dur + get_act_time();
-	LM_DBG("randomized expiry ts from %u to %lld (adj: %d/%lld, "
-	       "max_deviation: %d)\n", expires_ts, (long long)ret, expires_adj,
-	       (long long)ret - (long long)expires_ts, expires_max_deviation);
+	LM_DBG("randomized expiry ts from %u to %lld (band: [%d,%d], "
+	       "max_deviation: %d)\n", expires_ts, (long long)ret, lo, hi,
+	       expires_max_deviation);
 
 	return ret;
 }
+
+#define REG_CSEQ_ADJUST(_cs) ((_cs) + allow_dup_cseq)
 
 #endif /* __LIB_REG_COMMON_H__ */

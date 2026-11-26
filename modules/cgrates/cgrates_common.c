@@ -694,7 +694,7 @@ int cgr_handle_async_cmd(struct sip_msg *msg, json_object *jmsg,
 				CGRC_UNSET_LISTEN(c);
 			}
 			async_status = c->fd;
-			ctx->resume_f = cgrates_async_resume_repl;
+			ASYNC_SET_RESUME_F(ctx, cgrates_async_resume_repl);
 			ctx->resume_param = cp;
 		}
 		return ret;
@@ -722,8 +722,12 @@ int cgrc_async_read(struct cgr_conn *c,
 try_again:
 	bytes_read = read(c->fd, buffer, CGR_BUFFER_SIZE);
 	if (bytes_read < 0) {
-		if (errno == EINTR || errno == EAGAIN)
+		if (errno == EINTR)
 			goto try_again;
+		else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			async_status = f ? ASYNC_CONTINUE : ASYNC_DONE;
+			return final_ret;
+		}
 		else if (errno == ECONNRESET) {
 			LM_INFO("CGRateS engine reset the connection\n");
 			goto disable;
@@ -748,7 +752,6 @@ reprocess:
 	if (jobj) {
 		ret = cgrates_process(jobj, c, f, p);
 		json_object_put(jobj);
-		jobj = NULL;
 		if (ret)
 			final_ret = ret;
 	} else {

@@ -35,6 +35,8 @@
 #include "../tls_mgm/api.h"
 #include "msrp_parser.h"
 
+struct sip_msg;
+
 enum msrp_req_states { MSRP_START, MSRP_FIRSTLINE_IDENT,
 		MSRP_FIRSTLINE_METHOD,
 		MSRP_HEADERS, MSRP_BODY, MSRP_EOM
@@ -60,7 +62,6 @@ extern int msrp_max_msg_chunks;
 extern int *msrp_trace_is_on;
 extern struct script_route_ref*  msrp_trace_filter_route;
 extern trace_dest msrp_t_dst;
-extern struct msrp_req msrp_current_req;
 
 extern struct tls_mgm_binds tls_mgm_api;
 
@@ -83,12 +84,14 @@ extern struct tls_mgm_binds tls_mgm_api;
 
 
 void msrp_brief_parse_msg(struct msrp_req *r);
+int msrp_dispatch_msg(char *buf, int len, struct receive_info *rcv,
+		void *data, int data_len);
 
 int proto_msrp_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len,
-		const union sockaddr_union* to, unsigned int id);
+		const union sockaddr_union* to, unsigned int id,
+		struct sip_msg *msg);
 
 int msrp_read_req(struct tcp_connection* con, int* bytes_read);
 
 #endif
-

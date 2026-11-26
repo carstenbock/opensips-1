@@ -2,6 +2,7 @@
 [![Unit Tests](https://github.com/OpenSIPS/opensips/actions/workflows/unittests.yml/badge.svg?branch=master)](https://github.com/OpenSIPS/opensips/actions/workflows/unittests.yml?query=branch%3Amaster++)
 [![OSS-Fuzz](https://github.com/OpenSIPS/opensips/actions/workflows/cifuzz.yml/badge.svg?branch=master)](https://github.com/OpenSIPS/opensips/actions/workflows/cifuzz.yml?query=branch%3Amaster++)
 [![Cross Platform Builds](https://github.com/OpenSIPS/opensips/actions/workflows/multiarch.yml/badge.svg?branch=master)](https://github.com/OpenSIPS/opensips/actions/workflows/multiarch.yml?query=branch%3Amaster++)
+[![RTP.io](https://github.com/OpenSIPS/opensips/actions/workflows/rtp.io.yml/badge.svg?branch=master)](https://github.com/OpenSIPS/opensips/actions/workflows/rtp.io.yml?query=branch%3Amaster++)
 [![Coverity Scan Build Status](https://scan.coverity.com/projects/7580/badge.svg)](https://scan.coverity.com/projects/opensips-opensips)
 
 # Welcome to OpenSIPS Project
@@ -25,8 +26,8 @@ by a team including core and main developers of SER project.
 For information regarding the OpenSIPS installation, please see the [INSTALL](INSTALL)
 file.
 
-For current developers/contributors of this project, see the [CREDITS](CREDITS) and
-[AUTHORS](AUTHORS) file. For complete license information, please see the [COPYING](COPYING) file.
+For current developers/contributors of this project, see the [AUTHORS](AUTHORS) file.
+For complete license information, please see the [COPYING](COPYING) file.
 For an overview of OpenSIPS modules, a [modules listing](https://www.opensips.org/Documentation/Modules)
 is available on the opensips.org website.
 

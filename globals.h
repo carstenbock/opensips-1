@@ -27,6 +27,7 @@
 #define globals_h
 
 #include <time.h>
+#include "str.h"
 
 typedef struct __str * const strptr_t;
 
@@ -40,6 +41,7 @@ extern char * cfg_file;
 extern char *preproc;
 extern int config_check;
 extern char *stat_file;
+extern str pi_framework;
 
 extern char* pid_file;
 extern char* pgid_file;
@@ -50,6 +52,31 @@ extern int auto_aliases;
 
 extern unsigned int maxbuffer;
 extern int udp_workers_no;
+/* how the UDP workers of a listener receive, cfg "udp_rx_mode":
+ *  shared    - one socket, every worker polls it (each packet wakes all idle
+ *              workers, the last-forked one is woken first)
+ *  exclusive - same socket, EPOLLEXCLUSIVE (one wakeup per packet; needs a
+ *              6.0+ kernel: before 5.7 bursts serialize on one worker,
+ *              5.7-5.19 are untested, see io_watch_add())
+ *  reuseport - one SO_REUSEPORT socket per worker, a cBPF program spreads
+ *              the packets uniformly at random (needs a 4.5+ kernel)
+ *  auto      - reuseport when the kernel supports it, else shared */
+enum udp_rx_mode { UDP_RX_AUTO=0, UDP_RX_SHARED, UDP_RX_EXCLUSIVE,
+	UDP_RX_REUSEPORT };
+extern int udp_rx_mode;
+int parse_udp_rx_mode(const char *s);
+/* how TCP main hands read events to the TCP workers, cfg "tcp_dispatch_mode":
+ *  shared     - one dispatch socket polled by every worker (same herd as above)
+ *  exclusive  - same socket with EPOLLEXCLUSIVE (6.0+ kernel)
+ *  per_worker - one dispatch socket per worker, TCP main picks the next
+ *               idle worker round-robin
+ *  auto       - per_worker */
+enum tcp_dispatch_mode { TCP_DISPATCH_AUTO=0, TCP_DISPATCH_SHARED,
+	TCP_DISPATCH_EXCLUSIVE, TCP_DISPATCH_PER_WORKER };
+extern int tcp_dispatch_mode;
+int parse_tcp_dispatch_mode(const char *s);
+/* 1 if the running Linux kernel is at least major.minor, 0 otherwise */
+int os_kernel_at_least(int major, int minor);
 extern char *udp_auto_scaling_profile;
 extern enum poll_types io_poll_method;
 extern int auto_scaling_enabled;
@@ -66,6 +93,7 @@ extern int tcp_socket_backlog;
 extern int tcp_max_fd_no;
 extern int tcp_max_connections;
 extern int tcp_keepalive;
+extern int reactor_dbg_fd_check;
 extern int tcp_keepcount;
 extern int tcp_keepidle;
 extern int tcp_keepinterval;
@@ -73,7 +101,7 @@ extern int tcp_max_msg_time;
 extern int tcp_no_new_conn;
 extern int tcp_no_new_conn_bflag;
 extern int tcp_no_new_conn_rplflag;
-extern int tcp_parallel_read_on_workers;
+extern int tcp_threads;
 extern struct tcp_conn_profile tcp_con_df_profile;
 
 extern int no_daemon_mode;

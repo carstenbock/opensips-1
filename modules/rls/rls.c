@@ -194,9 +194,9 @@ static const param_export_t params[]={
 };
 
 static const mi_export_t mi_cmds[] = {
-	{ "rls_update_subscriptions", 0, 0, 0, {
+	{ "update_subscriptions", 0, 0, 0, {
 		{mi_update_subscriptions, {"presentity_uri", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"rls_update_subscriptions", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };

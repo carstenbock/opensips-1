@@ -122,13 +122,13 @@ static const cmd_export_t cmds[]=
 };
 
 static const mi_export_t mi_cmds[] = {
-	{ "msrp_gw_end_session", 0, 0, 0, {
+	{ "end_session", 0, 0, 0, {
 		{msrpgw_mi_end, {"key", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"msrp_gw_end_session", 0}
 	},
-	{ "msrp_gw_list_sessions", 0, 0, 0, {
+	{ "list_sessions", 0, 0, 0, {
 		{msrpgw_mi_list, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"msrp_gw_list_sessions", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };
@@ -437,7 +437,7 @@ int msrp_req_cb(struct msrp_msg *req, void *hdl_param)
 	p += req->content_type->body.len;
 	memcpy(p, CRLF, CRLF_LEN);
 
-	tmb.t_request(&str_init("MESSAGE"), &sess->sipua_ruri, &sess->sipua_to,
+	run_tm_api(&tmb, t_request, &str_init("MESSAGE"), &sess->sipua_ruri, &sess->sipua_to,
 		&sess->sipua_from, &hdrs, &req->body, NULL, NULL, NULL, NULL);
 
 	pkg_free(hdrs.s);

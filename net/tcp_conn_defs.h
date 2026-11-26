@@ -38,7 +38,9 @@
 
 #include "../locking.h"
 #include "../ip_addr.h"
+#include "../timer.h"
 #include "tcp_conn_profile.h"
+#include "proto_tcp/tcp_common_defs.h"
 
 /* keepalive */
 #ifndef NO_TCP_KEEPALIVE
@@ -79,11 +81,18 @@
 #define F_CONN_NON_BLOCKING		(1<<0)
 #define F_CONN_TRACE_DROPPED	(1<<1) /*!< tracing dropped on this connection */
 #define F_CONN_ACCEPTED			(1<<2) /*!< created after a connect event */
-#define F_CONN_REMOVED_READ		(1<<3) /*!< no longer in "main" reactor for read */
-#define F_CONN_REMOVED_WRITE	(1<<4) /*!< no longer in "main" reactor for write */
-/*!< no longer in "main" reactor for read or write */
-#define F_CONN_REMOVED			(F_CONN_REMOVED_READ|F_CONN_REMOVED_WRITE)
 #define F_CONN_INIT				(1<<5) /*!< the connection was initialized */
+#define F_CONN_DATA_READY		(1<<6) /*!< the connection is ready to process data */
+#define F_CONN_PROXY_OUT_SENT	(1<<7) /*!< outbound PROXY header already sent */
+#define F_CONN_HASHED			(1<<9) /*!< the connection is linked in the shared hashes */
+#define F_CONN_FORCE_CLOSED		(1<<10) /*!< closed explicitly by admin/script */
+
+/* Reactor state is owned and modified exclusively by TCP main. */
+#define F_TCP_MAIN_REMOVED_READ		(1<<0) /*!< no reader in main reactor */
+#define F_TCP_MAIN_REMOVED_WRITE	(1<<1) /*!< no writer in main reactor */
+#define F_TCP_MAIN_REMOVED \
+	(F_TCP_MAIN_REMOVED_READ|F_TCP_MAIN_REMOVED_WRITE)
+#define F_TCP_MAIN_READ_QUEUED		(1<<2) /*!< one read job queued/running */
 
 enum tcp_conn_states { S_CONN_ERROR=-2, S_CONN_BAD=-1, S_CONN_OK=0,
 		S_CONN_CONNECTING, S_CONN_EOF };
@@ -105,8 +114,27 @@ enum tcp_conn_alias_mode {
 	TCP_ALIAS_ALWAYS,
 };
 
+/*! \brief Cached TLS metadata stored in shared memory */
+struct tcp_tls_info {
+	char *version;				/*!< negotiated TLS version */
+	char *cipher_name;			/*!< negotiated cipher name */
+	char *cipher_desc;			/*!< negotiated cipher description */
+	unsigned int bits;				/*!< negotiated cipher bits */
+	unsigned char peer_verified;		/*!< normalized peer verification result */
+};
+
+
+typedef void (tcp_fail_f)(void *param);
+typedef void (tcp_fail_free_f)(void *param);
+
+struct tcp_fail_cb {
+	tcp_fail_f *f;
+	void *param;
+	tcp_fail_free_f *free;
+};
 
 struct tcp_async_chunk {
+	struct tcp_fail_cb fail_cb;
 	char *buf; /* buffer that needs to be sent out */
 	int len;   /* length of the buffer */
 	int ticks; /* time at which this chunk was initially
@@ -128,11 +156,9 @@ struct tcp_async_data {
 struct tcp_conn_profile {
 	unsigned int connect_timeout;
 	unsigned int con_lifetime;
-
 	unsigned int msg_read_timeout;
 	unsigned int send_threshold;
 	unsigned char no_new_conn:1;
-	unsigned char parallel_read:2;
 
 	enum tcp_conn_alias_mode alias_mode;
 
@@ -147,9 +173,7 @@ struct tcp_conn_profile {
 
 /*! \brief TCP connection structure */
 struct tcp_connection{
-	int s;					/*!< socket, used by "tcp main" */
-	int fd;					/*!< used only by "children", don't modify it! private data! */
-	int proc_id;				/*!< used only by "children", contains the pt table ID of the TCP worker currently holding the connection, or -1 if in TCP main */
+	int fd;					/*!< connection socket descriptor */
 	gen_lock_t write_lock;
 	unsigned int id;				/*!< id (unique!) used to retrieve a specific connection when reply-ing*/
 	unsigned long long cid;					/*!< connection id (unique!) used to uniquely identify connections across space and time */
@@ -157,9 +181,8 @@ struct tcp_connection{
 	volatile int refcnt;
 	enum sip_protos type;			/*!< PROTO_TCP or a protocol over it, e.g. TLS */
 	enum tcp_conn_states state;		/*!< connection state */
-	void* extra_data;			/*!< extra data associated to the connection, 0 for tcp*/
-	/*!< connection timeout, to be used by worker only; after this
-	 * it will be released (with success or not) */
+	void* extra_data;			/*!< TCP-main-private extra data associated to the connection, 0 for tcp*/
+	/*!< deadline for the current in-progress read, if any */
 	unsigned int timeout;
 	/*!< the lifetime of the connection - watched by TCP main process
 	 * in order to close un-used connections */
@@ -167,20 +190,26 @@ struct tcp_connection{
 	unsigned id_hash;			/*!< hash index in the id_hash */
 	struct tcp_connection* id_next;		/*!< next in id hash table */
 	struct tcp_connection* id_prev;		/*!< prev in id hash table */
-	struct tcp_connection* c_next;		/*!< Child next (use locally) */
-	struct tcp_connection* c_prev;		/*!< Child prev (use locally */
+	struct tcp_connection* wq_next;		/*!< next pending write conn in shared queue */
 	struct tcp_conn_alias con_aliases[TCP_CON_MAX_ALIASES];	/*!< Aliases for this connection */
 	int aliases;				/*!< Number of aliases, at least 1 */
-	struct tcp_req *con_req;	/*!< Per connection req buffer */
+	struct tcp_req *con_req;	/*!< Per-connection TCP request buffer in TCP-main-private memory */
+	void *proto_req;			/*!< Optional protocol-specific request state in TCP-main-private memory */
+	void *proto_extra_id;		/*!< Optional shared protocol-specific match id */
+	void *shared_data;		/*!< Optional shared attachment exported by the active protocol */
 	unsigned int msg_attempts;	/*!< how many read attempts we have done for the last request */
 	/*!< connection related flags */
 	unsigned short flags;
+	/*!< reactor state, written only by TCP main */
+	volatile unsigned short main_flags;
+	/*!< protected by tcp_write_queue->cond */
+	unsigned char write_queued;
 	struct tcp_conn_profile profile;
 	/*!< protocol related & reserved flags */
 	unsigned short proto_flags;
 	struct struct_hist *hist;
 	struct tcp_async_data *async;
-	/* protocol specific data attached to this connection */
+	/* protocol specific data attached to this connection, in TCP-main-private memory */
 	void *proto_data;
 };
 
@@ -203,5 +232,7 @@ int tcpconn_add_alias(struct sip_msg *msg, unsigned int id, int port, int proto)
 #define tcp_conn_reset_lifetime(_c) \
 	tcp_conn_set_lifetime(_c, (_c)->profile.con_lifetime)
 
-#endif
+#define tcp_conn_set_msg_read_timeout(_c) \
+	((_c)->timeout = get_ticks() + (_c)->profile.msg_read_timeout)
 
+#endif

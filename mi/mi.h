@@ -29,12 +29,15 @@
 
 #define MAX_MI_PARAMS  20
 #define MAX_MI_RECIPES 48
+#define MAX_MI_ALIASES 4
 
 /* async MI command */
 #define MI_ASYNC_RPL_FLAG    (1<<0)
 /* command only supports named parameters and will return
  * an error if positional parameters are received */
 #define MI_NAMED_PARAMS_ONLY (1<<1)
+/* internal-only flag: command local name is ambiguous across modules */
+#define MI_LOCAL_NAME_AMBIGUOUS (1U<<31)
 
 #define MI_ASYNC_RPL    ((mi_response_t*)-1)
 #define MI_NO_RPL 		1
@@ -53,6 +56,8 @@
 #define JSONRPC_INVAL_PARAMS_MSG   "Invalid params"
 #define JSONRPC_SERVER_ERR_CODE	   -32000
 #define JSONRPC_SERVER_ERR_MSG     "Server error"
+#define JSONRPC_AMBIG_METHOD_CODE  -32001
+#define JSONRPC_AMBIG_METHOD_MSG   "Method ambiguous"
 
 #define ERR_DET_POS_PARAMS_S "Command only supports named parameters"
 #define ERR_DET_AMBIG_CALL_S "Ambiguous call, use named parameters instead"
@@ -84,6 +89,7 @@ typedef struct mi_recipe_ {
 
 struct mi_cmd {
 	int id;
+	int local_id;
 	str_const module;
 	str name;
 	str help;
@@ -94,16 +100,26 @@ struct mi_cmd {
 	volatile unsigned char* trace_mask;
 };
 
+struct mi_cmd_alias {
+	int id;
+	str name;
+	int cmd_idx;
+};
+
 typedef struct mi_export_ {
 	char *name;
 	char *help;
 	unsigned int flags;
 	mi_child_init_f *init_f;
 	mi_recipe_t recipes[MAX_MI_RECIPES];
+	const char *aliases[MAX_MI_ALIASES];
 } mi_export_t;
 
 /* mi_export_t array terminator */
-#define EMPTY_MI_EXPORT 0, 0, 0, 0, {{EMPTY_MI_RECIPE}}
+#define EMPTY_MI_EXPORT 0, 0, 0, 0, {{EMPTY_MI_RECIPE}}, {0}
+
+#define MI_EXPORT_RECIPES(_mi) ((_mi).recipes)
+#define MI_EXPORT_ALIASES(_mi) ((_mi).aliases)
 
 typedef struct mi_request_ {
 	mi_item_t *req_obj;
@@ -118,6 +134,10 @@ int register_mi_cmd(char *name, char *help, unsigned int flags,
 		mi_child_init_f in, const mi_recipe_t *recipes, const char* mod_name);
 
 int register_mi_mod(const char *mod_name, const mi_export_t *mis);
+int register_mi_cmd_alias(const char *mod_name, const char *cmd_name,
+		const char *alias);
+int register_mi_cmd_aliases(const char *mod_name, const char *cmd_name,
+		const char *const *aliases);
 
 int init_mi_child();
 
@@ -129,6 +149,7 @@ mi_response_t *w_mi_help_1(const mi_params_t *params,
 					struct mi_handler *async_hdl);
 
 void get_mi_cmds(struct mi_cmd **cmds, int *size);
+void get_mi_cmd_aliases(struct mi_cmd_alias **aliases, int *size);
 
 void _init_mi_shm_mem_hooks(void);
 void _init_mi_pkg_mem_hooks(void);

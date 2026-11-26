@@ -228,6 +228,22 @@ void subs_cback_func(struct cell *t, int cb_type, struct tmcb_params *ps)
 		goto error;
 	}
 
+	/* The scheduled unsubscribe owns termination. Keep the dialog briefly
+	 * for final NOTIFY matching; never recreate it on a negative response. */
+	if (hentity->subs_state == PUA_SUBS_TERMINATING) {
+		lock_get(&HashT->p_records[hentity->hash_index].lock);
+		presentity = get_htable_safe(hentity->hash_index, hentity->local_index);
+		if (presentity && presentity->subs_state == PUA_SUBS_TERMINATING
+		&& str_match(&presentity->call_id, &hentity->call_id)) {
+			presentity->subs_state = PUA_SUBS_TERMINATED;
+			presentity->expires = (unsigned int)time(NULL) + 5;
+			if (presentity->db_flag == NO_UPDATEDB_FLAG)
+				presentity->db_flag = UPDATEDB_FLAG;
+		}
+		lock_release(&HashT->p_records[hentity->hash_index].lock);
+		goto done;
+	}
+
 	if(msg== FAKED_REPLY)
 	{
 		/* delete record from hash_table and call registered functions */
@@ -872,8 +888,8 @@ int send_subscribe(subs_info_t* subs)
 		hentity->hash_index = hash_index;
 		hentity->flag= flag;
 
-		result= tmb.t_request
-			(&met,                       /* Type of the message */
+		result= run_tm_api(&tmb, t_request,
+			&met,                        /* Type of the message */
 			pres.pres_uri,               /* Request-URI*/
 			&pres.to_uri,                /* To */
 			pres.watcher_uri,            /* From */
@@ -972,13 +988,14 @@ int send_subscribe(subs_info_t* subs)
 			pkg_free(td);
 			goto done;
 		}
+		presentity->subs_state = PUA_SUBS_ACTIVE;
 		presentity->desired_expires = hentity->desired_expires;
 		lock_release(&HashT->p_records[hash_index].lock);
 
 	//	hentity->flag= flag;
 		LM_DBG("event parameter: %d\n", hentity->event);
-		result= tmb.t_request_within
-			(&met,
+		result= run_tm_api(&tmb, t_request_within,
+			&met,
 			str_hdr,
 			0,
 			td,

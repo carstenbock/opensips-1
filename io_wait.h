@@ -114,7 +114,7 @@ struct fd_map {
 	                       * internal usage */
 	int app_flags;        /* flags to be used by upper layer apps, not by
 	                       * the reactor */
-	unsigned int timeout;
+	utime_t timeout;
 };
 
 
@@ -219,7 +219,7 @@ static inline struct fd_map* hash_fd_map(	io_wait_h* h,
 						fd_type type,
 						void* data,
 						int flags,
-						unsigned int timeout,
+						utime_t timeout,
 						int *already)
 {
 	if (h->fd_hash[fd].fd <= 0) {
@@ -280,6 +280,11 @@ again:
 #define IO_WATCH_WRITE           (1<<1)
 #define IO_WATCH_ERROR           (1<<2)
 #define IO_WATCH_TIMEOUT         (1<<3)
+/* ask the kernel to wake ONE of the processes sharing this fd per event
+ * (EPOLLEXCLUSIVE) instead of all of them; only meaningful for fds that
+ * several processes watch (a UDP listen socket, the TCP dispatch socket).
+ * Not kept in the fd map - it only steers the epoll registration. */
+#define IO_WATCH_EXCLUSIVE       (1<<4)
 /* 24 starting are reserved, do not attempt to use */
 #define IO_WATCH_PRV_FILTER      ((1<<24)-1)
 #define IO_WATCH_PRV_CHECKED     (1<<29)
@@ -303,6 +308,7 @@ again:
 		struct fd_map* _e;\
 		int _t,k;\
 		check_error = 0;\
+		if (!reactor_dbg_fd_check) break;\
 		/* iterate the fd_array and check if fd_hash is properly set for each */ \
 		for(k=0;k<h->fd_no;k++) {\
 			_e = get_fd_map(h, h->fd_array[k].fd); \
@@ -367,7 +373,7 @@ inline static int io_watch_add(	io_wait_h* h, // lgtm [cpp/use-of-goto]
 								fd_type type,
 								void* data,
 								int prio,
-								unsigned int timeout,
+								utime_t timeout,
 								int flags)
 {
 
@@ -415,6 +421,9 @@ inline static int io_watch_add(	io_wait_h* h, // lgtm [cpp/use-of-goto]
 	struct pollfd pfd;
 #endif
 	int ctl_flags;
+#ifdef EPOLLEXCLUSIVE
+	int excl;
+#endif
 	int n;  //FIXME
 	int check_error;
 #if 0 //defined(HAVE_SIGIO_RT) || defined (HAVE_EPOLL) FIXME
@@ -428,6 +437,10 @@ inline static int io_watch_add(	io_wait_h* h, // lgtm [cpp/use-of-goto]
 	idx=-1;
 #endif
 	e=0;
+#ifdef EPOLLEXCLUSIVE
+	excl = flags & IO_WATCH_EXCLUSIVE;
+#endif
+	flags &= ~IO_WATCH_EXCLUSIVE;
 
 	if (fd==-1){
 		LM_CRIT("fd is -1!\n");
@@ -474,8 +487,9 @@ inline static int io_watch_add(	io_wait_h* h, // lgtm [cpp/use-of-goto]
 		return 0;
 	}
 
+	/* convert timeout from seconds to miliseconds*/
 	if (timeout)
-		timeout+=get_ticks();
+		timeout = timeout*1000000 + get_uticks();
 
 	if ((e=hash_fd_map(h, fd, type, data,flags, timeout, &already))==0){
 		LM_ERR("[%s] failed to hash the fd %d\n",h->name, fd);
@@ -534,16 +548,19 @@ inline static int io_watch_add(	io_wait_h* h, // lgtm [cpp/use-of-goto]
 				ep_event.events|=EPOLLOUT;
 			if (!already) {
 again1:
-#if 0
-/* This is currently broken, because when using EPOLLEXCLUSIVE, the OS will
- * send sequential events to the same process - thus our pseudo-dispatcher
- * will no longer work, since events on a pipe will be queued by a single
- * process. - razvanc
- */
-#if (defined __OS_linux) && (__GLIBC__ >= 2) && (__GLIBC_MINOR__ >= 24)
-				if (e->flags & IO_WATCH_READ)
+#ifdef EPOLLEXCLUSIVE
+				/* opt-in only (IO_WATCH_EXCLUSIVE); the unconditional use
+				 * was disabled in 3596efdc00 because a woken but not yet
+				 * running process kept absorbing the following events: it
+				 * stayed on its epoll's wait queue until it ran, so
+				 * ep_poll_callback() still saw a waiter and ended the
+				 * exclusive wake-up there. Linux 5.7 (412895f03cbf) removes
+				 * the waiter when the wake-up succeeds, 6.0 (a16ceb139610,
+				 * ep_autoremove_wake_function) even when it fails. 5.4
+				 * serializes bursts, 6.12 does not, 5.7-5.19 are untested,
+				 * so callers gate on 6.0, see os_kernel_at_least() */
+				if (excl && (flags & IO_WATCH_READ))
 					ep_event.events|=EPOLLEXCLUSIVE;
-#endif
 #endif
 				n=epoll_ctl(h->epfd, EPOLL_CTL_ADD, fd, &ep_event);
 				if (n==-1){

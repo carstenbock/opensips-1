@@ -52,12 +52,11 @@ static const param_export_t params[] = {
 	{"msg_read_timeout_col",STR_PARAM, &tcp_mgm_cols[11].name.s},
 	{"send_threshold_col",  STR_PARAM, &tcp_mgm_cols[12].name.s},
 	{"no_new_conn_col",     STR_PARAM, &tcp_mgm_cols[13].name.s},
-	{"parallel_read_col",   STR_PARAM, &tcp_mgm_cols[14].name.s},
-	{"alias_mode_col",      STR_PARAM, &tcp_mgm_cols[15].name.s},
-	{"keepalive_col",       STR_PARAM, &tcp_mgm_cols[16].name.s},
-	{"keepcount_col",       STR_PARAM, &tcp_mgm_cols[17].name.s},
-	{"keepidle_col",        STR_PARAM, &tcp_mgm_cols[18].name.s},
-	{"keepinterval_col",    STR_PARAM, &tcp_mgm_cols[19].name.s},
+	{"alias_mode_col",      STR_PARAM, &tcp_mgm_cols[13].name.s},
+	{"keepalive_col",       STR_PARAM, &tcp_mgm_cols[14].name.s},
+	{"keepcount_col",       STR_PARAM, &tcp_mgm_cols[15].name.s},
+	{"keepidle_col",        STR_PARAM, &tcp_mgm_cols[16].name.s},
+	{"keepinterval_col",    STR_PARAM, &tcp_mgm_cols[17].name.s},
 	{0, 0, 0}
 };
 
@@ -69,9 +68,9 @@ static const cmd_export_t cmds[] = {
  * Exported MI functions
  */
 static const mi_export_t mi_cmds[] = {
-	{ "tcp_reload", "re-cache all TCP profiles from the database", 0, 0, {
+	{ "reload", "re-cache all TCP profiles from the database", 0, 0, {
 		{tcp_mi_reload, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"tcp_reload", 0}
 	},
 	//{ "tcp_list_profiles", "list all cached TCP profiles", 0, 0, {
 	//	{tcp_list_profiles, {0}},

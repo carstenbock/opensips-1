@@ -40,8 +40,9 @@
 #include "rest_client.h"
 #include "rest_methods.h"
 #include "api.h"
-#include "../../ssl_init_tweaks.h"
 #include "../../pt.h"
+
+#define REST_CLIENT_MAX_REDIRECTS 30
 
 /*
  * Module parameters
@@ -84,25 +85,30 @@ static int mod_init(void);
 static int child_init(int rank);
 static void mod_destroy(void);
 static int cfg_validate(void);
+static int fixup_max_redirects(void **param);
 
 /*
  * Function headers
  */
 static int w_rest_get(struct sip_msg *msg, str *url, pv_spec_t *body_pv,
-                      pv_spec_t *ctype_pv, pv_spec_t *code_pv);
+                      pv_spec_t *ctype_pv, pv_spec_t *code_pv,
+                      int *max_redirects);
 static int w_rest_post(struct sip_msg *msg, str *url, str *body, str *_ctype,
-					pv_spec_t *body_pv, pv_spec_t *ctype_pv, pv_spec_t *code_pv);
+					pv_spec_t *body_pv, pv_spec_t *ctype_pv, pv_spec_t *code_pv,
+					int *max_redirects);
 static int w_rest_put(struct sip_msg *msg, str *url, str *body, str *_ctype,
-					pv_spec_t *body_pv, pv_spec_t *ctype_pv, pv_spec_t *code_pv);
+					pv_spec_t *body_pv, pv_spec_t *ctype_pv, pv_spec_t *code_pv,
+					int *max_redirects);
 
 static int w_async_rest_get(struct sip_msg *msg, async_ctx *ctx, str *url,
-				pv_spec_t *body_pv, pv_spec_t *ctype_pv, pv_spec_t *code_pv);
+				pv_spec_t *body_pv, pv_spec_t *ctype_pv, pv_spec_t *code_pv,
+				int *max_redirects);
 static int w_async_rest_post(struct sip_msg *msg, async_ctx *ctx,
 			str *url, str *body, str *_ctype, pv_spec_t *body_pv,
-			pv_spec_t *ctype_pv, pv_spec_t *code_pv);
+			pv_spec_t *ctype_pv, pv_spec_t *code_pv, int *max_redirects);
 static int w_async_rest_put(struct sip_msg *msg, async_ctx *ctx,
 			str *url, str *body, str *_ctype, pv_spec_t *body_pv,
-			pv_spec_t *ctype_pv, pv_spec_t *code_pv);
+			pv_spec_t *ctype_pv, pv_spec_t *code_pv, int *max_redirects);
 
 static int w_rest_append_hf(struct sip_msg *msg, str *hfv);
 static int w_rest_init_client_tls(struct sip_msg *msg, str *tls_client_dom);
@@ -124,21 +130,24 @@ static const acmd_export_t acmds[] = {
 		{CMD_PARAM_STR,0,0},
 		{CMD_PARAM_VAR,0,0},
 		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
-		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0}, {0,0,0}}},
+		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
+		{CMD_PARAM_INT|CMD_PARAM_OPT,fixup_max_redirects,0}, {0,0,0}}},
 	{"rest_post",(acmd_function)w_async_rest_post, {
 		{CMD_PARAM_STR,0,0},
 		{CMD_PARAM_STR,0,0},
 		{CMD_PARAM_STR|CMD_PARAM_OPT,0,0},
 		{CMD_PARAM_VAR,0,0},
 		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
-		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0}, {0,0,0}}},
+		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
+		{CMD_PARAM_INT|CMD_PARAM_OPT,fixup_max_redirects,0}, {0,0,0}}},
 	{"rest_put",(acmd_function)w_async_rest_put, {
 		{CMD_PARAM_STR,0,0},
 		{CMD_PARAM_STR,0,0},
 		{CMD_PARAM_STR|CMD_PARAM_OPT,0,0},
 		{CMD_PARAM_VAR,0,0},
 		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
-		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0}, {0,0,0}}},
+		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
+		{CMD_PARAM_INT|CMD_PARAM_OPT,fixup_max_redirects,0}, {0,0,0}}},
 	{0,0,{{0,0,0}}}
 };
 
@@ -151,7 +160,8 @@ static const cmd_export_t cmds[] = {
 		{CMD_PARAM_STR,0,0},
 		{CMD_PARAM_VAR,0,0},
 		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
-		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0}, {0,0,0}},
+		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
+		{CMD_PARAM_INT|CMD_PARAM_OPT,fixup_max_redirects,0}, {0,0,0}},
 		ALL_ROUTES},
 	{"rest_post",(cmd_function)w_rest_post, {
 		{CMD_PARAM_STR,0,0},
@@ -159,7 +169,8 @@ static const cmd_export_t cmds[] = {
 		{CMD_PARAM_STR|CMD_PARAM_OPT,0,0},
 		{CMD_PARAM_VAR,0,0},
 		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
-		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0}, {0,0,0}},
+		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
+		{CMD_PARAM_INT|CMD_PARAM_OPT,fixup_max_redirects,0}, {0,0,0}},
 		ALL_ROUTES},
 	{"rest_put",(cmd_function)w_rest_put, {
 		{CMD_PARAM_STR,0,0},
@@ -167,7 +178,8 @@ static const cmd_export_t cmds[] = {
 		{CMD_PARAM_STR|CMD_PARAM_OPT,0,0},
 		{CMD_PARAM_VAR,0,0},
 		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
-		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0}, {0,0,0}},
+		{CMD_PARAM_VAR|CMD_PARAM_OPT,0,0},
+		{CMD_PARAM_INT|CMD_PARAM_OPT,fixup_max_redirects,0}, {0,0,0}},
 		ALL_ROUTES},
 	{"rest_append_hf",(cmd_function)w_rest_append_hf, {
 		{CMD_PARAM_STR,0,0}, {0,0,0}},
@@ -244,7 +256,7 @@ static int mod_init(void)
 	connection_timeout_ms = connection_timeout * 1000L;
 	_async_resume_retr_timeout = curl_timeout * 1000000U;
 
-	if (connect_poll_interval < 0) {
+	if (connect_poll_interval <= 0) {
 		LM_ERR("Bad connect_poll_interval (%ldms), setting to 20ms\n",
 		       connect_poll_interval);
 		connect_poll_interval = 20;
@@ -343,6 +355,19 @@ int validate_curl_http_version(const int *http_version)
 	}
 
 	return 1;
+}
+
+static int fixup_max_redirects(void **param)
+{
+	int max_redirects = **(int **)param;
+
+	if (max_redirects < 0 || max_redirects > REST_CLIENT_MAX_REDIRECTS) {
+		LM_ERR("max_redirects must be between 0 and %d\n",
+		       REST_CLIENT_MAX_REDIRECTS);
+		return -1;
+	}
+
+	return 0;
 }
 
 /**************************** Transformations ********************************/
@@ -514,8 +539,10 @@ error:
 
 /**************************** Module functions *******************************/
 
+
 static int w_rest_get(struct sip_msg *msg, str *url, pv_spec_t *body_pv,
-                      pv_spec_t *ctype_pv, pv_spec_t *code_pv)
+                      pv_spec_t *ctype_pv, pv_spec_t *code_pv,
+                      int *max_redirects)
 {
 	str url_nt;
 	int lrc = RCL_OK, rc;
@@ -530,7 +557,7 @@ static int w_rest_get(struct sip_msg *msg, str *url, pv_spec_t *body_pv,
 		return lrc;
 
 	rc = rest_sync_transfer(REST_CLIENT_GET, msg, url_nt.s, NULL, NULL,
-	                          body_pv, ctype_pv, code_pv);
+	                          body_pv, ctype_pv, code_pv, max_redirects ? *max_redirects : 0);
 
 	if (lrc == RCL_OK_LOCKED)
 		rcl_release_url(host, rc == RCL_OK);
@@ -540,7 +567,8 @@ static int w_rest_get(struct sip_msg *msg, str *url, pv_spec_t *body_pv,
 }
 
 static int w_rest_post(struct sip_msg *msg, str *url, str *body, str *_ctype,
-					pv_spec_t *body_pv, pv_spec_t *ctype_pv, pv_spec_t *code_pv)
+					pv_spec_t *body_pv, pv_spec_t *ctype_pv, pv_spec_t *code_pv,
+					int *max_redirects)
 {
 	str ctype = { NULL, 0 };
 	str url_nt;
@@ -559,7 +587,7 @@ static int w_rest_post(struct sip_msg *msg, str *url, str *body, str *_ctype,
 		ctype = *_ctype;
 
 	rc = rest_sync_transfer(REST_CLIENT_POST, msg, url_nt.s, body, &ctype,
-	                          body_pv, ctype_pv, code_pv);
+	                          body_pv, ctype_pv, code_pv, max_redirects ? *max_redirects : 0);
 
 	if (lrc == RCL_OK_LOCKED)
 		rcl_release_url(host, rc == RCL_OK);
@@ -569,7 +597,8 @@ static int w_rest_post(struct sip_msg *msg, str *url, str *body, str *_ctype,
 }
 
 static int w_rest_put(struct sip_msg *msg, str *url, str *body, str *_ctype,
-					pv_spec_t *body_pv, pv_spec_t *ctype_pv, pv_spec_t *code_pv)
+					pv_spec_t *body_pv, pv_spec_t *ctype_pv, pv_spec_t *code_pv,
+					int *max_redirects)
 {
 	str ctype = { NULL, 0 };
 	str url_nt;
@@ -588,7 +617,7 @@ static int w_rest_put(struct sip_msg *msg, str *url, str *body, str *_ctype,
 		ctype = *_ctype;
 
 	rc = rest_sync_transfer(REST_CLIENT_PUT, msg, url_nt.s, body, &ctype,
-	                          body_pv, ctype_pv, code_pv);
+	                          body_pv, ctype_pv, code_pv, max_redirects ? *max_redirects : 0);
 
 	if (lrc == RCL_OK_LOCKED)
 		rcl_release_url(host, rc == RCL_OK);
@@ -599,7 +628,8 @@ static int w_rest_put(struct sip_msg *msg, str *url, str *body, str *_ctype,
 
 int async_rest_method(enum rest_client_method method, struct sip_msg *msg,
                       char *url, str *body, str *ctype, async_ctx *ctx,
-                      pv_spec_p body_pv, pv_spec_p ctype_pv, pv_spec_p code_pv)
+                      pv_spec_p body_pv, pv_spec_p ctype_pv, pv_spec_p code_pv,
+                      int max_redirects)
 {
 	rest_async_param *param;
 	pv_value_t val;
@@ -621,12 +651,13 @@ int async_rest_method(enum rest_client_method method, struct sip_msg *msg,
 			ctx->timeout_s : curl_timeout;
 
 	rc = start_async_http_req(msg, method, url, body, ctype,
-			param, &param->body, ctype_pv ? &param->ctype : NULL, &read_fd);
+			param, &param->body, ctype_pv ? &param->ctype : NULL, &read_fd,
+			max_redirects);
 
 	/* error occurred; no transfer done */
 	if (read_fd == ASYNC_NO_IO) {
 		ctx->resume_param = NULL;
-		ctx->resume_f = NULL;
+		ASYNC_CLEAR_RESUME_F(ctx);
 		if (code_pv) {
 			val.flags = PV_VAL_INT|PV_TYPE_INT;
 			val.ri = 0;
@@ -685,7 +716,7 @@ int async_rest_method(enum rest_client_method method, struct sip_msg *msg,
 	if (lrc == RCL_OK_LOCKED)
 		rcl_release_url(host, rc == RCL_OK);
 
-	ctx->resume_f = resume_async_http_req;
+	ASYNC_SET_RESUME_F(ctx, resume_async_http_req);
 	ctx->timeout_f = time_out_async_http_req;
 	ctx->timeout_s = param->timeout_s;
 
@@ -705,7 +736,8 @@ done:
 }
 
 static int w_async_rest_get(struct sip_msg *msg, async_ctx *ctx, str *url,
-				pv_spec_t *body_pv, pv_spec_t *ctype_pv, pv_spec_t *code_pv)
+				pv_spec_t *body_pv, pv_spec_t *ctype_pv, pv_spec_t *code_pv,
+				int *max_redirects)
 {
 	str url_nt;
 	int rc;
@@ -719,7 +751,7 @@ static int w_async_rest_get(struct sip_msg *msg, async_ctx *ctx, str *url,
 			body_pv, ctype_pv, code_pv);
 
 	rc = async_rest_method(REST_CLIENT_GET, msg, url_nt.s, NULL, NULL, ctx,
-				body_pv, ctype_pv, code_pv);
+				body_pv, ctype_pv, code_pv, max_redirects ? *max_redirects : 0);
 
 	pkg_free(url_nt.s);
 	return rc;
@@ -727,7 +759,7 @@ static int w_async_rest_get(struct sip_msg *msg, async_ctx *ctx, str *url,
 
 static int w_async_rest_post(struct sip_msg *msg, async_ctx *ctx,
 			str *url, str *body, str *_ctype, pv_spec_t *body_pv,
-			pv_spec_t *ctype_pv, pv_spec_t *code_pv)
+			pv_spec_t *ctype_pv, pv_spec_t *code_pv, int *max_redirects)
 {
 	str ctype = { NULL, 0 };
 	str url_nt;
@@ -745,7 +777,8 @@ static int w_async_rest_post(struct sip_msg *msg, async_ctx *ctx,
 			body_pv, ctype_pv, code_pv);
 
 	rc = async_rest_method(REST_CLIENT_POST, msg, url_nt.s, body, &ctype, ctx,
-							body_pv, ctype_pv, code_pv);
+							body_pv, ctype_pv, code_pv,
+							max_redirects ? *max_redirects : 0);
 
 	pkg_free(url_nt.s);
 	return rc;
@@ -753,7 +786,7 @@ static int w_async_rest_post(struct sip_msg *msg, async_ctx *ctx,
 
 static int w_async_rest_put(struct sip_msg *msg, async_ctx *ctx,
 			str *url, str *body, str *_ctype, pv_spec_t *body_pv,
-			pv_spec_t *ctype_pv, pv_spec_t *code_pv)
+			pv_spec_t *ctype_pv, pv_spec_t *code_pv, int *max_redirects)
 {
 	str ctype = { NULL, 0 };
 	str url_nt;
@@ -771,7 +804,8 @@ static int w_async_rest_put(struct sip_msg *msg, async_ctx *ctx,
 		url->len, url->s, body_pv, ctype_pv, code_pv);
 
 	rc = async_rest_method(REST_CLIENT_PUT, msg, url_nt.s, body, &ctype, ctx,
-						body_pv, ctype_pv, code_pv);
+						body_pv, ctype_pv, code_pv,
+						max_redirects ? *max_redirects : 0);
 
 	pkg_free(url_nt.s);
 	return rc;

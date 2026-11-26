@@ -165,11 +165,7 @@ inline static void tcp_parse_headers(struct tcp_req *r,
 				break;
 
 			case H_STARTWS:
-				switch (*p){
-					content_len_beg_case;
-					crlf_default_skip_case;
-				}
-				p++;
+				r->state=H_SKIP;
 				break;
 			case H_SKIP_EMPTY:
 				switch (*p){
@@ -237,7 +233,11 @@ inline static void tcp_parse_headers(struct tcp_req *r,
 			change_state_case(H_CONT_LEN4,  'E', 'e', H_CONT_LEN5);
 			change_state_case(H_CONT_LEN5,  'N', 'n', H_CONT_LEN6);
 			change_state_case(H_CONT_LEN6,  'T', 't', H_CONT_LEN7);
-			change_state_case(H_CONT_LEN7,  '-', '_', H_CONT_LEN8);
+			case H_CONT_LEN7:
+				if (*p == '-') r->state=H_CONT_LEN8;
+				else r->state=H_SKIP;
+				p++;
+				break;
 			change_state_case(H_CONT_LEN8,  'L', 'l', H_CONT_LEN9);
 			change_state_case(H_CONT_LEN9,  'E', 'e', H_CONT_LEN10);
 			change_state_case(H_CONT_LEN10, 'N', 'n', H_CONT_LEN11);
@@ -294,7 +294,22 @@ inline static void tcp_parse_headers(struct tcp_req *r,
 					case '7':
 					case '8':
 					case '9':
+						if (r->content_len>=TCP_BUF_SIZE) {
+							LM_ERR("Content-Length value %d bigger than the "
+								"reading buffer\n", r->content_len);
+							r->error = TCP_REQ_BAD_LEN;
+							r->state = H_SKIP;
+							r->content_len = 0;
+							break;
+						}
 						r->content_len=r->content_len*10+(*p-'0');
+						if (r->content_len>=TCP_BUF_SIZE) {
+							LM_ERR("Content-Length value %d bigger than the "
+								"reading buffer\n", r->content_len);
+							r->error = TCP_REQ_BAD_LEN;
+							r->state = H_SKIP;
+							r->content_len = 0;
+						}
 						break;
 					case '\r':
 					case ' ':
@@ -335,14 +350,13 @@ skip:
 
 
 static inline int tcp_handle_req(struct tcp_req *req,
-		struct tcp_connection *con, int _max_msg_chunks,
-		int _parallel_handling)
+		struct tcp_connection *con, int _max_msg_chunks)
 {
 	struct receive_info local_rcv;
 	char *msg_buf;
 	int msg_len;
 	long size;
-	char c, *msg_buf_cpy = NULL;
+	char c;
 
 	if (req->complete){
 #ifdef EXTRA_DEBUG
@@ -362,7 +376,7 @@ static inline int tcp_handle_req(struct tcp_req *req,
 			goto error;
 		}
 
-		/* update the timeout - we successfully read the request */
+		/* refresh connection lifetime after successful read progress */
 		tcp_conn_reset_lifetime(con);
 		con->timeout=con->lifetime;
 
@@ -395,39 +409,18 @@ static inline int tcp_handle_req(struct tcp_req *req,
 			local_rcv = con->rcv;
 
 			if (!size) {
-				/* did not read any more things -  we can release
-				 * the connection */
 				LM_DBG("Nothing more to read on TCP conn %p, currently in state %d \n",
 					con,con->state);
-				if (req != &_tcp_common_current_req) {
-					/* we have the buffer in the connection tied buff -
-					 *	detach it , release the conn and free it afterwards */
-					con->con_req = NULL;
-				}
-
-				/* If parallel handling, make a copy (null terminted) of the
-				 * current reading buffer (so we can continue its handling)
-				 * and release the TCP conn on READ */
-				if ( (_parallel_handling!=0) &&
-				(msg_buf_cpy=(char*)pkg_malloc( msg_len+1 )) !=NULL ) {
-					memcpy( msg_buf_cpy, msg_buf, msg_len);
-					msg_buf_cpy[msg_len] = 0;
-					msg_buf = msg_buf_cpy;
-					tcp_done_reading( con );
-					con = NULL; /* having reached this, we MUST return 2 */
-				}
-
 			} else {
 				LM_DBG("We still have things on the pipe - "
 					"keeping connection \n");
 			}
 
-			if (receive_msg(msg_buf, msg_len,
-				&local_rcv, NULL, 0) <0)
-					LM_ERR("receive_msg failed \n");
-
-			if (msg_buf_cpy)
-				pkg_free(msg_buf_cpy);
+			if (tcp_dispatch_msg(msg_buf, msg_len,
+					&local_rcv, NULL, 0) < 0) {
+				LM_ERR("failed to deliver TCP message\n");
+				goto error;
+			}
 		}
 
 		if (size) {
@@ -446,19 +439,10 @@ static inline int tcp_handle_req(struct tcp_req *req,
 			return 1;
 		}
 
-		if (req != &_tcp_common_current_req) {
-			/* if we no longer need this tcp_req
-			 * we can free it now */
-			shm_free(req);
-			if (con)
-				con->con_req = NULL;
-		}
 	} else {
 		/* request not complete - check the if the thresholds are exceeded */
-		if (con->msg_attempts==0)
-			/* if first iteration, set a short timeout for reading
-			 * a whole SIP message */
-			con->timeout = get_ticks() + con->profile.msg_read_timeout;
+		if (con->msg_attempts == 0)
+			tcp_conn_set_msg_read_timeout(con);
 
 		con->msg_attempts ++;
 		if (con->msg_attempts == _max_msg_chunks) {
@@ -466,52 +450,9 @@ static inline int tcp_handle_req(struct tcp_req *req,
 				   "closing connection \n",con->msg_attempts);
 			goto error;
 		}
-
-		if (req == &_tcp_common_current_req) {
-			/* let's duplicate this - most likely another conn will come in */
-
-			LM_DBG("We didn't manage to read a full request on con %p\n",con);
-			con->con_req = shm_malloc(sizeof(struct tcp_req));
-			if (con->con_req == NULL) {
-				LM_ERR("No more mem for dynamic con request buffer\n");
-				goto error;
-			}
-
-			if (req->pos != req->buf) {
-				/* we have read some bytes */
-				memcpy(con->con_req->buf,req->buf,req->pos-req->buf);
-				con->con_req->pos = con->con_req->buf + (req->pos-req->buf);
-			} else {
-				con->con_req->pos = con->con_req->buf;
-			}
-
-			if (req->start != req->buf)
-				con->con_req->start = con->con_req->buf +(req->start-req->buf);
-			else
-				con->con_req->start = con->con_req->buf;
-
-			if (req->parsed != req->buf)
-				con->con_req->parsed =con->con_req->buf+(req->parsed-req->buf);
-			else
-				con->con_req->parsed = con->con_req->buf;
-
-			if (req->body != 0) {
-				con->con_req->body = con->con_req->buf + (req->body-req->buf);
-			} else
-				con->con_req->body = 0;
-
-			con->con_req->complete=req->complete;
-			con->con_req->has_content_len=req->has_content_len;
-			con->con_req->content_len=req->content_len;
-			con->con_req->bytes_to_go=req->bytes_to_go;
-			con->con_req->error = req->error;
-			con->con_req->state = req->state;
-			/* req will be reset on the next usage */
-		}
 	}
 
-	/* everything ok; if connection was returned already, use special rc 2 */
-	return con ? 0 : 2;
+	return 0;
 error:
 	/* report error */
 	return -1;
@@ -520,4 +461,3 @@ error:
 #define TRANS_TRACE_PROTO_ID "net"
 
 #endif
-

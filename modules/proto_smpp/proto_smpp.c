@@ -30,6 +30,7 @@
 #include "../../net/api_proto.h"
 #include "../../net/api_proto_net.h"
 #include "../../net/net_tcp.h"
+#include "../../net/tcp_common.h"
 #include "../../socket_info.h"
 #include "../../tsend.h"
 #include "../../net/proto_tcp/tcp_common_defs.h"
@@ -61,9 +62,11 @@ static int smpp_init(struct proto_info *pi);
 static int smpp_init_listener(struct socket_info *si);
 static int smpp_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id);
+		unsigned int id, struct sip_msg *msg);
 static int smpp_read_req(struct tcp_connection* conn, int* bytes_read);
 static int smpp_write_async_req(struct tcp_connection* con,int fd);
+static int smpp_dispatch_msg(char *buf, int len, struct receive_info *rcv,
+		void *data, int data_len);
 static int smpp_conn_init(struct tcp_connection* c);
 static void smpp_conn_clean(struct tcp_connection* c);
 static int send_smpp_msg(struct sip_msg* msg, str *name, str *from,
@@ -146,6 +149,7 @@ static int smpp_init(struct proto_info *pi)
 
 	pi->net.flags		= PROTO_NET_USE_TCP;
 	pi->net.stream.read	= smpp_read_req;
+	pi->net.stream.handle = smpp_dispatch_msg;
 	pi->net.stream.write	= smpp_write_async_req;
 
 	pi->net.stream.conn.init  = smpp_conn_init;
@@ -232,21 +236,42 @@ static int smpp_init_listener(struct socket_info *si)
 
 static int smpp_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id)
+		unsigned int id, struct sip_msg *msg)
 {
 	LM_INFO("smpp_send called\n");
 
 	return 0;
 }
 
-static struct tcp_req smpp_current_req;
+static int smpp_dispatch_msg(char *buf, int len, struct receive_info *rcv,
+		void *data, int data_len)
+{
+	smpp_session_t *session;
+
+	(void)len;
+
+	if (!data || data_len != (int)sizeof(session)) {
+		LM_ERR("missing SMPP session for dispatched message\n");
+		return -1;
+	}
+
+	memcpy(&session, data, sizeof(session));
+	if (!session) {
+		LM_ERR("missing SMPP session for dispatched message\n");
+		return -1;
+	}
+
+	handle_smpp_msg(buf, session, rcv);
+	return 0;
+}
+
 static int smpp_handle_req(struct tcp_req *req, struct tcp_connection *con)
 {
 	long size;
 	struct receive_info local_rcv;
 
 	if (req->complete){
-		/* update the timeout - we successfully read the request */
+		/* refresh connection lifetime after successful read progress */
 		tcp_conn_reset_lifetime(con);
 		con->timeout = con->lifetime;
 
@@ -263,26 +288,18 @@ static int smpp_handle_req(struct tcp_req *req, struct tcp_connection *con)
 			 * the connection */
 			LM_DBG("Nothing more to read on TCP conn %p, currently in state %d \n",
 				con,con->state);
-			if (req != &smpp_current_req) {
-				/* we have the buffer in the connection tied buff -
-				 *	detach it , release the conn and free it afterwards */
-				con->con_req = NULL;
-			}
 		} else {
 			LM_DBG("We still have things on the pipe - "
 				"keeping connection \n");
 		}
 		local_rcv = con->rcv;
 
-		/* give the message to the registered functions */
-		handle_smpp_msg(req->buf, (smpp_session_t *)con->proto_data, &local_rcv);
-
-		if (!size && req != &smpp_current_req) {
-			/* if we no longer need this tcp_req
-			 * we can free it now */
-			shm_free(req);
-			con->con_req = NULL;
-		}
+			if (tcp_dispatch_msg(req->buf,
+					req->parsed - req->start, &local_rcv,
+					&con->proto_data, sizeof(con->proto_data)) < 0) {
+				LM_ERR("failed to deliver SMPP message\n");
+				return -1;
+			}
 
 		con->msg_attempts = 0;
 
@@ -304,34 +321,6 @@ static int smpp_handle_req(struct tcp_req *req, struct tcp_connection *con)
 				   "closing connection \n",con->msg_attempts);
 			return -1;
 		}
-
-		if (req == &smpp_current_req) {
-			/* let's duplicate this - most likely another conn will come in */
-
-			LM_DBG("We didn't manage to read a full request\n");
-			con->con_req = shm_malloc(sizeof(struct tcp_req));
-			if (con->con_req == NULL) {
-				LM_ERR("No more mem for dynamic con request buffer\n");
-				return -1;
-			}
-
-			if (req->pos != req->buf) {
-				/* we have read some bytes */
-				memcpy(con->con_req->buf,req->buf,req->pos-req->buf);
-				con->con_req->pos = con->con_req->buf + (req->pos-req->buf);
-			} else {
-				con->con_req->pos = con->con_req->buf;
-			}
-
-			if (req->parsed != req->buf)
-				con->con_req->parsed =con->con_req->buf+(req->parsed-req->buf);
-			else
-				con->con_req->parsed = con->con_req->buf;
-
-			con->con_req->complete=req->complete;
-			con->con_req->content_len=req->content_len;
-			con->con_req->error = req->error;
-		}
 	}
 
 	return 0;
@@ -347,6 +336,11 @@ static inline void smpp_parse_headers(struct tcp_req *req)
 	}
 
 	req->content_len = ntohl(*px);
+	if (req->content_len < HEADER_SZ) {
+		LM_ERR("invalid SMPP packet length %u\n", req->content_len);
+		req->error = TCP_REQ_BAD_LEN;
+		return;
+	}
 	if (req->pos - req->buf == req->content_len) {
 		LM_DBG("received a complete message\n");
 		req->complete = 1;
@@ -370,14 +364,12 @@ static int smpp_read_req(struct tcp_connection* con, int* bytes_read)
 	bytes = -1;
 	total_bytes = 0;
 
-	if (con->con_req) {
-		req = con->con_req;
-		LM_DBG("Using the per connection buff \n");
-	} else {
-		LM_DBG("Using the global ( per process ) buff \n");
-		init_tcp_req(&smpp_current_req, 0);
-		req = &smpp_current_req;
-	}
+	req = tcp_conn_get_req(con);
+	if (!req)
+		return -1;
+	if (con->msg_attempts == 0)
+		init_tcp_req(req, 0);
+	LM_DBG("Using the connection buff\n");
 
 	again:
 	if(req->error == TCP_REQ_OK){
@@ -436,8 +428,7 @@ error:
 
 static int smpp_write_async_req(struct tcp_connection* con,int fd)
 {
-	LM_INFO("smpp_write_async_req called\n");
-	return 0;
+	return tcp_async_write(con, fd);
 }
 
 static int send_smpp_msg(struct sip_msg* msg, str *name, str *from,

@@ -111,7 +111,9 @@
 #include "t_funcs.h"
 #include "t_reply.h"
 #include "t_cancel.h"
+#include "t_lookup.h"
 #include "t_stats.h"
+#include <stdint.h>
 
 
 static struct timer_table *timertable=0;
@@ -254,13 +256,13 @@ static void fake_reply(struct cell *t, int branch, int code )
 	_tm_branch_index = branch;
 	if ( is_local(t) ) {
 		reply_status=local_reply( t, FAKED_REPLY, branch,
-					  code, &cancel_bitmap );
+					  code, cancel_bitmap );
 		if (reply_status==RPS_COMPLETED) {
 			put_on_wait(t);
 		}
 	} else {
 		reply_status=relay_reply( t, FAKED_REPLY, branch, code,
-			&cancel_bitmap );
+			cancel_bitmap );
 	}
 	_tm_branch_index = 0;
 	/* again, a final negative reply on a branch will never lead to a
@@ -272,6 +274,36 @@ static void fake_reply(struct cell *t, int branch, int code )
 
 
 
+
+
+void tm_tcp_chunk_fail(void *param)
+{
+	unsigned long long token = (unsigned long long)(uintptr_t)param;
+	unsigned int hash_index = (token >> 9) & 0xffff;
+	unsigned int label = token >> 25;
+	int branch = (int)(token & 0x1ff) - 1;
+	struct cell *t;
+
+	if (t_lookup_ident(&t, hash_index, label) < 0)
+		return;
+
+	if (push_new_global_context()) {
+		set_t(t);
+
+		LOCK_REPLIES(t);
+		if (branch >= t->nr_of_outgoings ||
+		TM_BRANCH(t,branch).last_received != 0 ||
+		TM_BRANCH(t,branch).request.buffer.s == NULL)
+			UNLOCK_REPLIES(t);
+		else
+			fake_reply(t, branch, -E_SEND);
+
+		init_t();
+		pop_pushed_global_context();
+	}
+
+	UNREF(t);
+}
 
 
 inline static void retransmission_handler( struct timer_link *retr_tl )
@@ -350,7 +382,7 @@ inline static void final_response_handler( struct timer_link *fr_tl )
 	context_p old_ctx;
 	struct retr_buf* r_buf;
 	struct cell *t;
-	branch_bm_t cancel_bitmap;
+	branch_bm_t cancel_bitmap = BRANCH_BM_ZERO;
 
 	if (fr_tl==0){
 		/* or BUG?, ignoring it for now */

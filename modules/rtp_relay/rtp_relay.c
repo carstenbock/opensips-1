@@ -28,8 +28,12 @@
 #include "rtp_relay_ctx.h"
 #include "rtp_relay.h"
 
-#define RTP_RELAY_PV_PEER 0x1
-#define RTP_RELAY_PV_VAR 0x2
+#define RTP_RELAY_PV_PEER   0x1
+#define RTP_RELAY_PV_VAR    0x2
+#define RTP_RELAY_PV_CALLER 0x4
+#define RTP_RELAY_PV_CALLEE 0x8
+#define RTP_RELAY_PV_LEG_MASK \
+	(RTP_RELAY_PV_PEER|RTP_RELAY_PV_CALLER|RTP_RELAY_PV_CALLEE)
 
 static int pv_parse_rtp_relay_var(pv_spec_p sp, const str *in);
 static int pv_get_rtp_relay_var(struct sip_msg *msg, pv_param_t *param,
@@ -74,16 +78,15 @@ static const cmd_export_t mod_cmds[] = {
 };
 
 static const mi_export_t mi_cmds[] = {
-	{ "rtp_relay_list", 0, 0, 0, {
+	{ "list", 0, 0, 0, {
 		{mi_rtp_relay_list, {0}},
 		{mi_rtp_relay_list, {"engine", 0}},
 		{mi_rtp_relay_list, {"engine", "set", 0}},
 		{mi_rtp_relay_list, {"engine", "node", 0}},
 		{mi_rtp_relay_list, {"engine", "set", "node", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"rtp_relay_list", 0}
 	},
-	{ "rtp_relay_update",
-		"updates an ongoing RTP relay session",
+	{ "update",		"updates an ongoing RTP relay session",
 			MI_ASYNC_RPL_FLAG, 0, {
 		{mi_rtp_relay_update, {0}},
 		{mi_rtp_relay_update, {"engine", 0}},
@@ -95,10 +98,9 @@ static const mi_export_t mi_cmds[] = {
 		{mi_rtp_relay_update, {"engine", "set", "node", "new_set", 0}},
 		{mi_rtp_relay_update, {"engine", "set", "node", "new_node", 0}},
 		{mi_rtp_relay_update, {"engine", "set", "node", "new_set", "new_node", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"rtp_relay_update", 0}
 	},
-	{ "rtp_relay_update_callid",
-		"updates an ongoing RTP relay session identified by its Call-ID",
+	{ "update_callid",		"updates an ongoing RTP relay session identified by its Call-ID",
 			MI_ASYNC_RPL_FLAG, 0, {
 		{mi_rtp_relay_update_callid, {"callid", 0}},
 		{mi_rtp_relay_update_callid, {"callid", "flags", 0}},
@@ -108,7 +110,7 @@ static const mi_export_t mi_cmds[] = {
 		{mi_rtp_relay_update_callid, {"callid", "engine", "set", "flags", 0}},
 		{mi_rtp_relay_update_callid, {"callid", "engine", "set", "node", 0}},
 		{mi_rtp_relay_update_callid, {"callid", "engine", "set", "node", "flags", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"rtp_relay_update_callid", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };
@@ -136,6 +138,12 @@ static const pv_export_t mod_pvars[] = {
 	{ str_const_init("rtp_relay_peer"), 2005, pv_get_rtp_relay_var,
 		pv_set_rtp_relay_var, pv_parse_rtp_relay_var,
 		pv_parse_rtp_relay_index, pv_init_rtp_relay_var, RTP_RELAY_PV_PEER},
+	{ str_const_init("rtp_relay_caller"), 2007, pv_get_rtp_relay_var,
+		pv_set_rtp_relay_var, pv_parse_rtp_relay_var,
+		pv_parse_rtp_relay_index, pv_init_rtp_relay_var, RTP_RELAY_PV_CALLER},
+	{ str_const_init("rtp_relay_callee"), 2008, pv_get_rtp_relay_var,
+		pv_set_rtp_relay_var, pv_parse_rtp_relay_var,
+		pv_parse_rtp_relay_index, pv_init_rtp_relay_var, RTP_RELAY_PV_CALLEE},
 	{ str_const_init("rtp_relay_ctx"), 2006, pv_get_rtp_relay_ctx,
 		pv_set_rtp_relay_ctx, pv_parse_rtp_relay_ctx,
 		NULL, NULL, 0},
@@ -413,6 +421,7 @@ static struct rtp_relay_leg *pv_get_rtp_relay_leg(struct sip_msg *msg,
 	struct rtp_relay_leg *leg, *peer;
 	pv_value_t flags_name;
 	int idx = RTP_RELAY_ALL_BRANCHES;
+	int leg_sel, use_peer;
 	str tag;
 
 	*flag = RTP_RELAY_FLAGS_UNKNOWN;
@@ -450,7 +459,27 @@ static struct rtp_relay_leg *pv_get_rtp_relay_leg(struct sip_msg *msg,
 	}
 	/* identify the leg in question */
 	leg = rtp_relay_get_leg(ctx, &tag, idx);
-	if (param->pvn.type) { /* looking for its peer */
+
+	leg_sel = param->pvn.type & RTP_RELAY_PV_LEG_MASK;
+	if (leg_sel == RTP_RELAY_PV_CALLER || leg_sel == RTP_RELAY_PV_CALLEE) {
+		if (ctx->established) {
+			leg = ctx->established->legs[
+				leg_sel == RTP_RELAY_PV_CALLER ?
+					RTP_RELAY_CALLER : RTP_RELAY_CALLEE];
+			if (!leg)
+				return NULL;
+			goto flags;
+		}
+
+		if (leg_sel == RTP_RELAY_PV_CALLER)
+			use_peer = (route_type == BRANCH_ROUTE || route_type == ONREPLY_ROUTE);
+		else
+			use_peer = !(route_type == BRANCH_ROUTE || route_type == ONREPLY_ROUTE);
+	} else {
+		use_peer = (leg_sel == RTP_RELAY_PV_PEER);
+	}
+
+	if (use_peer) { /* looking for its peer */
 		if (ctx->established) {
 			if (!leg)
 				return NULL;
@@ -459,15 +488,28 @@ static struct rtp_relay_leg *pv_get_rtp_relay_leg(struct sip_msg *msg,
 				return NULL;
 			}
 			leg = leg->peer;
-		} else if (!leg) {
-			LM_ERR("no leg identified, so cannot figure out peer\n");
-			return NULL;
 		} else {
+			if (!leg) {
+				if (!set || leg_sel == RTP_RELAY_PV_PEER) {
+					LM_ERR("no leg identified, so cannot figure out peer\n");
+					return NULL;
+				}
+				leg = rtp_relay_new_leg(ctx, &tag, idx);
+				if (!leg) {
+					LM_ERR("cannot create a new leg\n");
+					return NULL;
+				}
+			}
+
 			peer = rtp_relay_get_peer_leg(ctx, leg);
 			if (!peer) {
 				if (!set)
 					return NULL;
-				peer = rtp_relay_new_leg(ctx, &get_from(msg)->tag_value, RTP_RELAY_ALL_BRANCHES);
+				if (route_type == BRANCH_ROUTE || route_type == ONREPLY_ROUTE)
+					tag = get_from(msg)->tag_value;
+				else
+					tag = get_to(msg)->tag_value;
+				peer = rtp_relay_new_leg(ctx, &tag, RTP_RELAY_ALL_BRANCHES);
 				if (!peer) {
 					LM_ERR("cannot create a new leg\n");
 					return NULL;
@@ -488,6 +530,7 @@ static struct rtp_relay_leg *pv_get_rtp_relay_leg(struct sip_msg *msg,
 		}
 	}
 
+flags:
 	if (param->pvn.type & RTP_RELAY_PV_VAR) {
 		if (pv_get_spec_value(msg, (pv_spec_p)param->pvi.u.dval, &flags_name) < 0)
 			LM_ERR("cannot get the name of the RTP relay variable\n");
@@ -610,6 +653,7 @@ enum rtp_relay_ctx_flags {
 	RTP_RELAY_CTX_TO_TAG,
 	RTP_RELAY_CTX_FLAGS,
 	RTP_RELAY_CTX_DELETE,
+	RTP_RELAY_CTX_NODE,
 	RTP_RELAY_CTX_UNKNOWN,
 };
 
@@ -631,6 +675,8 @@ static enum rtp_relay_ctx_flags rtp_relay_ctx_flags_get(const str *in)
 		return RTP_RELAY_CTX_FLAGS;
 	if (str_casematch_nt(in, "delete"))
 		return RTP_RELAY_CTX_DELETE;
+	if (str_casematch_nt(in, "node"))
+		return RTP_RELAY_CTX_NODE;
 	return RTP_RELAY_CTX_UNKNOWN;
 }
 
@@ -682,6 +728,9 @@ static int pv_get_rtp_relay_ctx(struct sip_msg *msg, pv_param_t *param,
 		case RTP_RELAY_CTX_DELETE:
 			sync = &ctx->delete;
 			break;
+		case RTP_RELAY_CTX_NODE:
+			sync = &ctx->node;
+			break;
 		default:
 			LM_BUG("unhandled flag %d\n", flag);
 			break;
@@ -731,6 +780,9 @@ static int pv_set_rtp_relay_ctx(struct sip_msg *msg, pv_param_t *param,
 			break;
 		case RTP_RELAY_CTX_DELETE:
 			sync = &ctx->delete;
+			break;
+		case RTP_RELAY_CTX_NODE:
+			sync = &ctx->node;
 			break;
 		default:
 			LM_BUG("unhandled flag %d\n", flag);

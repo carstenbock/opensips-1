@@ -47,6 +47,9 @@ enum _tr_s_subtype {
 	TR_S_SHA256, TR_S_SHA256_HMAC, TR_S_SHA384, TR_S_SHA384_HMAC, TR_S_SHA512,
 	TR_S_SHA512_HMAC
 };
+enum _tr_i_subtype {
+	TR_I_NONE=0, TR_I_BOOL
+};
 enum _tr_uri_subtype {
 	TR_URI_NONE=0, TR_URI_USER, TR_URI_HOST, TR_URI_PASSWD, TR_URI_PORT,
 	TR_URI_PARAMS, TR_URI_PARAM, TR_URI_HEADERS, TR_URI_TRANSPORT, TR_URI_TTL,
@@ -71,7 +74,7 @@ enum _tr_param_type { TR_PARAM_NONE=0, TR_PARAM_STRING, TR_PARAM_NUMBER,
 enum _tr_csv_subtype {TR_CSV_NONE=0, TR_CSV_COUNT,TR_CSV_VALUEAT};
 enum _tr_sdp_subtype {TR_SDP_NONE=0, TR_SDP_LINEAT, TR_SDP_STREAM_DEL,
 	TR_SDP_STREAM};
-enum _tr_ip_subtype  {TR_IP_NONE=0,TR_IP_FAMILY,TR_IP_NTOP,TR_IP_RESOLVE,
+enum _tr_ip_subtype  {TR_IP_NONE=0,TR_IP_FAMILY,TR_IP_NTOP,TR_IP_RESOLVE,TR_IP_RESOLVE_V4,TR_IP_RESOLVE_V6,
 	TR_IP_ISIP, TR_IP_ISIP4, TR_IP_ISIP6, TR_IP_PTON, TR_IP_MATCHES, TR_IP_ISPRIVATE};
 enum _tr_re_subtype  {TR_RE_NONE=0,TR_RE_SUBST};
 
@@ -118,12 +121,23 @@ void free_transformation(trans_t *t);
 void free_tr_param(tr_param_t *tp);
 
 /* transformation parameter parsing helper functions */
+	enum tr_parse_sparam_mode {
+	TR_PARSE_SPARAM_NO_WS = 0,
+	TR_PARSE_SPARAM_WS,
+	TR_PARSE_SPARAM_WS_RBRACKET
+	};
+
 char *tr_parse_nparam(char *p, str *in, tr_param_t **tp);
-char *tr_parse_sparam(char *p, str *in, tr_param_t **tp, int skip_param_ws);
+char *tr_parse_sparam(char *p, str *in, tr_param_t **tp,
+		enum tr_parse_sparam_mode mode);
 
 /* core transformations */
 int tr_parse_string(str* in, trans_t *t);
 int tr_eval_string(struct sip_msg *msg, tr_param_t *tp, int subtype,
+		pv_value_t *val);
+
+int tr_parse_integer(str *in, trans_t *t);
+int tr_eval_integer(struct sip_msg *msg, tr_param_t *tp, int subtype,
 		pv_value_t *val);
 
 int tr_parse_uri(str* in, trans_t *t);
@@ -159,4 +173,3 @@ int tr_eval_re(struct sip_msg *msg, tr_param_t *tp, int subtype,
 		pv_value_t *val);
 
 #endif
-

@@ -577,6 +577,7 @@ struct sip_msg*  sip_msg_cloner( struct sip_msg *org_msg, int *sip_msg_len,
 	new_msg->body = NULL;
 	new_msg->msg_cb = NULL;
 	new_msg->sdp_ops = NULL;
+	new_msg->pkg_buf = NULL;
 
 	new_msg->msg_flags |= FL_SHM_CLONE;
 	p += ROUND4(sizeof(struct sip_msg));
@@ -1222,6 +1223,7 @@ int update_cloned_msg_from_msg(struct sip_msg *c_msg, struct sip_msg *msg)
 		return -1;
 	}
 
+
 	/* length of the new data lump structures */
 	l1_len = l2_len = l3_len = 0;
 	LUMP_LIST_LEN(l1_len, msg->add_rm);
@@ -1322,18 +1324,19 @@ int update_cloned_msg_from_msg(struct sip_msg *c_msg, struct sip_msg *msg)
 		free_sip_body( body_bk );
 	}
 
-	if (!(msg->msg_flags & FL_TM_FAKE_REQ)) {
-		/* if not a fake request, we should free old values right now,
-		 * otherwise we leak if it's a fake request, then we can't free 
-		 * old info now - we might still need it ( eg. to build a reply 
-		 * from the faked req ) - let the freeing happen when destryong
-		 * the fake req */
-		shm_lock();
-		if (add_rm_aux) shm_free_bulk(add_rm_aux);
-		if (body_lumps_aux) shm_free_bulk(body_lumps_aux);
-		if (reply_lump_aux) shm_free_bulk(reply_lump_aux);
-		shm_unlock();
-	}
+	/* if "msg" is a fake request, due to how the fake requests are built
+	 * from the t->uas.request, the fake request "msg" and the shm cloned
+	 * request "t->uas.request" may initially (entering this function) share
+	 * the lump lumps. So we need to be carefully what we free here. We free
+	 * the lump chunk from the old cloned request ONLY if they are not shared
+	 * with the "msg", otherwise just let them attached to the "msg" and
+	 * the "free_faked_req) will take care of them */
+	if (add_rm_aux && add_rm_aux != msg->add_rm)
+		shm_free(add_rm_aux);
+	if (body_lumps_aux && body_lumps_aux != msg->body_lumps)
+		shm_free(body_lumps_aux);
+	if (reply_lump_aux && reply_lump_aux != msg->reply_lump)
+		shm_free(reply_lump_aux);
 
 	c_msg->msg_flags |= FL_SHM_UPDATED;
 	return 0;

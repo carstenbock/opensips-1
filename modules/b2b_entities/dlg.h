@@ -69,6 +69,14 @@ typedef struct b2b_dlg_leg {
 	unsigned int cseq;
 	str route_set;
 	str contact;
+	str prack_headers;
+	struct cell* prack_tran;
+	/* UPDATE is tracked per leg for the same reason PRACK is: when several
+	 * early dialogs are advertised upstream with distinct to-tags, each of
+	 * them can have an UPDATE in flight at the same time, so every leg
+	 * needs its own UAS transaction and its own last reply code */
+	struct cell* update_tran;
+	unsigned int last_reply_code;
 	struct b2b_dlg_leg* next;
 }dlg_leg_t;
 
@@ -107,7 +115,6 @@ typedef struct b2b_dlg
 	struct cell*         uac_tran;
 	struct cell*         uas_tran;
 	struct cell*         update_tran;
-	struct cell*         prack_tran;
 	struct cell*         cancel_tm_tran;
 	dlg_leg_t*           legs;
 	const struct socket_info*  send_sock;
@@ -119,7 +126,8 @@ typedef struct b2b_dlg
 	struct b2b_tracer   *tracer;
 	void                *param;
 	b2b_param_free_cb    free_param;
-	str                  prack_headers;
+	unsigned int         ref;
+	int                  deleted;
 }b2b_dlg_t;
 
 typedef struct b2b_entry
@@ -150,8 +158,11 @@ str* b2b_htable_insert(b2b_table table, b2b_dlg_t* dlg, int hash_index,
 
 b2b_dlg_t* b2b_htable_search_safe(str callid, str to_tag, str from_tag);
 
-int b2b_parse_key(str* key, unsigned int* hash_index,
+int b2b_parse_key(str* key, unsigned int hsize, unsigned int* hash_index,
 		unsigned int* local_index);
+
+unsigned int b2b_et_hsize(enum b2b_entity_type et);
+unsigned int b2b_table_hsize(b2b_table table);
 
 str* b2b_generate_key(unsigned int hash_index, unsigned int local_index);
 
@@ -191,12 +202,15 @@ void b2b_tm_cback(struct cell* t, b2b_table htable, struct tmcb_params *ps);
 void print_b2b_entities(void);
 
 int b2breq_complete_ehdr(str* extra_headers, str *client_headers,
-		str* ehdr_out, str* body, str* contact);
+		str* ehdr_out, str* body, str* contact, str *ct_hdr_params);
 
 b2b_dlg_t* b2b_search_htable_dlg(b2b_table table, unsigned int hash_index,
 		unsigned int local_index, str* to_tag, str* from_tag, str* callid);
 
 int b2b_apply_lumps(struct sip_msg* msg);
+int b2b_get_reply_leg(enum b2b_entity_type et, str *b2b_key, str *to_tag);
+int b2b_has_leg_idx(enum b2b_entity_type et, str *b2b_key, int leg_idx);
+void b2b_get_server_entity_key(str *entity_key);
 
 int b2b_register_cb(b2b_cb_t cb, int cb_type, str *mod_name);
 

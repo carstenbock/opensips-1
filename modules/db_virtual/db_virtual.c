@@ -43,7 +43,7 @@
 int db_probe_time = 10;
 
 /* max consecutive retries before give up */
-int db_max_consec_retrys = 10;
+int db_max_consec_retries = 10;
 
 /* for debug.. try_reconect with or without a timer process(probe) */
 int db_reconnect_with_timer = 1;
@@ -95,7 +95,9 @@ static const cmd_export_t cmds[] = {
 static const param_export_t params[] = {
         //{"db_file",                 STR_PARAM, &db_file.s},
         {"db_probe_time",           INT_PARAM, &db_probe_time},
-        {"db_max_consec_retrys",    INT_PARAM, &db_max_consec_retrys},
+        /* kept for backwards-compatibility */
+        {"db_max_consec_retrys",    INT_PARAM, &db_max_consec_retries},
+        {"db_max_consec_retries",   INT_PARAM, &db_max_consec_retries},
         {"db_urls",     STR_PARAM|USE_FUNC_PARAM,(void*)store_urls},
 	{0, 0, 0}
 };
@@ -103,15 +105,15 @@ static const param_export_t params[] = {
  * MI
  */
 static const mi_export_t mi_cmds[] = {
-    {"db_get", 0, 0, 0, {
-        {db_get_info, {0}},
-        {EMPTY_MI_RECIPE}}
+    {"get", 0, 0, 0, {
+    	{db_get_info, {0}},
+        {EMPTY_MI_RECIPE}}, {"db_get", 0}
     },
-    {"db_set", 0, 0, 0, {
-        {db_set_info_1,   {"set_index", "db_url_index", "may_use_db_flag", 0}},
+    {"set", 0, 0, 0, {
+    	{db_set_info_1,   {"set_index", "db_url_index", "may_use_db_flag", 0}},
         {db_set_info_2,   {"set_index", "db_url_index", "may_use_db_flag",
                            "ingore_retries", 0}},
-        {EMPTY_MI_RECIPE}}
+        {EMPTY_MI_RECIPE}}, {"db_set", 0}
     },
     {EMPTY_MI_EXPORT}
 };
@@ -261,6 +263,10 @@ int init_global(void){//str *info_set_mapping){
             if(strncmp("define", s, strlen("define")) == 0){
                 s += strlen("define")+1;
                 p = strchr(s, ' ');
+                if (!p) {
+                    LM_ERR("invalid DB set definition: %s\n", s);
+                    return -1;
+                }
                 /* set1=FAILOVER */
                 *p = 0;
                 p++;

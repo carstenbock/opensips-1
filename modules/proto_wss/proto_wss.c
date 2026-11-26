@@ -30,12 +30,14 @@
 #include <sys/uio.h>
 #include <poll.h>
 
+#include "../../mem/mem.h"
 #include "../../pt.h"
 #include "../../sr_module.h"
 #include "../../net/net_tcp.h"
 #include "../../net/tcp_common.h"
 #include "../../net/api_proto.h"
 #include "../../net/api_proto_net.h"
+#include "../../net/proxy_protocol.h"
 #include "../../socket_info.h"
 #include "../../tsend.h"
 #include "../../receive.h"
@@ -48,20 +50,19 @@
 #include "proto_wss.h"
 #include "../proto_ws/ws_common_defs.h"
 #include "../tls_mgm/api.h"
+#include "../tls_mgm/tls_shared_data.h"
 
 struct tls_mgm_binds tls_mgm_api;
 
 /* parameters*/
 int wss_max_msg_chunks = TCP_CHILD_MAX_MSG_CHUNK;
 
-static struct tcp_req tcp_current_req;
-
-static struct ws_req wss_current_req;
-
 static int wss_hs_read_tout = 100;
 static int wss_hs_tls_tout = 100;
 static int wss_send_tout = 100;
 static int wss_require_origin = 1;
+/* comma-separated list of accepted Origin values; empty = any */
+static str wss_allowed_origins = {NULL, 0};
 
 /* check the SSL certificate when comes to TCP conn reusage */
 static int cert_check_on_conn_reusage = 0;
@@ -71,14 +72,14 @@ static str wss_resource = str_init("/");
 
 static int wss_raw_writev(struct tcp_connection *c, int fd,
 		const struct iovec *iov, int iovcnt, int tout);
+static int wss_async_write(struct tcp_connection* con, int fd);
 
 #define _ws_common_module "wss"
-#define _ws_common_tcp_current_req tcp_current_req
-#define _ws_common_current_req wss_current_req
 #define _ws_common_max_msg_chunks wss_max_msg_chunks
 #define _ws_common_read(c, r) tls_mgm_api.tls_read((c), (r))
 #define _ws_common_writev wss_raw_writev
 #define _ws_common_read_tout wss_hs_read_tout
+#define _ws_common_proxy_send_tout wss_send_tout
 #define _ws_common_require_origin wss_require_origin
 /*
  * the timeout is only used by the _ws_common_writev function
@@ -109,9 +110,10 @@ static int proto_wss_init(struct proto_info *pi);
 static int proto_wss_init_listener(struct socket_info *si);
 static int proto_wss_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id);
+		unsigned int id, struct sip_msg *msg);
 static int wss_read_req(struct tcp_connection* con, int* bytes_read);
 static int wss_conn_init(struct tcp_connection* c);
+static int wss_conn_connect(struct tcp_connection* c);
 static void ws_conn_clean(struct tcp_connection* c);
 static void wss_report(int type, unsigned long long conn_id, int conn_flags,
 		void *extra);
@@ -137,6 +139,7 @@ static const param_export_t params[] = {
 	{ "wss_resource",       STR_PARAM, &wss_resource.s     },
 	{ "wss_send_timeout",   INT_PARAM, &wss_send_tout      },
 	{ "require_origin",     INT_PARAM, &wss_require_origin },
+	{ "allowed_origins",    STR_PARAM, &wss_allowed_origins.s },
 	{ "wss_handshake_timeout", INT_PARAM, &wss_hs_read_tout},
 	{ "trace_destination",     STR_PARAM,         &trace_destination_name.s  },
 	{ "wss_tls_handshake_timeout",  INT_PARAM, &wss_hs_tls_tout           },
@@ -157,12 +160,10 @@ static const dep_export_t deps = {
 };
 
 static const mi_export_t mi_cmds[] = {
-	{ "wss_trace", 0, 0, 0, {
+	{ "trace", 0, 0, 0, {
 		{wss_trace_mi, {0}},
 		{wss_trace_mi_1, {"trace_mode", 0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
+		{EMPTY_MI_RECIPE}}, {"wss_trace", 0}},
 	{EMPTY_MI_EXPORT}
 };
 
@@ -202,11 +203,14 @@ static int proto_wss_init(struct proto_info *pi)
 	pi->tran.send			= proto_wss_send;
 	pi->tran.dst_attr		= tcp_conn_fcntl;
 
-	pi->net.flags			= PROTO_NET_USE_TCP;
+	pi->net.flags			= PROTO_NET_USE_TCP | PROTO_NET_SUPPORTS_PROXY;
 	pi->net.stream.read		= wss_read_req;
+	pi->net.stream.write		= wss_async_write;
 
 	pi->net.stream.conn.init	= wss_conn_init;
+	pi->net.stream.conn.connect	= wss_conn_connect;
 	pi->net.stream.conn.clean	= ws_conn_clean;
+	pi->net.stream.conn.dump	= tls_shared_info_dump;
 	if (cert_check_on_conn_reusage)
 		pi->net.stream.conn.match	= tls_conn_extra_match;
 	else
@@ -222,6 +226,8 @@ static int mod_init(void)
 	LM_INFO("initializing Secure WebSocket protocol\n");
 
 	wss_resource.len = strlen(wss_resource.s);
+	if (ws_parse_allowed_origins(&wss_allowed_origins) < 0)
+		return -1;
 
 	if(load_tls_mgm_api(&tls_mgm_api) != 0){
 		LM_DBG("failed to find tls API - is tls_mgm module loaded?\n");
@@ -269,30 +275,29 @@ static int wss_conn_init(struct tcp_connection* c)
 	struct tls_domain *dom;
 	int ret;
 
-	/* allocate the tcp_data and the array of chunks as a single mem chunk */
-	d = (struct ws_data *)shm_malloc(sizeof(*d));
-	if (d==NULL) {
-		LM_ERR("failed to create ws states in shm mem\n");
-		return -1;
+	d = c->proto_data;
+	if (!d) {
+		/* allocate the tcp_data and the array of chunks as a single mem chunk */
+		d = (struct ws_data *)thread_malloc(sizeof(*d));
+		if (d==NULL) {
+			LM_ERR("failed to create ws states in private mem\n");
+			return -1;
+		}
+
+		memset( d, 0, sizeof( struct ws_data ) );
+		d->state = WS_CON_INIT;
+		d->type = (c->flags & F_CONN_ACCEPTED) ? WS_NONE : WS_CLIENT;
+		d->code = WS_ERR_NONE;
+		c->proto_data = (void*)d;
 	}
 
-	memset( d, 0, sizeof( struct ws_data ) );
-
-	if ( t_dst && tprot.create_trace_message ) {
+	if ( t_dst && tprot.create_trace_message && d->tprot == NULL ) {
 		d->tprot = &tprot;
 		d->dest = t_dst;
 		d->net_trace_proto_id = net_trace_proto_id;
 		d->trace_is_on = trace_is_on;
 		d->trace_route_ref = trace_filter_route_ref;
 	}
-
-
-
-	d->state = WS_CON_INIT;
-	d->type = WS_NONE;
-	d->code = WS_ERR_NONE;
-
-	c->proto_data = (void*)d;
 
 	if ( c->flags&F_CONN_ACCEPTED ) {
 		LM_DBG("looking up TLS server "
@@ -305,7 +310,7 @@ static int wss_conn_init(struct tcp_connection* c)
 		LM_ERR("no TLS %s domain found\n",
 				(c->flags&F_CONN_ACCEPTED?"server":"client"));
 		c->proto_data = NULL;
-		shm_free(d);
+		thread_free(d);
 		return -1;
 	}
 
@@ -313,10 +318,29 @@ static int wss_conn_init(struct tcp_connection* c)
 	if (ret < 0) {
 		c->proto_data = NULL;
 		LM_ERR("Cannot initiate the conn\n");
-		shm_free(d);
+		thread_free(d);
 	}
 
 	return ret;
+}
+
+static int wss_conn_connect(struct tcp_connection* c)
+{
+	if (!c->proto_data || WS_TYPE(c) != WS_CLIENT)
+		return 0;
+
+	if (send_stream_proxy_protocol_v1(c, c->fd, _ws_common_proxy_send_tout, 0,
+			NULL, _ws_common_module) < 0) {
+		LM_ERR("failed to send outbound PROXY header\n");
+		return -1;
+	}
+
+	if (ws_client_handshake(c) < 0) {
+		LM_ERR("cannot complete WebSocket handshake\n");
+		return -1;
+	}
+
+	return 0;
 }
 
 static void ws_conn_clean(struct tcp_connection* c)
@@ -338,7 +362,7 @@ static void ws_conn_clean(struct tcp_connection* c)
 			}
 		}
 
-		shm_free(c->proto_data);
+		thread_free(c->proto_data);
 		c->proto_data = NULL;
 
 	}
@@ -393,15 +417,14 @@ static void wss_report(int type, unsigned long long conn_id, int conn_flags,
 /*! \brief Finds a tcpconn & sends on it */
 static int proto_wss_send(const struct socket_info* send_sock,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id)
+		unsigned int id, struct sip_msg *msg)
 {
 	struct tcp_connection *c;
 	struct tcp_conn_profile prof;
 	struct tls_domain *dom;
 	struct timeval get;
 	struct ip_addr ip;
-	int port = 0, fd, n, matched;
-	struct ws_data* d;
+	int port = 0, n, matched;
 
 	matched = tcp_con_get_profile(to, &send_sock->su, send_sock->proto, &prof);
 
@@ -413,11 +436,11 @@ static int proto_wss_send(const struct socket_info* send_sock,
 		port=su_getport(to);
 		dom = (cert_check_on_conn_reusage==0)?
 			NULL : tls_mgm_api.find_client_domain( &ip, port);
-		n = tcp_conn_get(id, &ip, port, PROTO_WSS, dom, &c, &fd, send_sock);
+		n = tcp_conn_get(id, &ip, port, PROTO_WSS, dom, &c, send_sock);
 		if (dom)
 			tls_mgm_api.release_domain(dom);
 	}else if (id){
-		n = tcp_conn_get(id, 0, 0, PROTO_NONE, NULL, &c, &fd, NULL);
+		n = tcp_conn_get(id, 0, 0, PROTO_NONE, NULL, &c, NULL);
 	}else{
 		LM_CRIT("prot_tls_send called with null id & to\n");
 		get_time_difference(get,prof.send_threshold,tcp_timeout_con_get);
@@ -442,7 +465,7 @@ static int proto_wss_send(const struct socket_info* send_sock,
 		}
 		LM_DBG("no open tcp connection found, opening new one\n");
 		/* create tcp connection */
-		if ((c=ws_connect(send_sock, to, &prof, &fd))==0) {
+		if ((c=ws_connect(send_sock, to, &prof, msg))==0) {
 			LM_ERR("connect failed\n");
 			return -1;
 		}
@@ -452,7 +475,7 @@ static int proto_wss_send(const struct socket_info* send_sock,
 
 	/* now we have a connection, let's what we can do with it */
 	/* BE CAREFUL now as we need to release the conn before exiting !!! */
-	if (fd==-1) {
+	if (c->state != S_CONN_OK && c->state != S_CONN_CONNECTING) {
 		/* connection is not writable because of its state */
 		/* return error, nothing to do about it */
 		tcp_conn_release(c, 0);
@@ -460,41 +483,19 @@ static int proto_wss_send(const struct socket_info* send_sock,
 	}
 
 send_it:
-	LM_DBG("sending via fd %d...\n",fd);
-
-	n = ws_req_write(c, fd, buf, len);
+	LM_DBG("sending on conn %p...\n", c);
+	n = tcp_async_add_chunk(c, buf, len, 1);
+	if (n == 0)
+		n = len;
 	stop_expire_timer(get, prof.send_threshold, "WSS ops",buf,(int)len,1);
-	tcp_conn_reset_lifetime(c);
 
-	/* only here we will have all tracing data TLS + WS */
-	d = c->proto_data;
-
-	if ( (c->flags&F_CONN_ACCEPTED)==0 && d && d->dest && d->tprot ) {
-		if ( d->message ) {
-			send_trace_message( d->message, t_dst);
-			d->message = NULL;
-		}
-
-		/* don't allow future traces for this cnection */
-		d->tprot = 0;
-		d->dest  = 0;
-	}
-
-
-	LM_DBG("after write: c= %p n=%d fd=%d\n",c, n, fd);
+	LM_DBG("after write: c=%p n=%d\n", c, n);
 	if (n<0){
 		LM_ERR("failed to send\n");
 		c->state=S_CONN_BAD;
-		if (c->proc_id != process_no)
-			close(fd);
 		tcp_conn_release(c, 0);
 		return -1;
 	}
-
-	/* only close the FD if not already in the context of our process
-	either we just connected, or main sent us the FD */
-	if (c->proc_id != process_no)
-		close(fd);
 
 	/* mark the ID of the used connection (tracing purposes) */
 	last_outgoing_tcp_id = c->id;
@@ -522,8 +523,18 @@ static int wss_read_req(struct tcp_connection* con, int* bytes_read)
 	int size;
 	struct ws_data* d;
 
+	switch (check_tcp_proxy_protocol(con)) {
+	case 0:
+		goto done;
+	case -1:
+		goto error;
+	case 1:
+		break;
+	}
+
 	/* we need to fix the SSL connection before doing anything */
-	if (tls_mgm_api.tls_fix_read_conn(con, con->fd, 0, t_dst, 1) < 0) {
+	size = tls_mgm_api.tls_fix_read_conn(con, con->fd, 0, t_dst, 1);
+	if (size < 0) {
 		LM_ERR("cannot fix read connection\n");
 		if ( (d=con->proto_data) && d->dest && d->tprot ) {
 			if ( d->message ) {
@@ -537,13 +548,18 @@ static int wss_read_req(struct tcp_connection* con, int* bytes_read)
 		}
 		goto error;
 	}
+	if (size == 0) {
+		LM_DBG("SSL accept/connect still pending!\n");
+		goto done;
+	}
 
 	d=con->proto_data;
 
 	if (WS_STATE(con) != WS_CON_HANDSHAKE_DONE) {
 		size = ws_server_handshake(con);
 		if (size < 0) {
-			LM_ERR("cannot complete WebSocket handshake\n");
+			LM_ERR("cannot complete WebSocket handshake from %s:%d\n",
+					ip_addr2a(&con->rcv.src_ip), con->rcv.src_port);
 			goto error;
 		}
 
@@ -584,44 +600,86 @@ error:
 static int wss_raw_writev(struct tcp_connection *c, int fd,
 		const struct iovec *iov, int iovcnt, int tout)
 {
-	int i, n, ret = 0;
-#ifdef TLS_DONT_WRITE_FRAGMENTS
-	static char *buf = NULL;
-#endif
+	char *buf = NULL, *data, *p;
+	size_t len;
+	int i, n, ret;
 
-#ifndef TLS_DONT_WRITE_FRAGMENTS
-	lock_get(&c->write_lock);
-	for (i = 0; i < iovcnt; i++) {
-		n = tls_mgm_api.tls_blocking_write(c, fd, iov[i].iov_base, iov[i].iov_len,
-				wss_hs_tls_tout, wss_send_tout, t_dst);
-		if (n < 0) {
-			ret = -1;
-			goto end;
+	if (fd < 0) {
+		ret = 0;
+		for (i = 0; i < iovcnt; i++)
+			ret += iov[i].iov_len;
+		n = tcp_async_add_chunks(c, iov, iovcnt, 1);
+		return (n == 0) ? ret : n;
+	}
+
+	/* Hand all the elements to a single TLS write, so they leave in one
+	 * TLS record: the reader consumes one record per read attempt and gives
+	 * up after wss_max_msg_chunks attempts, so a handshake written element
+	 * by element (16 elements for the client's upgrade request) cannot be
+	 * read by a peer with the default limit, and every data frame would
+	 * cost two records (header + payload). The buffer is per call: TCP
+	 * main's I/O threads reach this function through the handshake. */
+	if (iovcnt == 1) {
+		data = iov[0].iov_base;
+		len = iov[0].iov_len;
+	} else {
+		len = 0;
+		for (i = 0; i < iovcnt; i++)
+			len += iov[i].iov_len;
+		buf = thread_malloc(len);
+		if (!buf) {
+			LM_ERR("no more pkg memory for a %zu bytes WSS write\n", len);
+			return -1;
 		}
-		ret += n;
+		for (p = buf, i = 0; i < iovcnt; i++) {
+			memcpy(p, iov[i].iov_base, iov[i].iov_len);
+			p += iov[i].iov_len;
+		}
+		data = buf;
 	}
-#else
-	n = 0;
-	for (i = 0; i < iovcnt; i++)
-		n += iov[i].iov_len;
-	buf = pkg_realloc(buf, n);
-	if (!buf) {
-		ret = -2;
-		goto end;
-	}
-	n = 0;
-	for (i = 0; i < iovcnt; i++) {
-		memcpy(buf + n, iov[i].iov_base, iov[i].iov_len);
-		n += iov[i].iov_len;
-	}
-	lock_get(&c->write_lock);
-	n = tls_mgm_api.tls_blocking_write(c, fd, buf, n,
-				wss_hs_tls_tout, wss_send_tout, t_dst);
-#endif /* TLS_DONT_WRITE_FRAGMENTS */
 
-end:
-	lock_release(&c->write_lock);
-	return ret;
+	n = tls_mgm_api.tls_blocking_write(c, fd, data, len,
+			wss_hs_tls_tout, wss_send_tout, t_dst);
+	if (buf)
+		thread_free(buf);
+	if (n < 0)
+		return -1;
+
+	if (n > 0)
+		tcp_conn_reset_lifetime(c);
+	return n;
+}
+
+static int wss_async_write(struct tcp_connection* con, int fd)
+{
+	int n;
+	struct tcp_async_chunk *chunk;
+
+	n = tls_mgm_api.tls_fix_read_conn(con, fd, wss_hs_tls_tout, t_dst, 0);
+	if (n < 0) {
+		LM_ERR("failed to do pre-tls handshake!\n");
+		return -1;
+	} else if (n == 0) {
+		LM_DBG("SSL accept/connect still pending!\n");
+		return 1;
+	}
+
+	tls_mgm_api.tls_update_fd(con, fd);
+
+	while ((chunk = tcp_async_get_chunk(con)) != NULL) {
+		LM_DBG("Trying to send %d bytes from chunk %p in conn %p - %d %d \n",
+				chunk->len, chunk, con, chunk->ticks, get_ticks());
+
+		n = ws_req_write(con, fd, chunk->buf, chunk->len);
+		if (n < 0) {
+			return -1;
+		}
+
+		tcp_async_update_write(con, chunk->len);
+		tcp_conn_reset_lifetime(con);
+	}
+
+	return 0;
 }
 
 static mi_response_t *wss_trace_mi(const mi_params_t *params,

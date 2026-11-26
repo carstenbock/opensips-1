@@ -2082,8 +2082,13 @@ int send_notify_request(subs_t* subs, subs_t * watcher_subs,
 						}
 						if(final_body)
 						{
-							free_fct(notify_body->s);
-							pkg_free(notify_body);
+							if (notify_body != n_body) {
+								if (free_fct)
+									free_fct(notify_body->s);
+								else
+									subs->event->free_body(notify_body->s);
+								pkg_free(notify_body);
+							}
 							notify_body= final_body;
 						}
 					}
@@ -2105,6 +2110,15 @@ jump_over_body:
 	}
 
 	/* build extra headers */
+	if (subs->event->build_notify_headers) {
+		if (notify_extra_hdrs.s) {
+			pkg_free(notify_extra_hdrs.s);
+			notify_extra_hdrs = STR_NULL;
+		}
+		if (subs->event->build_notify_headers(subs, &notify_extra_hdrs) < 0)
+			goto error;
+		extra_hdrs = &notify_extra_hdrs;
+	}
 	if( build_str_hdr( subs, notify_body?1:0, &str_hdr,
 				&ct_body, extra_hdrs?extra_hdrs:&notify_extra_hdrs)< 0 )
 	{
@@ -2134,8 +2148,8 @@ jump_over_body:
 	/* don't open new TCP connections if connection is down */
 	tcp_no_new_conn = 1;
 
-	result = tmb.t_request_within
-		(&met,                          /* method*/
+	result = run_tm_api(&tmb, t_request_within,
+		&met,                           /* method*/
 		&str_hdr,                       /* extra headers*/
 		aux_body?aux_body:notify_body,  /* body*/
 		td,                             /* dialog structure*/
@@ -2363,7 +2377,6 @@ str* create_winfo_xml(watcher_t* watchers, char* version,
 	xmlDocPtr doc = NULL;
     xmlNodePtr root_node = NULL, node = NULL;
 	xmlNodePtr w_list_node = NULL;
-	char content[200];
 	str *body= NULL;
 	char* buffer= NULL;
 	watcher_t* w;
@@ -2424,15 +2437,13 @@ str* create_winfo_xml(watcher_t* watchers, char* version,
 	w= watchers->next;
 	while(w)
 	{
-		strncpy( content,w->uri.s, w->uri.len);
-		content[ w->uri.len ]='\0';
-		node = xmlNewChild(w_list_node, NULL, BAD_CAST "watcher",
-				BAD_CAST content) ;
+		node = xmlNewChild(w_list_node, NULL, BAD_CAST "watcher", NULL) ;
 		if( node ==NULL)
 		{
 			LM_ERR("while adding child\n");
 			goto error;
 		}
+		xmlNodeSetContentLen(node, BAD_CAST w->uri.s, w->uri.len);
 		if(xmlNewProp(node, BAD_CAST "id", BAD_CAST w->id.s)== NULL)
 		{
 			LM_ERR("while adding new attribute\n");
@@ -2466,8 +2477,6 @@ str* create_winfo_xml(watcher_t* watchers, char* version,
 
 	xmlCleanupParser();
 
-    xmlMemoryDump();
-
     return body;
 
 error:
@@ -2475,4 +2484,3 @@ error:
 		xmlFreeDoc(doc);
 	return NULL;
 }
-

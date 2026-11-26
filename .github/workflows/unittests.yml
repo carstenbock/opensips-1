@@ -4,9 +4,25 @@ name: Unit Tests
 
 # Controls when the action will run. 
 on:
-  # Triggers the workflow on all push or pull request events
+  # Triggers the workflow on push or pull request events touching source
   push:
+    paths:
+      - '**/Makefile*'
+      - '**/*.c'
+      - '**/*.cpp'
+      - '**/*.h'
+      - 'cfg.y'
+      - 'cfg.lex'
+      - 'scripts/**'
   pull_request:
+    paths:
+      - '**/Makefile*'
+      - '**/*.c'
+      - '**/*.cpp'
+      - '**/*.h'
+      - 'cfg.y'
+      - 'cfg.lex'
+      - 'scripts/**'
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
@@ -18,23 +34,21 @@ jobs:
     # The type of runner that the job will run on
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:${{ matrix.os }}
+      image: ghcr.io/opensips/ubuntu-ci:${{ matrix.os }}
       options: >-
         -v sources:/__w/${{ github.event.repository.name }}/${{ github.event.repository.name }}
     env:
       COMPILER: ${{ matrix.compiler }}
       BUILD_OS: ubuntu:${{ matrix.os }}
+      # Focal's wolfSSL lacks the custom-OID APIs needed for TNAuthList.
+      STIR_SHAKEN_OPENSSL: ${{ matrix.os == '20.04' && '1' || '' }}
 
     strategy:
       fail-fast: false
       matrix:
-        os: [22.04]
-        compiler: ['gcc', 'clang', 'gcc-11', 'gcc-12', 'clang-11', 'clang-12', 'clang-13', 'clang-14', 'clang-15', 'gcc-arm64-qemu-cross', 'gcc-arm32-qemu-cross', 'clang-arm64-qemu-cross', 'clang-arm32-qemu-cross']
+        os: [20.04, 22.04, 24.04, 26.04]
+        compiler: ['gcc', 'clang']
         include:
-          - os: 20.04
-            compiler: 'gcc'
-          - os: 20.04
-            compiler: 'clang'
           - os: 20.04
             compiler: 'gcc-9'
           - os: 20.04
@@ -59,21 +73,46 @@ jobs:
             compiler: 'clang-18'
           - os: 24.04
             compiler: 'clang-19'
+          - os: 22.04
+            compiler: 'gcc-11'
+          - os: 22.04
+            compiler: 'gcc-12'
+          - os: 22.04
+            compiler: 'clang-11'
+          - os: 22.04
+            compiler: 'clang-12'
+          - os: 22.04
+            compiler: 'clang-13'
+          - os: 22.04
+            compiler: 'clang-14'
+          - os: 22.04
+            compiler: 'clang-15'
+          - os: 22.04
+            compiler: 'gcc-arm64-qemu-cross'
+          - os: 22.04
+            compiler: 'gcc-arm32-qemu-cross'
+          - os: 22.04
+            compiler: 'clang-arm64-qemu-cross'
+          - os: 22.04
+            compiler: 'clang-arm32-qemu-cross'
+          - os: 26.04
+            compiler: 'gcc-14'
+          - os: 26.04
+            compiler: 'clang-18'
+          - os: 26.04
+            compiler: 'clang-19'
+          - os: 26.04
+            compiler: 'clang-20'
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      - name: Install git
-        run: |
-          apt-get update
-          apt-get install -y git lsb-release gnupg2 wget
-
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
       - name: Cache the compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         if: endsWith(matrix.compiler, '-qemu-cross')
         with:
           path: ccache
@@ -86,9 +125,15 @@ jobs:
         run: sh -x scripts/build/start_container.sh
 
       - name: Install dependencies
-        run: |
-          sh -x scripts/build/reset_sources.sh
-          sh -x scripts/build/install_depends.sh
+        run: sh -x scripts/build/install_depends.sh
+
+      # The NATS modules (modules-contrib/) need libnats >= 3.14, which no
+      # Ubuntu release ships; without it they build nothing and their suites
+      # are skipped.  The cross legs build in another container: there the
+      # script skips itself and so do the suites.
+      - name: Install libnats
+        if: ${{ !endsWith(matrix.compiler, '-cross') }}
+        run: sh -x scripts/build/install_libnats.sh
 
       - name: Get libtap
         run: git clone https://github.com/zorgnax/libtap.git lib/libtap
@@ -112,12 +157,44 @@ jobs:
           MAKE_TGT: 'test'
         run: script -e unit_tests.log -c 'sh -x scripts/build/do_build.sh DEFS_EXTRA_OPTS="-DUNIT_TESTS -fPIE -fPIC"'
 
+      # -k reports every failing suite instead of stopping at the first one.
+      - name: Run module tests
+        id: module_tests
+        env:
+          MAKE_TGT: '-k test-modules'
+        run: script -e module_tests.log -c 'sh -x scripts/build/do_build.sh DEFS_EXTRA_OPTS="-DUNIT_TESTS -fPIE -fPIC"'
+
+      # -k names each failing target as it goes, but that line scrolls past in
+      # the middle of the remaining suites' output.  Restate the failures at
+      # the end of the log, where one looks first.
+      - name: Report failing module suites
+        if: ${{ failure() && steps.module_tests.conclusion == 'failure' }}
+        run: |
+          tr -d '\r' <module_tests.log | awk '
+            /^ *====   [^ ]+   ====$/ { suite = $2 }
+            /^not ok|^#   Failed test at/ { print suite ": " $0; bad[suite] = 1 }
+            # A suite that dies without reporting a single assertion (a crash
+            # while parsing its config, say) shows up only as a make failure.
+            /^make: \*\*\* \[.*test-/ {
+              t = $0; sub(/.*: test-/, "", t); sub(/\].*/, "", t); bad[t] = 1
+            }
+            END {
+              for (s in bad)
+                list = list " " s
+              if (list == "")
+                list = " (none reported - see the log above)"
+              print "::error title=Failing module suites::" substr(list, 2)
+            }'
+
       - name: Collect test logs
-        uses: actions/upload-artifact@v4
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
           name: unit_tests-logs_${{ matrix.os }}_${{ matrix.compiler }}
+          if-no-files-found: ignore
           path: |
             unit_tests.log
+            module_tests.log
 
   all_done:
     needs: build_and_test
@@ -125,4 +202,6 @@ jobs:
     with:
       job_name: "Unit Tests"
       job_result: ${{ needs.build_and_test.result }}
-    if: ${{ always() }}
+    secrets:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+    if: ${{ always() && !cancelled() }}

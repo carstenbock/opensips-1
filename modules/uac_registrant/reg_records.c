@@ -48,6 +48,126 @@ static char call_id_ftag_buf[MD5_LEN];
 int send_unregister(unsigned int hash_index, reg_record_t *rec, str *auth_hdr,
 	unsigned int all_contacts);
 
+enum reg_stat_filter {
+	REG_STAT_ALL,
+	REG_STAT_ENABLED,
+	REG_STAT_REGISTERED,
+	REG_STAT_FAILED
+};
+
+static int count_registrant(void *e_data, void *data, void *r_data)
+{
+	unsigned long *count = (unsigned long *)data;
+
+	(*count)++;
+	return 0;
+}
+
+static int count_enabled_registrant(void *e_data, void *data, void *r_data)
+{
+	reg_record_t *rec = (reg_record_t *)e_data;
+	unsigned long *count = (unsigned long *)data;
+
+	if (rec->flags & REG_ENABLED)
+		(*count)++;
+	return 0;
+}
+
+static int count_registered_registrant(void *e_data, void *data, void *r_data)
+{
+	reg_record_t *rec = (reg_record_t *)e_data;
+	unsigned long *count = (unsigned long *)data;
+
+	if ((rec->flags & REG_ENABLED) && rec->state == REGISTERED_STATE)
+		(*count)++;
+	return 0;
+}
+
+static int count_failed_registrant(void *e_data, void *data, void *r_data)
+{
+	reg_record_t *rec = (reg_record_t *)e_data;
+	unsigned long *count = (unsigned long *)data;
+
+	if ((rec->flags & REG_ENABLED) &&
+		(rec->state == REGISTER_TIMEOUT_STATE ||
+		 rec->state == INTERNAL_ERROR_STATE ||
+		 rec->state == WRONG_CREDENTIALS_STATE ||
+		 rec->state == REGISTRAR_ERROR_STATE))
+		(*count)++;
+	return 0;
+}
+
+static unsigned long get_registrant_count(enum reg_stat_filter filter)
+{
+	slinkedl_run_data_f *count_handler;
+	unsigned long count = 0;
+	unsigned int i;
+	int ret;
+
+	if (!reg_htable)
+		return 0;
+
+	switch (filter) {
+	case REG_STAT_ALL:
+		count_handler = count_registrant;
+		break;
+	case REG_STAT_ENABLED:
+		count_handler = count_enabled_registrant;
+		break;
+	case REG_STAT_REGISTERED:
+		count_handler = count_registered_registrant;
+		break;
+	case REG_STAT_FAILED:
+		count_handler = count_failed_registrant;
+		break;
+	default:
+		LM_ERR("invalid registrant statistic filter %d\n", filter);
+		return 0;
+	}
+
+	for (i = 0; i < reg_hsize; i++) {
+		lock_get(&reg_htable[i].lock);
+		ret = slinkedl_traverse(reg_htable[i].p_list,
+			count_handler, &count, NULL);
+		lock_release(&reg_htable[i].lock);
+
+		if (ret < 0) {
+			LM_ERR("failed to count registrants in bucket %u\n", i);
+			break;
+		}
+	}
+
+	return count;
+}
+
+static unsigned long get_total_registrants(void *unused)
+{
+	return get_registrant_count(REG_STAT_ALL);
+}
+
+static unsigned long get_enabled_registrants(void *unused)
+{
+	return get_registrant_count(REG_STAT_ENABLED);
+}
+
+static unsigned long get_registered_registrants(void *unused)
+{
+	return get_registrant_count(REG_STAT_REGISTERED);
+}
+
+static unsigned long get_failed_registrants(void *unused)
+{
+	return get_registrant_count(REG_STAT_FAILED);
+}
+
+const stat_export_t reg_stats[] = {
+	{"registrants", STAT_IS_FUNC, (stat_var **)get_total_registrants},
+	{"enabled_registrants", STAT_IS_FUNC, (stat_var **)get_enabled_registrants},
+	{"registered_registrants", STAT_IS_FUNC, (stat_var **)get_registered_registrants},
+	{"failed_registrants", STAT_IS_FUNC, (stat_var **)get_failed_registrants},
+	{0, 0, 0}
+};
+
 int reg_build_sr_identifier(const str *aor, const str *contact,
 	const str *registrar, str *ident)
 {
@@ -89,12 +209,13 @@ int reg_build_sr_identifier(const str *aor, const str *contact,
 }
 
 void reg_print_record(reg_record_t *rec) {
-	LM_DBG("checking uac=[%p] state=[%d][%.*s] expires=[%d]"
+	LM_DBG("checking uac=[%p] state=[%d][%.*s] expires=[%d/%d]"
 			" last_register_sent=[%d] registration_timeout=[%d]"
 			" auth_user[%p][%d]->[%.*s] auth_password=[%p][%d]->[%.*s]"
 			" sock=[%p] clustering=[%.*s/%d] enabled=[%s]\n",
 		rec, rec->state,
-		uac_reg_state[rec->state].len, uac_reg_state[rec->state].s, rec->expires,
+		uac_reg_state[rec->state].len, uac_reg_state[rec->state].s,
+		rec->expires, rec->wanted_expires,
 		(unsigned int)rec->last_register_sent, (unsigned int)rec->registration_timeout,
 		rec->auth_user.s, rec->auth_user.len, rec->auth_user.len, rec->auth_user.s,
 		rec->auth_password.s, rec->auth_password.len,
@@ -244,6 +365,7 @@ int add_record(uac_reg_map_t *uac, str *now, unsigned int mode,
 
 	memset(record, 0, size);
 
+	record->wanted_expires = uac->expires;
 	record->expires = uac->expires;
 
 	td = &(record->td);
@@ -409,6 +531,7 @@ int init_reg_htable(void) {
 		}
 		reg_htable[i].s_list = NULL;
 	}
+
 	return 0;
 }
 

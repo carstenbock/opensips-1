@@ -42,9 +42,15 @@ struct last_real_ports {
 	unsigned short remote;
 };
 
+struct socket_info_ref {
+	const struct socket_info *si;
+	struct socket_info_ref *next;
+};
+
 struct socket_info {
 	int socket;
 	str name; /*!< name - eg.: foo.bar or 10.0.0.1 */
+	str orig_name; /*!< original configured name (optional) */
 	str tag;  /* the tag of the interface, use only in OpenSIPS ecosystem */
 	struct ip_addr address; /*!< ip address */
 	str address_str;        /*!< ip address converted to string -- optimization*/
@@ -61,9 +67,19 @@ struct socket_info {
 	struct ip_addr adv_address; /* Advertised address in ip_addr form (for find_si) */
 	unsigned short adv_port;    /* optimization for grep_sock_info() */
 	unsigned short workers;
+	/* udp_rx_mode=reuseport: one SO_REUSEPORT socket per worker, all created
+	 * and bound by the attendant before forking; [0] is the same fd as
+	 * 'socket'. Worker i swaps 'socket' for worker_socks[i] in its own (pkg)
+	 * copy. NULL when the listener uses the single shared socket. With an
+	 * auto-scaling profile there is one socket per possible worker and the
+	 * shm slot table (net_udp.c) says which ones currently have a reader. */
+	int *worker_socks;
+	int worker_socks_no;
+	void *worker_slots;
 	unsigned short tos;
 	struct scaling_profile *s_profile;
 	void *extra_data;
+	struct socket_info_ref *bond_sis;
 	enum sip_protos internal_proto;
 
 	/* these are IP-level local/remote ports used during the last write op via
@@ -96,7 +112,8 @@ struct socket_info_full {
 #define PROTO_NAME_MAX_SIZE  8 /* CHANGEME if you define a bigger protocol name
 						   * currently hep_tcp - biggest proto */
 
-int new_sock2list(struct socket_id *sid, struct socket_info_full** list);
+int new_sock2list(struct socket_id *sid, str *orig_name,
+		struct socket_info_full** list);
 
 int fix_socket_list(struct socket_info_full **);
 
@@ -156,6 +173,8 @@ const struct socket_info* grep_sock_info_ext(str* host, unsigned short port,
 										unsigned short proto, int check_tag);
 
 const struct socket_info* parse_sock_info(str *spec);
+struct socket_info_full* grep_sock_by_orig_name(unsigned short proto, str *host,
+		unsigned short port, struct socket_info_full *resume);
 
 const struct socket_info* find_si(const struct ip_addr* ip, unsigned short port,
 												unsigned short proto);
@@ -212,7 +231,7 @@ inline static int parse_proto(unsigned char* s, long len, int* proto)
 
 	/* must support 2-char arrays for ws
 	 * must support 3-char arrays for udp, tcp, tls, wss
-	 * must support 4-char arrays for sctp
+	 * must support 4-char arrays for sctp and bond
 	 * must support 5-char arrays for ipsec
 	 * must support 7-char arrays for hep_tcp and hep_udp */
 	*proto=PROTO_NONE;
@@ -282,6 +301,11 @@ inline static int parse_proto(unsigned char* s, long len, int* proto)
 				if ((s[3]=='p' || s[3]=='P') && (s[4]=='s' || s[4]=='S')) {
 					*proto=PROTO_MSRPS; return 0;
 				}
+			}
+			break;
+		case PROTO2UINT('b', 'o', 'n'):
+			if(len==4 && (s[3]=='d' || s[3]=='D')) {
+				*proto=PROTO_BOND; return 0;
 			}
 			break;
 		default:
@@ -559,8 +583,10 @@ static inline char *proto2a(int proto)
 }
 
 
-#define MAX_SOCKET_STR ( 4 + 1 + IP_ADDR_MAX_STR_SIZE+1+INT2STR_MAX_LEN+1)
-#define sock_str_len(_sock,_type) (3 + 1*((_sock)->proto==PROTO_SCTP) + 1 + \
+/* proto:name:port, where name is an IP, an advertised hostname (up to 255
+ * chars, RFC 1035) or a tag; the proto is budgeted at its longest name */
+#define MAX_SOCKET_STR (PROTO_NAME_MAX_SIZE + 1 + 255 + 1 + INT2STR_MAX_LEN + 1)
+#define sock_str_len(_sock,_type) (PROTO_NAME_MAX_SIZE + 1 + \
 		(((_type)==0) ? (_sock)->address_str.len + (_sock)->port_no_str.len + 1 : \
 				(((_type)==1) ? (_sock)->adv_name_str.len + (_sock)->adv_port_str.len + 1 : \
 						(_sock)->tag.len)))
@@ -584,6 +610,10 @@ static inline char* socket2str(const struct socket_info *sock, char *s, int *len
 		}
 		p = p1 = s;
 	} else {
+		if ( sock_str_len(sock,type) > (int)sizeof(buf) ) {
+			LM_ERR("socket name too long\n");
+			return 0;
+		}
 		p = p1 = buf;
 	}
 
@@ -631,7 +661,8 @@ int probe_max_sock_buff( int sock, int buff_choice, int buff_max,
 		int buff_increment);
 
 struct socket_id *socket_info2id(struct socket_info *si);
-struct socket_info_full* new_sock_info( struct socket_id *sid);
+struct socket_info_full* new_sock_info(struct socket_id *sid, str *orig_name);
+int fix_bond_socket_list(struct socket_id *list);
 void push_sock2list(struct socket_info_full *si);
 void pop_sock2list(struct socket_info_full *si);
 void free_sock_info(struct socket_info_full* si);

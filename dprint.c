@@ -69,6 +69,8 @@ static char *log_json_buf = NULL;
 int log_json_buf_size = 6144;
 static char *log_msg_buf = NULL;
 int log_msg_buf_size = 4096;
+/* seconds between two logs of the same LMR_* call site */
+int log_ratelimit_period = 1;
 
 str log_cee_hostname;
 
@@ -96,6 +98,7 @@ int log_consumers_no = 2;
 
 int log_event_enabled = 0;
 int log_event_level_filter = 0;
+int parse_err_log_level = L_ERR;
 static str evi_log_name = str_init("E_CORE_LOG");
 static event_id_t evi_log_id;
 
@@ -944,6 +947,14 @@ void cleanup_log_level(void)
 
 void reset_proc_log_level(void)
 {
+	/* Before init_log_level() runs - e.g. from a module's mod_init(), which
+	 * is invoked well before init_multi_proc_support() - default_log_level
+	 * is still NULL, so fall back to the value logging started with. */
+	if (!default_log_level) {
+		*log_level = log_level_holder;
+		return;
+	}
+
 	*log_level = *default_log_level;
 }
 
@@ -954,11 +965,26 @@ void reset_proc_log_level(void)
  */
 void __set_proc_log_level(int proc_idx, int level)
 {
+	/* The process table is allocated by init_multi_proc_support(), which runs
+	 * after init_modules() - so pt is NULL during every module's mod_init().
+	 * There is only one process at that point and log_level already points at
+	 * the static holder, so honour the request instead of crashing. */
+	if (!pt) {
+		*log_level = level;
+		return;
+	}
+
 	pt[proc_idx].log_level = level;
 }
 
 void __set_proc_default_log_level(int proc_idx, int level)
 {
+	/* see __set_proc_log_level() - pt does not exist yet during mod_init() */
+	if (!pt) {
+		log_level_holder = level;
+		return;
+	}
+
 	pt[proc_idx].default_log_level = level;
 }
 
@@ -971,6 +997,16 @@ void set_global_log_level(int level)
 		__set_proc_default_log_level(i, level);
 		__set_proc_log_level(i, level);
 	}
+
+	/* allocated by init_log_level(); before that there is nothing shared to
+	 * update, and counted_max_processes is still 0 so the loop above was a
+	 * no-op - apply the level to this process instead */
+	if (!log_level_global) {
+		__set_proc_default_log_level(0, level);
+		__set_proc_log_level(0, level);
+		return;
+	}
+
 	*log_level_global = level;
 }
 
@@ -982,10 +1018,18 @@ void set_proc_log_level(int level)
 
 void suppress_proc_log_event(void)
 {
+	/* no process table yet (mod_init) - nothing to suppress, and the event
+	 * consumer it guards is not running either */
+	if (!pt)
+		return;
+
 	pt[process_no].suppress_log_event = 1;
 }
 
 void reset_proc_log_event(void)
 {
+	if (!pt)
+		return;
+
 	pt[process_no].suppress_log_event = 0;
 }

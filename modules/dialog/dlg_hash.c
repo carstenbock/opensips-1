@@ -382,6 +382,7 @@ int dlg_clone_callee_leg(struct dlg_cell *dlg, int cloned_leg_idx)
 		return -1;
 	src_leg = &dlg->legs[cloned_leg_idx];
 	leg = &dlg->legs[dlg->legs_no[DLG_LEGS_USED]];
+	leg->branch_id = src_leg->branch_id;
 
 	if (shm_str_dup(&leg->adv_contact, &src_leg->adv_contact) != 0) {
 		LM_ERR("oom contact\n");
@@ -414,6 +415,7 @@ static inline int translate_contact_ipport( str *ct, const struct socket_info *s
 	if ((p=q_memchr(ct->s, ':', ct->len))==NULL) {
 		LM_ERR("failed find hdr body in "
 			"advertised contact <%.*s>\n", ct->len, ct->s);
+		return -1;
 	}
 
 	memset( &ct_hdr, 0, sizeof(ct_hdr));
@@ -554,7 +556,8 @@ int dlg_update_leg_info(int leg_idx, struct dlg_cell *dlg, str* tag, str *rr,
 			}
 			rrp = head;
 			leg->nr_uris = 0;
-			while (rrp) {
+			while (rrp && leg->nr_uris <
+					(int)(sizeof(leg->route_uris) / sizeof(leg->route_uris[0]))) {
 				leg->route_uris[leg->nr_uris++] = rrp->nameaddr.uri;
 				rrp = rrp->next;
 			}
@@ -761,7 +764,9 @@ int dlg_update_routing(struct dlg_cell *dlg, unsigned int leg,
 		}
 		rrp = head;
 		dlg->legs[leg].nr_uris = 0;
-		while (rrp) {
+		while (rrp && dlg->legs[leg].nr_uris <
+				(int)(sizeof(dlg->legs[leg].route_uris) /
+					 sizeof(dlg->legs[leg].route_uris[0]))) {
 			dlg->legs[leg].route_uris[dlg->legs[leg].nr_uris++] = rrp->nameaddr.uri;
 			rrp = rrp->next;
 		}
@@ -1123,6 +1128,13 @@ static void raise_state_changed_event(struct dlg_cell *dlg,
 	str db_id;
 
 	if (!evi_probe_event(ei_st_ch_id))
+		return;
+
+	/* raise_events_as_backup=0: a replicated dialog whose sharing tag is
+	 * BACKUP here belongs to the active peer, which raises the event itself;
+	 * skip it here (dialogs without a sharing tag are raised as before) */
+	if (!raise_events_as_backup && dialog_repl_cluster &&
+			get_shtag_state(dlg) == SHTAG_STATE_BACKUP)
 		return;
 
 	if (evi_param_set_str(id_p, did) < 0) {
@@ -1551,6 +1563,13 @@ static inline int internal_mi_print_dlg(mi_item_t *dialog_obj,
 						goto error;
 					}
 
+				} else if (dv->type == DLG_VAL_TYPE_BOOL) {
+					values_item = add_mi_object(values_arr, NULL, 0);
+					if (!values_item)
+						goto error;
+					if (add_mi_bool(values_item,dv->name.s,dv->name.len,
+						dv->val.n) < 0)
+						goto error;
 				} else {
 					values_item = add_mi_object(values_arr, NULL, 0);
 					if (!values_item)
@@ -1904,11 +1923,12 @@ mi_response_t *mi_set_dlg_profile(const mi_params_t *params,
 		&profile_name.s, &profile_name.len) < 0)
 		return init_mi_param_error();
 
-	get_mi_string_param(params, "value",
-		&profile_value.s, &profile_value.len);
+	if (try_get_mi_string_param(params, "value",
+			&profile_value.s, &profile_value.len) == -2)
+		return init_mi_param_error();
 
-	get_mi_int_param(params, "clear_values",
-		&clear_values);
+	if (try_get_mi_int_param(params, "clear_values", &clear_values) == -2)
+		return init_mi_param_error();
 
 	profile = search_dlg_profile(&profile_name);
 	if (!profile) {
@@ -1998,8 +2018,9 @@ mi_response_t *mi_unset_dlg_profile(const mi_params_t *params,
 		&profile_name.s, &profile_name.len) < 0)
 		return init_mi_param_error();
 
-	get_mi_string_param(params, "value",
-		&profile_value.s, &profile_value.len);
+	if (try_get_mi_string_param(params, "value",
+			&profile_value.s, &profile_value.len) == -2)
+		return init_mi_param_error();
 
 	profile = search_dlg_profile(&profile_name);
 	if (!profile) {

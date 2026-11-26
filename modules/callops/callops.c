@@ -207,7 +207,7 @@ static const param_export_t params[] = {
 };
 
 static const mi_export_t mi_cmds[] = {
-	{ "call_transfer", 0, 0, 0, {
+	{ "transfer", 0, 0, 0, {
 		{mi_call_blind_transfer, {"callid", "leg", "destination", 0}},
 		{mi_call_attended_transfer,
 			{"callid", "leg", "transfer_callid", "transfer_leg", 0}},
@@ -217,19 +217,19 @@ static const mi_export_t mi_cmds[] = {
 		{mi_call_attended_transfer,
 			{"callid", "leg", "transfer_callid", "transfer_fromtag",
 				"transfer_totag", "transfer_destination", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"call_transfer", 0}
 	},
-	{ "call_hold", 0, 0, 0, {
+	{ "hold", 0, 0, 0, {
 		{mi_call_hold, {"callid", 0}},
 		{mi_call_hold, {"callid", "leg", 0}},
 		{mi_call_hold, {"callid", "leg", "headers", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"call_hold", 0}
 	},
-	{ "call_unhold", 0, 0, 0, {
+	{ "unhold", 0, 0, 0, {
 		{mi_call_unhold, {"callid", 0}},
 		{mi_call_unhold, {"callid", "leg", 0}},
 		{mi_call_unhold, {"callid", "leg", "headers", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"call_unhold", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };
@@ -358,20 +358,28 @@ static void call_transfer_dlg_unref(void *p)
 static inline void call_transfer_raise(struct dlg_cell *dlg, str *callid, str *ruri,
 		str *state, str *status)
 {
-	/* XXX: old leg is caller or callee, so it should be safe to use a buffer
-	 * of 6 bytes */
-	char buf[sizeof("caller")];
 	int_str old_leg;
 	int val_type;
+	int fetched = 0;
 
-	old_leg.s = str_init(buf);
+	old_leg.s = STR_NULL;
 
 	if (call_dlg_api.fetch_dlg_value(dlg, &call_transfer_param, &val_type,
-		&old_leg, 1) < 0)
+		&old_leg, 1) >= 0) {
+		if (val_type != DLG_VAL_TYPE_STR) {
+			LM_ERR("invalid call transfer leg value type %d\n", val_type);
+			old_leg.s = empty_str;
+		} else {
+			fetched = 1;
+		}
+	} else {
 		init_str(&old_leg.s, "unknown");
+	}
 
 	RAISE_CALL_EVENT(TRANSFER, &dlg->callid, &old_leg.s,
 			callid, ruri, state, status, NULL);
+	if (fetched)
+		pkg_free(old_leg.s.s);
 }
 
 static void call_transfer_reply(struct cell *t, int type, struct tmcb_params *ps)
@@ -823,7 +831,7 @@ static int call_handle_notify(struct dlg_cell *dlg, struct sip_msg *msg)
 reply:
 	status.s = error_text(status_code);
 	status.len = strlen(status.s);
-	if (call_tm_api.t_reply(msg, status_code, &status) < 0)
+	if (run_tm_api(&call_tm_api, t_reply, msg, status_code, &status) < 0)
 		return -1;
 	return 0;
 }
@@ -918,7 +926,7 @@ static mi_response_t *mi_call_blind_transfer(const mi_params_t *params,
 				call_transfer_dlg_callback, 0, 0);
 	}
 
-	if (call_dlg_api.send_indialog_request(dlg, &refer,
+	if (run_dlg_api(&call_dlg_api, send_indialog_request, dlg, &refer,
 			(caller?DLG_CALLER_LEG:callee_idx(dlg)), NULL, NULL, refer_hdr,
 			mi_call_transfer_reply, async_hdl, NULL) < 0) {
 		LM_ERR("could not send the transfer message!\n");
@@ -1054,7 +1062,7 @@ static mi_response_t *mi_call_attended_transfer(const mi_params_t *params,
 	}
 
 	isval.s = legA;
-	call_dlg_api.store_dlg_value(dlgA, &call_transfer_param, &isval, 
+	call_dlg_api.store_dlg_value(dlgA, &call_transfer_param, &isval,
 		DLG_VAL_TYPE_STR);
 	/* register callbacks for handling notifies - does not matter if this
 	 * fails, its not like we won't transfer if we don't get the notifications
@@ -1063,7 +1071,7 @@ static mi_response_t *mi_call_attended_transfer(const mi_params_t *params,
 		call_dlg_api.register_dlgcb(dlgA, DLGCB_REQ_WITHIN,
 				call_transfer_dlg_callback, 0, 0);
 
-	if (call_dlg_api.send_indialog_request(dlgA, &refer,
+	if (run_dlg_api(&call_dlg_api, send_indialog_request, dlgA, &refer,
 			(callerA?DLG_CALLER_LEG:callee_idx(dlgA)), NULL, NULL, refer_hdr,
 			mi_call_transfer_reply, async_hdl, NULL) < 0) {
 		LM_ERR("could not send the transfer message!\n");
@@ -1215,7 +1223,7 @@ static int call_put_leg_onhold(struct dlg_cell *dlg, int leg, unsigned mode, str
 	RAISE_CALL_EVENT(HOLD, &dlg->callid, &sleg, &action, &state, NULL);
 
 	/* send it out */
-	ret = call_dlg_api.send_indialog_request(dlg, &invite, leg, &body, &ct,
+	ret = run_dlg_api(&call_dlg_api, send_indialog_request, dlg, &invite, leg, &body, &ct,
 			hdrs, mi_call_hold_reply, (void *)(long)param, NULL);
 	pkg_free(body.s);
 	if (ret < 0) {
@@ -1276,7 +1284,7 @@ static int call_resume_leg_onhold(struct dlg_cell *dlg, int leg, unsigned mode, 
 	param |= mode;
 
 	RAISE_CALL_EVENT(HOLD, &dlg->callid, &sleg, &action, &state, NULL);
-	if (call_dlg_api.send_indialog_request(dlg, &invite, leg, &body, &ct,
+	if (run_dlg_api(&call_dlg_api, send_indialog_request, dlg, &invite, leg, &body, &ct,
 			hdrs, mi_call_hold_reply, (void *)(long)param, NULL) < 0) {
 		init_str(&state, "fail");
 		RAISE_CALL_EVENT(HOLD, &dlg->callid, &sleg, &action, &state, NULL);
@@ -1533,7 +1541,7 @@ static int w_call_blind_transfer(struct sip_msg *req, int leg, str *dst)
 				call_transfer_dlg_callback, 0, 0);
 	}
 
-	if (call_dlg_api.send_indialog_request(dlg, &refer,
+	if (run_dlg_api(&call_dlg_api, send_indialog_request, dlg, &refer,
 			(leg == DLG_CALLER_LEG?DLG_CALLER_LEG:callee_idx(dlg)), NULL, NULL,
 			refer_hdr, mi_call_transfer_reply, NULL, NULL) < 0) {
 		LM_ERR("could not send the transfer message!\n");
@@ -1620,7 +1628,7 @@ static int w_call_attended_transfer(struct sip_msg *req, int leg,
 		call_dlg_api.register_dlgcb(dlgA, DLGCB_REQ_WITHIN,
 				call_transfer_dlg_callback, 0, 0);
 
-	if (call_dlg_api.send_indialog_request(dlgA, &refer,
+	if (run_dlg_api(&call_dlg_api, send_indialog_request, dlgA, &refer,
 			(leg == DLG_CALLER_LEG?DLG_CALLER_LEG:callee_idx(dlgA)), NULL, NULL,
 			refer_hdr, mi_call_transfer_reply, NULL, NULL) < 0) {
 		LM_ERR("could not send the transfer message!\n");

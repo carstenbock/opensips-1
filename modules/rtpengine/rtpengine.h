@@ -27,6 +27,7 @@
 #define _RTPENGINE_H
 
 #include "bencode.h"
+#include "../../ip_addr.h"
 #include "../../str.h"
 
 /* flags for set, node, and socket management */
@@ -46,7 +47,7 @@ struct rtpe_node {
 	unsigned int		rn_last_ticks;
 	int					rn_flags;
 	socklen_t       ai_addrlen;
-	struct sockaddr ai_addr;
+	union sockaddr_union ai_addr;
 
 	struct rtpe_node	*rn_next;
 };
@@ -85,5 +86,42 @@ struct rtpe_version_head{
 };
 
 #define RTPENGINE_TABLE_VERSION 1
+
+enum rtpe_operation {
+	OP_OFFER = 1,
+	OP_ANSWER,
+	OP_DELETE,
+	OP_START_RECORDING,
+	OP_STOP_RECORDING,
+	OP_PAUSE_RECORDING,
+	OP_QUERY,
+	OP_START_MEDIA,
+	OP_STOP_MEDIA,
+	OP_BLOCK_MEDIA,
+	OP_UNBLOCK_MEDIA,
+	OP_BLOCK_DTMF,
+	OP_UNBLOCK_DTMF,
+	OP_START_FORWARD,
+	OP_STOP_FORWARD,
+	OP_PLAY_DTMF,
+	OP_SUBSCRIBE_REQUEST,
+	OP_SUBSCRIBE_ANSWER,
+	OP_UNSUBSCRIBE,
+	OP_ROLLBACK,
+	OP_PUBLISH,
+};
+
+struct ng_flags_parse {
+	int via, to, packetize, transport, directional, no_from_tag;
+	int source_selector; /* subscribe request: all, from-tags= or label= */
+	bencode_item_t *dict, *flags, *direction, *replace, *rtcp_mux;
+	str call_id, from_tag, to_tag, received_from;
+	str viabranch;
+};
+
+struct sip_msg;
+int rtpe_function_call_prepare(bencode_buffer_t *bencbuf, struct sip_msg *msg,
+		enum rtpe_operation op, struct ng_flags_parse *ng_flags, str *flags_str,
+		str *body_in, bencode_item_t *extra_dict, char **err);
 
 #endif

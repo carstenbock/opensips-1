@@ -201,7 +201,8 @@ static inline char* parse_to_param(char *buffer, char *end,
 						goto parse_error;
 				}
 				break;
-			case  0:
+			case 0:
+				goto parse_error;
 			case ',':
 				switch (status)
 				{
@@ -236,6 +237,8 @@ static inline char* parse_to_param(char *buffer, char *end,
 							goto parse_error;
 						switch (*(tmp+1))
 						{
+							case 0:
+								goto parse_error;
 							case '\r':
 							case '\n':
 								break;
@@ -449,14 +452,14 @@ static inline char* parse_to_param(char *buffer, char *end,
 						/*previous=crlf and now !=' '*/
 						goto endofheader;
 					default:
-						LM_ERR("spitting out [%c] in status %d\n",*tmp,status );
+						LM_PARSE("spitting out [%c] in status %d\n",*tmp,status );
 						goto error;
 				}
 		}/*switch*/
 	}/*for*/
 
 	if (status==PARA_VALUE_QUOTED) {
-			LM_ERR("unexpected end of header in state %d\n", status);
+			LM_PARSE("unexpected end of header in state %d\n", status);
 			goto parse_error;
 	}
 
@@ -478,7 +481,7 @@ endofheader:
 	return tmp;
 
 parse_error:
-	LM_ERR("unexpected char [%c] in status %d: <<%.*s>> .\n",
+	LM_PARSE("unexpected char [%c] in status %d: <<%.*s>> .\n",
 	    tmp < end? *tmp : *(end-1),status, (int)(tmp-buffer), ZSW(buffer));
 error:
 	if (param) pkg_free(param);
@@ -540,6 +543,7 @@ static inline char* _parse_to(char* buffer, char *end, struct to_body *to_b,
 					case URI_OR_TOKEN:
 						end_mark = tmp;
 						status = MAYBE_URI_END;
+						/* fall through */
 					case MAYBE_URI_END:
 					case DISPLAY_TOKEN:
 					case DISPLAY_TOKEN2:
@@ -584,19 +588,7 @@ static inline char* _parse_to(char* buffer, char *end, struct to_body *to_b,
 				}
 				break;
 			case 0:
-				switch (status)
-				{
-					case URI_OR_TOKEN:
-					case MAYBE_URI_END:
-						to_b->uri.len = tmp - to_b->uri.s;
-						/* fall through */
-					case END:
-						saved_status = status = END;
-						goto endofheader;
-					default:
-						goto parse_error;
-				}
-				break;
+				goto parse_error;
 			case ',':
 				switch (status)
 				{
@@ -640,6 +632,8 @@ static inline char* _parse_to(char* buffer, char *end, struct to_body *to_b,
 				switch (status)
 				{
 					case DISPLAY_QUOTED:
+						if (tmp+1==end || *(tmp+1)==0)
+							goto parse_error;
 						tmp++; /* jump over next char */
 						break;
 					default:
@@ -805,7 +799,7 @@ endofheader:
 		case E_PARA_VALUE:
 			break;
 		default:
-			LM_ERR("unexpected end of header in state %d\n", status);
+			LM_PARSE("unexpected end of header in state %d\n", status);
 			goto error;
 	}
 
@@ -815,12 +809,13 @@ endofheader:
 	return tmp;
 
 parse_error:
-	LM_ERR("unexpected char [%c] in status %d: <<%.*s>> .\n",
+	LM_PARSE("unexpected char [%c] in status %d: <<%.*s>> .\n",
 	    tmp < end? *tmp : *(end-1), status, (int)(tmp-buffer), buffer);
 error:
 	first_b->error=PARSE_ERROR;
 	free_to_params(first_b);
 	free_to(first_b->next);
+	first_b->next = NULL;
 	return tmp;
 
 }

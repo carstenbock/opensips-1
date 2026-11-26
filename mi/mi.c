@@ -46,6 +46,25 @@
 static struct mi_cmd*  mi_cmds = 0;
 static int mi_cmds_no = 0;
 
+static mi_response_t *build_err_resp(int code, const char *msg, int msg_len,
+		const char *details, int details_len);
+
+#define MI_MODULE_SEP ':'
+#define MI_DEFAULT_MODULE_NAME "core"
+#define MI_PROTO_MODULE_PREFIX "proto_"
+
+struct mi_mod_group {
+	int id;
+	str_const module;
+	int start;
+	int end;
+};
+
+static struct mi_mod_group *mi_mod_groups = 0;
+static int mi_mod_groups_no = 0;
+static struct mi_cmd_alias *mi_cmd_aliases = 0;
+static int mi_cmd_aliases_no = 0;
+
 void _init_mi_sys_mem_hooks(void)
 {
 	cJSON_InitHooks(&sys_mem_hooks);
@@ -61,7 +80,7 @@ void _init_mi_pkg_mem_hooks(void)
 	cJSON_InitHooks(NULL);
 }
 
-static inline int get_mi_id( char *name, int len)
+static inline int get_mi_id(const char *name, int len)
 {
 	int n;
 	int i;
@@ -71,7 +90,7 @@ static inline int get_mi_id( char *name, int len)
 }
 
 
-static inline struct mi_cmd* lookup_mi_cmd_id(int id,char *name, int len)
+static inline struct mi_cmd* lookup_mi_cmd_id(int id, const char *name, int len)
 {
 	int i;
 
@@ -84,23 +103,401 @@ static inline struct mi_cmd* lookup_mi_cmd_id(int id,char *name, int len)
 	return 0;
 }
 
+static void mark_ambiguous_mi_cmd_name(struct mi_cmd *new_cmd)
+{
+	const char *new_local_name;
+	int new_local_len;
+	int i;
+
+	new_local_name = new_cmd->name.s + new_cmd->module.len + 1;
+	new_local_len = new_cmd->name.len - new_cmd->module.len - 1;
+
+	for (i = 0; i < mi_cmds_no - 1; i++) {
+		if (mi_cmds[i].local_id != new_cmd->local_id ||
+				mi_cmds[i].name.len - mi_cmds[i].module.len - 1 != new_local_len ||
+				memcmp(mi_cmds[i].name.s + mi_cmds[i].module.len + 1,
+					new_local_name, new_local_len) != 0)
+			continue;
+
+		mi_cmds[i].flags |= MI_LOCAL_NAME_AMBIGUOUS;
+		new_cmd->flags |= MI_LOCAL_NAME_AMBIGUOUS;
+	}
+
+}
+
+static int add_mi_cmd_alias(const char *name, int len, int cmd_idx)
+{
+	struct mi_cmd_alias *aliases;
+	int id;
+	int i;
+
+	if (!name || len <= 0)
+		return 0;
+
+	id = get_mi_id(name, len);
+	for (i = 0; i < mi_cmd_aliases_no; i++) {
+		if (mi_cmd_aliases[i].id != id ||
+				mi_cmd_aliases[i].name.len != len ||
+				memcmp(mi_cmd_aliases[i].name.s, name, len) != 0)
+			continue;
+		if (mi_cmd_aliases[i].cmd_idx == cmd_idx)
+			return 0;
+	}
+
+	aliases = (struct mi_cmd_alias *)pkg_realloc(mi_cmd_aliases,
+			(mi_cmd_aliases_no + 1) * sizeof(struct mi_cmd_alias));
+	if (!aliases) {
+		LM_ERR("no more pkg memory\n");
+		return -1;
+	}
+
+	mi_cmd_aliases = aliases;
+	mi_cmd_aliases[mi_cmd_aliases_no].id = id;
+	mi_cmd_aliases[mi_cmd_aliases_no].name.s = (char *)name;
+	mi_cmd_aliases[mi_cmd_aliases_no].name.len = len;
+	mi_cmd_aliases[mi_cmd_aliases_no].cmd_idx = cmd_idx;
+	mi_cmd_aliases_no++;
+
+	return 0;
+}
+
+static inline struct mi_cmd* lookup_mi_cmd_alias(const char *name, int len)
+{
+	struct mi_cmd *match = NULL;
+	struct mi_cmd *cmd;
+	int id;
+	int i;
+
+	id = get_mi_id(name, len);
+	for (i = 0; i < mi_cmd_aliases_no; i++) {
+		if (mi_cmd_aliases[i].id != id ||
+				mi_cmd_aliases[i].name.len != len ||
+				memcmp(mi_cmd_aliases[i].name.s, name, len) != 0)
+			continue;
+
+		cmd = &mi_cmds[mi_cmd_aliases[i].cmd_idx];
+		if (!match) {
+			match = cmd;
+			continue;
+		}
+
+		if (match != cmd)
+			return NULL;
+	}
+
+	return match;
+}
+
+static inline struct mi_cmd* lookup_mi_cmd_local(const char *name, int len,
+		int *ambiguous)
+{
+	struct mi_cmd *cmd;
+	struct mi_cmd *match = NULL;
+	int local_id;
+	int i;
+
+	if (ambiguous)
+		*ambiguous = 0;
+
+	local_id = get_mi_id(name, len);
+
+	for (i = 0; i < mi_cmds_no; i++) {
+		cmd = &mi_cmds[i];
+		if (cmd->local_id != local_id ||
+				cmd->name.len - cmd->module.len - 1 != len ||
+				memcmp(cmd->name.s + cmd->module.len + 1, name, len) != 0)
+			continue;
+
+		if ((cmd->flags & MI_LOCAL_NAME_AMBIGUOUS) || match) {
+			if (ambiguous)
+				*ambiguous = 1;
+			return NULL;
+		}
+
+		match = cmd;
+	}
+
+	return match;
+}
+
+static const char *get_mi_mod_name(const char *mod_name)
+{
+	if (!mod_name || !*mod_name)
+		return MI_DEFAULT_MODULE_NAME;
+
+	if (strncmp(mod_name, MI_PROTO_MODULE_PREFIX,
+			sizeof(MI_PROTO_MODULE_PREFIX) - 1) == 0)
+		return mod_name + sizeof(MI_PROTO_MODULE_PREFIX) - 1;
+
+	return mod_name;
+}
+
+static mi_response_t *build_ambiguous_mi_cmd_resp(const char *name, int len)
+{
+	struct mi_cmd *cmd;
+	mi_response_t *resp;
+	int *matches;
+	char *details;
+	int details_len;
+	int local_len;
+	int needed;
+	int is_local;
+	int i;
+	int n;
+	int p;
+	int j;
+
+	if (!name || len <= 0)
+		return NULL;
+
+	if (mi_cmds_no <= 1)
+		return NULL;
+
+	matches = pkg_malloc(mi_cmds_no * sizeof(int));
+	if (!matches) {
+		LM_ERR("no more pkg memory\n");
+		return build_err_resp(JSONRPC_AMBIG_METHOD_CODE,
+				MI_SSTR(JSONRPC_AMBIG_METHOD_MSG),
+				MI_SSTR("ambiguous MI command"));
+	}
+
+	is_local = (memchr(name, MI_MODULE_SEP, len) == NULL);
+	n = 0;
+	if (is_local) {
+		for (i = 0; i < mi_cmds_no; i++) {
+			cmd = &mi_cmds[i];
+			local_len = cmd->name.len - cmd->module.len - 1;
+			if (local_len != len ||
+					memcmp(cmd->name.s + cmd->module.len + 1, name, len) != 0)
+				continue;
+
+			matches[n++] = i;
+		}
+	}
+
+	for (i = 0; i < mi_cmd_aliases_no; i++) {
+		if (mi_cmd_aliases[i].name.len != len ||
+				memcmp(mi_cmd_aliases[i].name.s, name, len) != 0)
+			continue;
+
+		for (j = 0; j < n; j++)
+			if (matches[j] == mi_cmd_aliases[i].cmd_idx)
+				break;
+		if (j == n)
+			matches[n++] = mi_cmd_aliases[i].cmd_idx;
+	}
+
+	if (n < 2) {
+		pkg_free(matches);
+		return NULL;
+	}
+
+	details_len = 0;
+	for (i = 0; i < n; i++) {
+		details_len += mi_cmds[matches[i]].name.len;
+		if (i > 0)
+			details_len += 2;
+	}
+
+	needed = sizeof("supported names: ") - 1 + details_len;
+	details = pkg_malloc(needed + 1);
+	if (!details) {
+		LM_ERR("no more pkg memory\n");
+		pkg_free(matches);
+		return build_err_resp(JSONRPC_AMBIG_METHOD_CODE,
+				MI_SSTR(JSONRPC_AMBIG_METHOD_MSG),
+				MI_SSTR("ambiguous MI command"));
+	}
+
+	memcpy(details, "supported names: ", sizeof("supported names: ") - 1);
+	p = sizeof("supported names: ") - 1;
+	for (i = 0; i < n; i++) {
+		if (i > 0) {
+			details[p++] = ',';
+			details[p++] = ' ';
+		}
+
+		cmd = &mi_cmds[matches[i]];
+		memcpy(details + p, cmd->name.s, cmd->name.len);
+		p += cmd->name.len;
+	}
+
+	details[p] = '\0';
+	resp = build_err_resp(JSONRPC_AMBIG_METHOD_CODE,
+			MI_SSTR(JSONRPC_AMBIG_METHOD_MSG), details, p);
+	pkg_free(matches);
+	pkg_free(details);
+	return resp;
+}
+
+static int add_mi_mod_group(const char *mod_name, int mod_len, int start, int end)
+{
+	struct mi_mod_group *groups;
+	int mod_id;
+
+	if (start >= end)
+		return 0;
+
+	mod_id = get_mi_id(mod_name, mod_len);
+
+	if (mi_mod_groups_no > 0 &&
+			mi_mod_groups[mi_mod_groups_no - 1].id == mod_id &&
+			mi_mod_groups[mi_mod_groups_no - 1].end == start &&
+			mi_mod_groups[mi_mod_groups_no - 1].module.len == mod_len &&
+			memcmp(mi_mod_groups[mi_mod_groups_no - 1].module.s,
+				mod_name, mod_len) == 0) {
+		mi_mod_groups[mi_mod_groups_no - 1].end = end;
+		return 0;
+	}
+
+	groups = (struct mi_mod_group *)pkg_realloc(mi_mod_groups,
+			(mi_mod_groups_no + 1) * sizeof(struct mi_mod_group));
+	if (!groups) {
+		LM_ERR("no more pkg memory\n");
+		return -1;
+	}
+
+	mi_mod_groups = groups;
+	mi_mod_groups[mi_mod_groups_no].id = mod_id;
+	mi_mod_groups[mi_mod_groups_no].module.s = mod_name;
+	mi_mod_groups[mi_mod_groups_no].module.len = mod_len;
+	mi_mod_groups[mi_mod_groups_no].start = start;
+	mi_mod_groups[mi_mod_groups_no].end = end;
+	mi_mod_groups_no++;
+
+	return 0;
+}
+
+static char *build_mi_cmd_name(const char *mod_name, const char *cmd_name)
+{
+	int mod_len;
+	int cmd_len;
+	char *full_name;
+
+	mod_len = strlen(mod_name);
+	cmd_len = strlen(cmd_name);
+
+	full_name = pkg_malloc(mod_len + 1 + cmd_len + 1);
+	if (!full_name)
+		return NULL;
+
+	memcpy(full_name, mod_name, mod_len);
+	full_name[mod_len] = MI_MODULE_SEP;
+	memcpy(full_name + mod_len + 1, cmd_name, cmd_len);
+	full_name[mod_len + 1 + cmd_len] = '\0';
+
+	return full_name;
+}
+
 
 int register_mi_mod(const char *mod_name, const mi_export_t *mis)
 {
+	const char *module_name;
+	const char *const *aliases;
+	char *cmd_name;
+	int cmd_idx;
+	int mod_len;
+	int start;
 	int ret;
 	int i;
+	int j;
 
 	if (mis==0)
 		return 0;
 
+	module_name = get_mi_mod_name(mod_name);
+	mod_len = strlen(module_name);
+	start = mi_cmds_no;
+
 	for ( i=0 ; mis[i].name ; i++ ) {
-		ret = register_mi_cmd(mis[i].name, mis[i].help, mis[i].flags,
-				mis[i].init_f, mis[i].recipes, mod_name);
+		if (strchr(mis[i].name, MI_MODULE_SEP)) {
+			LM_ERR("invalid MI cmd <%s> for module %s (must not include '%c')\n",
+					mis[i].name, module_name, MI_MODULE_SEP);
+			return -1;
+		}
+
+		cmd_name = build_mi_cmd_name(module_name, mis[i].name);
+		if (!cmd_name) {
+			LM_ERR("oom while building MI cmd <%s> for module %s\n",
+					mis[i].name, module_name);
+			return -1;
+		}
+
+		ret = register_mi_cmd(cmd_name, mis[i].help, mis[i].flags,
+				mis[i].init_f, MI_EXPORT_RECIPES(mis[i]), module_name);
 		if (ret!=0) {
 			LM_ERR("failed to register cmd <%s> for module %s\n",
-					mis[i].name,mod_name);
+					mis[i].name, module_name);
+			pkg_free(cmd_name);
+			continue;
 		}
+
+		cmd_idx = mi_cmds_no - 1;
+		if (add_mi_cmd_alias(mis[i].name, strlen(mis[i].name), cmd_idx) < 0)
+			return -1;
+
+		aliases = MI_EXPORT_ALIASES(mis[i]);
+		for (j = 0; aliases && aliases[j]; j++)
+			if (add_mi_cmd_alias(aliases[j], strlen(aliases[j]), cmd_idx) < 0)
+				return -1;
 	}
+
+	if (add_mi_mod_group(module_name, mod_len, start, mi_cmds_no) < 0)
+		return -1;
+
+	return 0;
+}
+
+int register_mi_cmd_alias(const char *mod_name, const char *cmd_name,
+		const char *alias)
+{
+	const char *module_name;
+	struct mi_cmd *cmd;
+	char *full_name;
+	int cmd_idx;
+	int id;
+	int len;
+	int ret;
+
+	if (!cmd_name || !alias) {
+		LM_ERR("invalid params cmd_name=%s alias=%s\n", cmd_name, alias);
+		return -1;
+	}
+
+	module_name = get_mi_mod_name(mod_name);
+	full_name = build_mi_cmd_name(module_name, cmd_name);
+	if (!full_name) {
+		LM_ERR("oom while building canonical MI cmd for alias registration\n");
+		return -1;
+	}
+
+	len = strlen(full_name);
+	id = get_mi_id(full_name, len);
+	cmd = lookup_mi_cmd_id(id, full_name, len);
+	if (!cmd) {
+		LM_ERR("cannot register alias <%s>: unknown canonical cmd <%s>\n",
+				alias, full_name);
+		pkg_free(full_name);
+		return -1;
+	}
+
+	cmd_idx = cmd - mi_cmds;
+	ret = add_mi_cmd_alias(alias, strlen(alias), cmd_idx);
+	pkg_free(full_name);
+	return ret;
+}
+
+int register_mi_cmd_aliases(const char *mod_name, const char *cmd_name,
+		const char *const *aliases)
+{
+	int i;
+
+	if (!aliases)
+		return 0;
+
+	for (i = 0; aliases[i]; i++)
+		if (register_mi_cmd_alias(mod_name, cmd_name, aliases[i]) < 0)
+			return -1;
 
 	return 0;
 }
@@ -126,15 +523,23 @@ int register_mi_cmd(char *name, char *help, unsigned int flags,
 		mi_child_init_f in, const mi_recipe_t *recipes, const char* mod_name)
 {
 	struct mi_cmd *cmds;
+	int mod_len;
 	int id;
 	int len;
 
-	if (recipes==0 || name==0) {
+	if (recipes==0 || name==0 || mod_name==0) {
 		LM_ERR("invalid params recipes=%p, name=%s\n", recipes, name);
 		return -1;
 	}
 
+	mod_len = strlen(mod_name);
 	len = strlen(name);
+	if (len <= mod_len + 1 || memcmp(name, mod_name, mod_len) != 0 ||
+			name[mod_len] != MI_MODULE_SEP) {
+		LM_ERR("invalid command <%s> for module %s\n", name, mod_name);
+		return -1;
+	}
+
 	id = get_mi_id(name,len);
 
 	if (lookup_mi_cmd_id( id, name, len)) {
@@ -155,15 +560,18 @@ int register_mi_cmd(char *name, char *help, unsigned int flags,
 	cmds = &cmds[mi_cmds_no-1];
 
 	cmds->init_f = in;
-	cmds->flags = flags;
+	cmds->flags = flags & (~MI_LOCAL_NAME_AMBIGUOUS);
 	cmds->name.s = name;
 	cmds->name.len = len;
 	cmds->module.s = mod_name;
 	cmds->module.len = strlen(mod_name);
+	cmds->local_id = get_mi_id(name + mod_len + 1, len - mod_len - 1);
 	cmds->help.s = help;
 	cmds->help.len = help ? strlen(help) : 0;
 	cmds->id = id;
 	cmds->recipes = recipes;
+
+	mark_ambiguous_mi_cmd_name(cmds);
 
 	/**
 	 * FIXME we should check if trace_api is loaded not to lose unnecessary space
@@ -186,10 +594,44 @@ int register_mi_cmd(char *name, char *help, unsigned int flags,
 
 struct mi_cmd* lookup_mi_cmd( char *name, int len)
 {
+	char *cmd_name;
+	struct mi_cmd *cmd;
+	int amb;
+	int mod_len;
+	int mod_id;
 	int id;
+	int i;
+	int j;
 
-	id = get_mi_id(name,len);
-	return lookup_mi_cmd_id( id, name, len);
+	cmd_name = memchr(name, MI_MODULE_SEP, len);
+	if (!cmd_name) {
+		cmd = lookup_mi_cmd_local(name, len, &amb);
+		if (cmd || amb)
+			return cmd;
+		return lookup_mi_cmd_alias(name, len);
+	}
+	if (cmd_name == name || cmd_name == name + len - 1)
+		return NULL;
+
+	mod_len = cmd_name - name;
+	mod_id = get_mi_id(name, mod_len);
+	id = get_mi_id(name, len);
+
+	for (i = 0; i < mi_mod_groups_no; i++) {
+		if (mi_mod_groups[i].id != mod_id ||
+				mi_mod_groups[i].module.len != mod_len ||
+				memcmp(mi_mod_groups[i].module.s, name, mod_len) != 0)
+			continue;
+
+		for (j = mi_mod_groups[i].start; j < mi_mod_groups[i].end; j++) {
+			cmd = &mi_cmds[j];
+			if (id == cmd->id && len == cmd->name.len &&
+					memcmp(cmd->name.s, name, len) == 0)
+				return cmd;
+		}
+	}
+
+	return lookup_mi_cmd_alias(name, len);
 }
 
 
@@ -197,6 +639,12 @@ void get_mi_cmds( struct mi_cmd** cmds, int *size)
 {
 	*cmds = mi_cmds;
 	*size = mi_cmds_no;
+}
+
+void get_mi_cmd_aliases(struct mi_cmd_alias **aliases, int *size)
+{
+	*aliases = mi_cmd_aliases;
+	*size = mi_cmd_aliases_no;
 }
 
 int parse_mi_request(const char *req, const char **end_ptr, mi_request_t *parsed)
@@ -339,6 +787,7 @@ mi_response_t *handle_mi_request(mi_request_t *req, struct mi_cmd *cmd,
 {
 	mi_response_t *resp;
 	const mi_recipe_t *cmd_recipe;
+	char *method;
 	mi_params_t cmd_params;
 	int params_err = -1;
 	int pos_params;
@@ -356,6 +805,11 @@ mi_response_t *handle_mi_request(mi_request_t *req, struct mi_cmd *cmd,
 	}
 
 	if (!cmd) {
+		method = mi_get_req_method(req);
+		resp = build_ambiguous_mi_cmd_resp(method, strlen(method));
+		if (resp)
+			return resp;
+
 		LM_ERR("Command not found\n");
 		return build_err_resp(JSONRPC_NOT_FOUND_CODE,
 				MI_SSTR(JSONRPC_NOT_FOUND_MSG), NULL, 0);

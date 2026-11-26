@@ -23,7 +23,111 @@
 #include "net_tcp.h"
 #include "tcp_common.h"
 #include "tcp_conn_profile.h"
+#include "proxy_protocol.h"
+#include "trans.h"
 #include "../tsend.h"
+#include "../ipc.h"
+#include "proto_tcp/tcp_common_defs.h"
+
+#define TCP_DEFAULT_ASYNC_CHUNKS 32
+
+static struct tcp_fail_cb tcp_fail_cb;
+
+struct tcp_fail_job {
+	tcp_fail_f *f;
+	void *param;
+	tcp_fail_free_f *free;
+};
+
+static void tcp_fail_rpc(int sender, void *param)
+{
+	struct tcp_fail_job *job = param;
+
+	job->f(job->param);
+	if (job->free)
+		job->free(job->param);
+	shm_free(job);
+}
+
+int tcp_register_fail_cb(tcp_fail_f *f, void *param, tcp_fail_free_f *free)
+{
+	if (!f)
+		return -1;
+
+	tcp_fail_cb.f = f;
+	tcp_fail_cb.param = param;
+	tcp_fail_cb.free = free;
+	return 0;
+}
+
+void tcp_clear_fail_cb(void)
+{
+	memset(&tcp_fail_cb, 0, sizeof tcp_fail_cb);
+}
+
+static void tcp_free_fail_cb(struct tcp_async_chunk *chunk)
+{
+	if (!chunk->fail_cb.f)
+		return;
+	memset(&chunk->fail_cb, 0, sizeof chunk->fail_cb);
+}
+
+void tcp_async_fail_chunks(struct tcp_connection *con)
+{
+	struct tcp_fail_job *job;
+	struct tcp_fail_cb *cb;
+	int i;
+
+	if (!con->async)
+		return;
+
+	for (i = 0; i < con->async->pending; i++) {
+		cb = &con->async->chunks[i]->fail_cb;
+		if (cb->f) {
+			job = shm_malloc(sizeof *job);
+			if (!job) {
+				LM_ERR("no more SHM for chunk failure notification\n");
+				if (cb->free)
+					cb->free(cb->param);
+			} else {
+				job->f = cb->f;
+				job->param = cb->param;
+				job->free = cb->free;
+				if (ipc_dispatch_rpc(tcp_fail_rpc, job) < 0) {
+					LM_ERR("failed to dispatch chunk failure notification\n");
+					if (job->free)
+						job->free(job->param);
+					shm_free(job);
+				}
+			}
+		}
+		tcp_free_fail_cb(con->async->chunks[i]);
+	}
+}
+
+static int tcp_async_init_data(struct tcp_connection *con)
+{
+	int chunks;
+
+	if (con->async)
+		return 0;
+
+	chunks = protos[con->type].net.stream.async_chunks;
+	if (chunks <= 0)
+		chunks = TCP_DEFAULT_ASYNC_CHUNKS;
+
+	con->async = shm_malloc(sizeof(struct tcp_async_data) +
+			chunks * sizeof(struct tcp_async_chunk *));
+	if (!con->async) {
+		LM_ERR("No more SHM for async queue on conn %p / %u\n", con, con->id);
+		return -1;
+	}
+
+	con->async->allocated = chunks;
+	con->async->oldest = 0;
+	con->async->pending = 0;
+	return 0;
+}
 
 /*! \brief blocking connect on a non-blocking fd; it will timeout after
  * tcp_connect_timeout
@@ -188,189 +292,44 @@ error:
 
 struct tcp_connection* tcp_sync_connect(const struct socket_info* send_sock,
                const union sockaddr_union* server, struct tcp_conn_profile *prof,
-               int *fd, int send2main)
+               int *fd)
 {
 	struct tcp_connection* con;
-	int s;
 
-	s = tcp_sync_connect_fd(&send_sock->su, server, send_sock->proto, prof, send_sock->flags, send_sock->tos);
-	if (s < 0)
-		return NULL;
-
-	con=tcp_conn_create(s, server, send_sock, prof, S_CONN_OK, send2main);
-	if (con==NULL){
-		LM_ERR("tcp_conn_create failed, closing the socket\n");
-		close(s);
-		return 0;
-	}
-	*fd = s;
+	*fd = -1;
+	con = tcp_conn_create(server, send_sock, prof, S_CONN_CONNECTING);
+	if (!con)
+		LM_ERR("tcp_conn_create failed\n");
 	return con;
 }
 
 int tcp_async_connect(const struct socket_info* send_sock,
             const union sockaddr_union* server, struct tcp_conn_profile *prof,
-            int timeout, struct tcp_connection** c, int *ret_fd, int send2main)
+            struct tcp_connection** c, int *ret_fd)
 {
-	int fd, n;
-	union sockaddr_union my_name;
-	socklen_t my_name_len;
 	struct tcp_connection* con;
-#if defined(HAVE_SELECT) && defined(BLOCKING_USE_SELECT)
-	fd_set sel_set;
-	fd_set orig_set;
-	struct timeval timeout_val;
-#else
-	struct pollfd pf;
-#endif
-	unsigned int elapsed,to;
-	int err;
-	unsigned int err_len;
-	int poll_err;
-	char *ip;
-	unsigned short port;
-	struct timeval begin;
 
-	/* create the socket */
-	fd=socket(AF2PF(server->s.sa_family), SOCK_STREAM, 0);
-	if (fd==-1){
-		LM_ERR("socket: (%d) %s\n", errno, strerror(errno));
+	*ret_fd = -1;
+	con = tcp_conn_create(server, send_sock, prof, S_CONN_CONNECTING);
+	if (con == NULL) {
+		LM_ERR("tcp_conn_create failed\n");
 		return -1;
 	}
-
-	if (tcp_init_sock_opt(fd, prof, send_sock->flags, send_sock->tos)<0){
-		LM_ERR("tcp_init_sock_opt failed\n");
-		goto error;
-	}
-
-	my_name_len = sockaddru_len(send_sock->su);
-	memcpy( &my_name, &send_sock->su, my_name_len);
-	if (!(send_sock->flags & SI_REUSEPORT))
-		su_setport( &my_name, 0);
-	if (bind(fd, &my_name.s, my_name_len )!=0) {
-		LM_ERR("bind failed (%d) %s\n", errno,strerror(errno));
-		goto error;
-	}
-
-	/* attempt to do connect and see if we do block or not */
-	poll_err=0;
-	elapsed = 0;
-	to = timeout*1000;
-
-	if (gettimeofday(&(begin), NULL)) {
-		LM_ERR("Failed to get TCP connect start time\n");
-		goto error;
-	}
-
-again:
-	n=connect(fd, &server->s, sockaddru_len(*server));
-	if (n==-1) {
-		if (errno==EINTR){
-			elapsed=get_time_diff(&begin);
-			if (elapsed<to) goto again;
-			else {
-				LM_DBG("Local connect attempt failed \n");
-				goto async_connect;
-			}
-		}
-		if (errno!=EINPROGRESS && errno!=EALREADY){
-			get_su_info(&server->s, ip, port);
-			LM_ERR("[server=%s:%d] (%d) %s\n",ip, port, errno,strerror(errno));
-			goto error;
-		}
-	} else goto local_connect;
-
-	/* let's poll for a little */
-#if defined(HAVE_SELECT) && defined(BLOCKING_USE_SELECT)
-	FD_ZERO(&orig_set);
-	FD_SET(fd, &orig_set);
-#else
-	pf.fd=fd;
-	pf.events=POLLOUT;
-#endif
-
-	while(1){
-		elapsed=get_time_diff(&begin);
-		if (elapsed<to)
-			to-=elapsed;
-		else {
-			LM_DBG("Polling is overdue \n");
-			goto async_connect;
-		}
-#if defined(HAVE_SELECT) && defined(BLOCKING_USE_SELECT)
-		sel_set=orig_set;
-		timeout_val.tv_sec=to/1000000;
-		timeout_val.tv_usec=to%1000000;
-		n=select(fd+1, 0, &sel_set, 0, &timeout_val);
-#else
-		n=poll(&pf, 1, to/1000);
-#endif
-		if (n<0){
-			if (errno==EINTR) continue;
-			get_su_info(&server->s, ip, port);
-			LM_ERR("poll/select failed:[server=%s:%d] (%d) %s\n",
-				ip, port, errno, strerror(errno));
-			goto error;
-		}else if (n==0) /* timeout */ continue;
-#if defined(HAVE_SELECT) && defined(BLOCKING_USE_SELECT)
-		if (FD_ISSET(fd, &sel_set))
-#else
-		if (pf.revents&(POLLERR|POLLHUP|POLLNVAL)){
-			LM_ERR("poll error: flags %x\n", pf.revents);
-			poll_err=1;
-		}
-#endif
-		{
-			err_len=sizeof(err);
-			if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len) != 0) {
-				get_su_info(&server->s, ip, port);
-				LM_WARN("getsockopt error: fd=%d [server=%s:%d]: (%d) %s\n", fd,
-						ip, port, errno, strerror(errno));
-				goto error;
-			}
-			if ((err==0) && (poll_err==0)) goto local_connect;
-			if (err!=EINPROGRESS && err!=EALREADY){
-				get_su_info(&server->s, ip, port);
-				LM_ERR("failed to retrieve SO_ERROR [server=%s:%d] (%d) %s\n",
-					ip, port, err, strerror(err));
-				goto error;
-			}
-		}
-	}
-
-async_connect:
-	LM_DBG("Create connection for async connect\n");
-	/* create a new dummy connection */
-	con=tcp_conn_create(fd, server, send_sock,
-	                    prof, S_CONN_CONNECTING, send2main);
-	if (con==NULL) {
-		LM_ERR("tcp_conn_create failed\n");
-		goto error;
-	}
-	/* report an async, in progress connect */
 	*c = con;
 	return 0;
-
-local_connect:
-	con=tcp_conn_create(fd, server, send_sock, prof, S_CONN_OK, send2main);
-	if (con==NULL) {
-		LM_ERR("tcp_conn_create failed, closing the socket\n");
-		goto error;
-	}
-	*c = con;
-	*ret_fd = fd;
-	/* report a local connect */
-	return 1;
-
-error:
-	close(fd);
-	*c = NULL;
-	return -1;
 }
 
 int tcp_async_write(struct tcp_connection* con,int fd)
 {
 	int n;
 	struct tcp_async_chunk *chunk;
+
+	n = send_stream_proxy_protocol_v1(con, fd, 0,
+			0, NULL, "TCP");
+	if (n < 0)
+		return -1;
+	if (n > 0)
+		return 1;
 
 	while ((chunk = tcp_async_get_chunk(con)) != NULL) {
 		LM_DBG("Trying to send %d bytes from chunk %p in conn %p - %d %d \n",
@@ -399,6 +358,7 @@ int tcp_async_write(struct tcp_connection* con,int fd)
 			}
 		}
 		tcp_async_update_write(con, n);
+		tcp_conn_reset_lifetime(con);
 	}
 	return 0;
 }
@@ -474,7 +434,11 @@ int tcp_write_on_socket(struct tcp_connection* c, int fd,
 	int n;
 
 	lock_get(&c->write_lock);
-	if (c->async) {
+	if (fd < 0) {
+		n = tcp_async_add_chunk(c, buf, len, 0);
+		if (n == 0)
+			n = len;
+	} else if (c->async) {
 		/*
 		 * if there is any data pending to write, we have to wait for those chunks
 		 * to be sent, otherwise we will completely break the messages' order
@@ -487,6 +451,8 @@ int tcp_write_on_socket(struct tcp_connection* c, int fd,
 		n = tsend_stream(fd, buf, len, write_timeout);
 	}
 	lock_release(&c->write_lock);
+	if (fd >= 0 && n > 0)
+		tcp_conn_reset_lifetime(c);
 
 	return n;
 }
@@ -502,25 +468,35 @@ int tcp_async_add_chunk(struct tcp_connection *con, char *buf,
 {
 	struct tcp_async_chunk *c;
 
+	if (lock)
+		lock_get(&con->write_lock);
+
+	if (tcp_async_init_data(con) < 0) {
+		if (lock)
+			lock_release(&con->write_lock);
+		return -1;
+	}
+
 	c = shm_malloc(sizeof(struct tcp_async_chunk) + len);
 	if (!c) {
+		if (lock)
+			lock_release(&con->write_lock);
 		LM_ERR("No more SHM\n");
 		return -1;
 	}
 
+	c->fail_cb = tcp_fail_cb;
 	c->len = len;
 	c->ticks = get_ticks();
 	c->buf = (char *)(c+1);
 	memcpy(c->buf,buf,len);
-
-	if (lock)
-		lock_get(&con->write_lock);
 
 	if (con->async->allocated == con->async->pending) {
 		LM_ERR("We have reached the limit of max async postponed chunks %d "
 			"on conn %p / %u\n", con->async->pending, con, con->id);
 		if (lock)
 			lock_release(&con->write_lock);
+		tcp_free_fail_cb(c);
 		shm_free(c);
 		return -2;
 	}
@@ -533,6 +509,34 @@ int tcp_async_add_chunk(struct tcp_connection *con, char *buf,
 		lock_release(&con->write_lock);
 
 	return 0;
+}
+
+int tcp_async_add_chunks(struct tcp_connection *con, const struct iovec *iov,
+		int iovcnt, int lock)
+{
+	int i;
+	int rc = 0;
+
+	if (lock)
+		lock_get(&con->write_lock);
+
+	if (tcp_async_init_data(con) < 0) {
+		rc = -1;
+		goto out;
+	}
+
+	for (i = 0; i < iovcnt; i++) {
+		if (iov[i].iov_len == 0)
+			continue;
+		rc = tcp_async_add_chunk(con, iov[i].iov_base, iov[i].iov_len, 0);
+		if (rc < 0)
+			break;
+	}
+
+out:
+	if (lock)
+		lock_release(&con->write_lock);
+	return rc;
 }
 
 
@@ -562,8 +566,13 @@ void tcp_async_update_write(struct tcp_connection *con, int len)
 		}
 	}
 	con->async->pending -= i;
-	for (c = 0; c < i; c++)
+	for (c = 0; c < i; c++) {
+		if (con->async->chunks[c]->fail_cb.free)
+			con->async->chunks[c]->fail_cb.free(
+				con->async->chunks[c]->fail_cb.param);
+		tcp_free_fail_cb(con->async->chunks[c]);
 		shm_free(con->async->chunks[c]);
+	}
 	if (con->async->pending) {
 		LM_DBG("We still have %d chunks pending on %p\n",
 				con->async->pending, con);

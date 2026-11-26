@@ -58,6 +58,9 @@
 #define PV_TYPE_INT			16
 #define PV_VAL_PKG			32
 #define PV_VAL_SHM			64
+#define PV_VAL_BOOL			128
+
+#define PV_PARAM_PVV_SHM	1
 
 /* @v: a (pv_value_t *) */
 #define pvv_is_int(v) \
@@ -132,7 +135,7 @@ enum _pv_type {
 	PVT_XLOG_LEVEL,       PVT_AF,                PVT_HDR_NAME,
 	PVT_SOCKET_IN,        PVT_SOCKET_OUT,        PVT_BRANCH_FLAG,
 	PVT_SDP,              PVT_SDP_LINE,          PVT_SDP_STREAM,
-	PVT_SDP_SESSION,      PVT_MSG_FLAG,
+	PVT_SDP_SESSION,      PVT_MSG_FLAG,          PVT_PROXY_PROTOCOL,
 	/* registered by json module */
 	PVT_JSON,
 	/* registered by xml module */
@@ -178,6 +181,7 @@ typedef struct _pv_param
 	pv_name_t    pvn; /*!< PV name */
 	pv_index_t   pvi; /*!< PV index */
 	str          pvv; /*!< PV value buffer */
+	int          pvv_flags; /*!< ownership flags for pvv */
 } pv_param_t, *pv_param_p;
 
 typedef int (*pv_getf_t) (struct sip_msg*,  pv_param_t*, pv_value_t*);
@@ -308,4 +312,3 @@ int add_arg_var(char *opt);
 void destroy_argv_list(void);
 
 #endif
-

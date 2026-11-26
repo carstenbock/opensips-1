@@ -114,6 +114,11 @@ int xj_jcon_connect(xj_jcon jbc)
     	LM_DBG("failed to get info about Jabber server address\n");
 		goto error;
     }
+	if(he->h_addrtype != AF_INET || he->h_length != sizeof(address.sin_addr))
+	{
+		LM_DBG("invalid Jabber server address family or length\n");
+		goto error;
+	}
 
 	memset(&address, 0, sizeof(address));
     // fill the fields of the address
@@ -769,6 +774,18 @@ int xj_jcon_jconf_presence(xj_jcon jbc, xj_jconf jcf, char* type,
 		char* status)
 {
 	char buff[256];
+	size_t remaining = sizeof(buff) - 3;
+
+	if (jcf->room.len < 0 || jcf->server.len < 0 || jcf->nick.len < 0)
+		return -1;
+	if ((size_t)jcf->room.len > remaining)
+		return -1;
+	remaining -= jcf->room.len;
+	if ((size_t)jcf->server.len > remaining)
+		return -1;
+	remaining -= jcf->server.len;
+	if ((size_t)jcf->nick.len > remaining)
+		return -1;
 
 	strncpy(buff, jcf->room.s,
 			jcf->room.len + jcf->server.len +1);
@@ -816,4 +833,3 @@ int  xj_jcon_del_jconf(xj_jcon jbc, str *sid, char dl, int flag)
 }
 
 /**********    *********/
-

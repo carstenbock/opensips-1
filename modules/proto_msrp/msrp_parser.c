@@ -107,8 +107,9 @@ int parse_msrp_msg( char* buf, int len, struct msrp_msg *msg)
 		}
 		/* this converstion is risk free as the we already tested
 		 * for a valid number above */
-		str2int( &msg->fl.u.reply.status,
-			(unsigned int*)&msg->fl.u.reply.status_no );
+		if (str2int(&msg->fl.u.reply.status,
+				(unsigned int *)&msg->fl.u.reply.status_no) < 0)
+			goto error;
 	} else {
 		/* let's hope it is a request, check for spaces at least */
 		if (q_memchr( msg->fl.u.request.method.s, ' ',
@@ -215,8 +216,9 @@ done:
 		goto error;
 	}
 	/* TO and FROM (in this order) must be the first ones */
-	if (msg->headers->type!=HDR_TO_PATH_T &&
-	msg->headers->next->type!=HDR_FROM_PATH_T) {
+	if (msg->headers==NULL || msg->headers->next==NULL ||
+			msg->headers->type!=HDR_TO_PATH_T ||
+			msg->headers->next->type!=HDR_FROM_PATH_T) {
 		LM_ERR("TO and FROM are not the first headers\n");
 		goto error;
 	}
@@ -242,12 +244,12 @@ error:
 
 void free_msrp_msg( struct msrp_msg *msg)
 {
-	if (msg->headers)
-		free_hdr_field_lst(msg->headers);
-
 	if (msg->to_path && msg->to_path->parsed)
 		free_msrp_path( (struct msrp_url *)msg->to_path->parsed );
 
 	if (msg->from_path && msg->from_path->parsed)
 		free_msrp_path( (struct msrp_url *)msg->from_path->parsed );
+
+	if (msg->headers)
+		free_hdr_field_lst(msg->headers);
 }

@@ -17,11 +17,20 @@ ifeq ($(strip $(OTEL_CPP_CFLAGS)$(OTEL_CPP_LIBS)),)
 $(error OpenTelemetry C++ SDK not found via pkg-config (opentelemetry_*). Please install the system libraries.)
 endif
 
-DEFS+=-DHAVE_OPENTELEMETRY_CPP
-CXXFLAGS+=-std=c++17 -fpermissive $(OTEL_CPP_CFLAGS)
+CXXFLAGS+=-std=c++17 -fpermissive \
+	-Wno-register \
+	-Wno-write-strings \
+	-Wno-pointer-arith \
+	$(OTEL_CPP_CFLAGS)
 LIBS+=$(OTEL_CPP_LIBS)
 
 include ../../Makefile.modules
 
 opentelemetry.o: opentelemetry.cpp
-	$(Q)$(CXX) $(CXXFLAGS) $(DEFS) $(INCLUDE) -fPIC -c $< -o $@
+	$(Q)$(CXX) $(CXXFLAGS) $(DEFS) $(INCLUDE) $(DEBUGSYM) -fPIC -c $< -o $@
+
+clean: clean-opentelemetry
+
+.PHONY: clean-opentelemetry
+clean-opentelemetry:
+	-@rm -f opentelemetry.o

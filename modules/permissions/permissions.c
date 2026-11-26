@@ -172,22 +172,18 @@ static const mi_export_t mi_cmds[] = {
 	{ MI_ADDRESS_RELOAD, 0, 0, mi_address_child_init, {
 		{mi_address_reload, {0}},
 		{mi_address_reload_1, {"partition", 0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{ MI_ADDRESS_DUMP, 0, 0, 0, {
 		{mi_address_dump, {0}},
 		{mi_address_dump_1, {"partition", 0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{ MI_SUBNET_DUMP, 0, 0, 0, {
 		{mi_subnet_dump, {0}},
 		{mi_subnet_dump_1, {"partition", 0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{ MI_ALLOW_URI, 0, 0, 0, {
 		{mi_allow_uri, {"basename", "uri", "contact", 0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{EMPTY_MI_EXPORT}
 };
 
@@ -529,6 +525,13 @@ static int load_fixup(void** param, int param_no)
 	idx = find_index(table, pathname);
 
 	if (idx == -1) {
+		if (rules_num >= MAX_RULE_FILES) {
+			LM_ERR("maximum number of rule files reached (%d)\n",
+			       MAX_RULE_FILES);
+			pkg_free(pathname);
+			return -1;
+		}
+
 		     /* Not opened yet, open the file and parse it */
 		table[rules_num].filename = pathname;
 		table[rules_num].rules = parse_config_file(pathname);

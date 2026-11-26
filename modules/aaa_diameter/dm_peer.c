@@ -321,7 +321,7 @@ static int dm_send_acct(struct dm_message *msg)
 			if (str_match(&dm_avp->name, _str("Event-Timestamp"))) {
 
 				/* did the upper module pass an UNIX timestamp or NTP bytes? */
-				if (dm_avp->value.os.len >= 0) {
+				if (dm_avp->value_type == AAA_TYPE_OCTETSTRING) {
 					if (dm_avp->value.os.len != 4) {
 						LM_BUG("Event-Timestamp must have 4 octets (%d given)",
 						       (int)dm_avp->value.os.len);
@@ -509,8 +509,16 @@ static int dm_send_custom_req(struct dm_message *msg)
 			expire.tv_sec++;
 			expire.tv_nsec -= 1000000000L;
 		}
-		FD_CHECK(fd_msg_send_timeout(&dmsg, NULL, msg->reply_cond,
-			dm_custom_req_expired, &expire));
+		/* the request in flight holds a reference to the cond, released by
+		 * its answer (dm_receive_msg()) or by dm_custom_req_expired() */
+		dm_cond_ref(msg->reply_cond);
+		rc = fd_msg_send_timeout(&dmsg, NULL, msg->reply_cond,
+			dm_custom_req_expired, &expire);
+		if (rc != 0) {
+			dm_cond_unref(msg->reply_cond);
+			LM_ERR("error in fd_msg_send_timeout: %d\n", rc);
+			return rc > 0 ? -rc : rc;
+		}
 	} else {
 		FD_CHECK(fd_msg_send(&dmsg, NULL, NULL));
 	}

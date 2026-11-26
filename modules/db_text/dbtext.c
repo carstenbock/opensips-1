@@ -80,15 +80,15 @@ static const param_export_t params[] = {
 
 /** MI commands */
 static const mi_export_t mi_cmds[] = {
-	{"dbt_dump", 0, 0, 0, {
+	{"dump", 0, 0, 0, {
 		{mi_dbt_dump, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dbt_dump", 0}
 	},
-	{"dbt_reload", 0, 0, 0, {
+	{"reload", 0, 0, 0, {
 		{mi_dbt_reload, {0}},
 		{mi_dbt_reload_1, {"db_name", 0}},
 		{mi_dbt_reload_2, {"db_name", "table_name", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dbt_reload", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };

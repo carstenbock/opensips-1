@@ -951,7 +951,7 @@ static int eval_elem(struct expr* e, struct sip_msg* msg, pv_value_t *val)
 							*sizeof(char));
 					if(val->rs.s==0)
 					{
-						LM_ERR("no more memory\n");
+						LMR_ERR("no more memory\n");
 						pv_value_destroy(&lval);
 						pv_value_destroy(&rval);
 						return 0;
@@ -976,7 +976,7 @@ static int eval_elem(struct expr* e, struct sip_msg* msg, pv_value_t *val)
 					val->rs.s = pkg_malloc(n+1);
 					if (!val->rs.s)
 					{
-						LM_ERR("no more memory\n");
+						LMR_ERR("no more memory\n");
 						pv_value_destroy(&lval);
 						pv_value_destroy(&rval);
 						return 0;
@@ -1953,6 +1953,22 @@ void print_rl(struct os_script_routes *srs)
 	dump_script_routes(&srs->startup, 1,             "startup");
 	dump_script_routes(srs->timer,    TIMER_RT_NO,   "timer");
 	dump_script_routes(srs->event,    EVENT_RT_NO,   "event");
+}
+
+const char *route_type_name(int route_type)
+{
+	switch (route_type) {
+	case REQUEST_ROUTE: return "request";
+	case FAILURE_ROUTE: return "failure";
+	case ONREPLY_ROUTE: return "onreply";
+	case BRANCH_ROUTE: return "branch";
+	case ERROR_ROUTE: return "error";
+	case LOCAL_ROUTE: return "local";
+	case STARTUP_ROUTE: return "startup";
+	case TIMER_ROUTE: return "timer";
+	case EVENT_ROUTE: return "event";
+	default: return "unknown";
+	}
 }
 
 

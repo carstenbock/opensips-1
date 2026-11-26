@@ -91,7 +91,6 @@
 #define WORD(p) (*(p + 0) + (*(p + 1) << 8))
 #define DWORD(p) (*(p+0) + (*(p+1) << 8) + (*(p+2) << 16) + (*(p+3) << 24))
 
-#define LOWER_CASE(p) (*(p) & 0x20)
 #define BUFLEN 4096
 
 #define COMPACT_FORMS	"cfiklmstvx"
@@ -167,7 +166,7 @@ static const cmd_export_t cmds[]={
 		{CMD_PARAM_STR|CMD_PARAM_OPT|CMD_PARAM_FIX_NULL,
 			 fixup_mc_compact_flags, 0},
 		{0, 0, 0}},
-		REQUEST_ROUTE|ONREPLY_ROUTE|LOCAL_ROUTE|FAILURE_ROUTE},
+		REQUEST_ROUTE|BRANCH_ROUTE|ONREPLY_ROUTE|LOCAL_ROUTE|FAILURE_ROUTE},
 	{"mc_compress",	  (cmd_function)mc_compress, {
 		{CMD_PARAM_INT|CMD_PARAM_OPT, 0, 0},
 		{CMD_PARAM_STR, fixup_compression_flags,
@@ -175,7 +174,7 @@ static const cmd_export_t cmds[]={
 		{CMD_PARAM_STR|CMD_PARAM_OPT,
 			fixup_whitelist_compress, fixup_whitelist_free},
 		{0, 0, 0}},
-		REQUEST_ROUTE|ONREPLY_ROUTE|LOCAL_ROUTE|FAILURE_ROUTE},
+		REQUEST_ROUTE|BRANCH_ROUTE|ONREPLY_ROUTE|LOCAL_ROUTE|FAILURE_ROUTE},
 	{"mc_decompress",	(cmd_function)mc_decompress, {
 		{0, 0, 0}},
 		REQUEST_ROUTE|LOCAL_ROUTE|FAILURE_ROUTE},
@@ -530,10 +529,11 @@ static int mc_is_in_whitelist(struct hdr_field* hf, mc_whitelist_p wh_list)
 {
 	if (!wh_list)
 		return 0;
-	if (hf->type != HDR_OTHER_T) {
-		return ((1 << (hf->type%MC_BYTE_SIZE))&
-			(wh_list->hdr_mask[hf->type/MC_BYTE_SIZE]));
-	} else {
+	/* The HDR_OTHER_T bit matches all custom headers for "*". */
+	if (wh_list->hdr_mask[hf->type/MC_BYTE_SIZE] &
+			(1 << (hf->type%MC_BYTE_SIZE)))
+		return 1;
+	if (hf->type == HDR_OTHER_T) {
 		mc_other_hdr_lst_p other_hdr = wh_list->other_hdr;
 
 		for ( ; other_hdr; other_hdr=other_hdr->next) {
@@ -567,8 +567,9 @@ static int append_hf2lst(struct hdr_field** lst, struct hdr_field* hf,
 		/* OTHER hdr type */
 		while (temp) {
 			/* Header already exists */
-			if (!strncasecmp(temp->name.s, hf->name.s,
-							temp->name.len)) {
+			if (temp->name.len == hf->name.len &&
+					!strncasecmp(temp->name.s, hf->name.s,
+						hf->name.len)) {
 				while (temp->sibling)
 					temp = temp->sibling;
 
@@ -899,32 +900,19 @@ static int mc_compact_cb(char** buf_p, struct mc_compact_args *mc_compact_args, 
 			i = HDR_OTHER_T;
 again:
 		if (hdr_mask[i]) {
-			/* Compact form name so the header have
-				to be built */
-			if (LOWER_CASE(hdr_mask[i]->name.s) ||
-				hdr_mask[i]->type == HDR_CONTENTLENGTH_T) {
-				/* Copy the name of the header */
-				wrap_copy_and_update(&new_buf.s,
-					hdr_mask[i]->name.s,
-					hdr_mask[i]->name.len, &new_buf.len);
+			/* Copy the name of the header */
+			wrap_copy_and_update(&new_buf.s,
+				hdr_mask[i]->name.s,
+				hdr_mask[i]->name.len, &new_buf.len);
 
-				/* Copy the ': ' delimiter*/
-				wrap_copy_and_update(&new_buf.s, DELIM,
-						DELIM_LEN, &new_buf.len);
-				/* Copy the first field of the header*/
-				wrap_copy_and_update(&new_buf.s,
-					hdr_mask[i]->body.s,
-					hdr_mask[i]->body.len, &new_buf.len);
-			/* Normal form header so it can be copied in one step */
-			} else {
-				wrap_copy_and_update(
-					&new_buf.s,
-					hdr_mask[i]->name.s,
-					/* Possible siblings. No CRLF yet */
-					hdr_mask[i]->len - CRLF_LEN,
-					&new_buf.len
-				);
-			}
+			/* Copy the ': ' delimiter*/
+			wrap_copy_and_update(&new_buf.s, DELIM,
+					DELIM_LEN, &new_buf.len);
+
+			/* Copy the first field of the header*/
+			wrap_copy_and_update(&new_buf.s,
+				hdr_mask[i]->body.s,
+				hdr_mask[i]->body.len, &new_buf.len);
 
 			/* Copy the rest of the header fields(siblings)
 							if they exist */
@@ -1006,6 +994,10 @@ again:
 	memcpy(*buf_p, new_buf.s, new_buf.len);
 	*olen = new_buf.len;
 
+	if (new_buf.len > msg_total_len)
+		LM_BUG("buffer overflow: "\
+			"calculated=%d, actual=%d\n", msg_total_len, new_buf.len);
+
 	/* Free the vector */
 	pkg_free(hdr_mask);
 
@@ -1063,8 +1055,6 @@ static int mc_compress(struct sip_msg* msg, int *algo_p, int *flags_p,
 	if (wh_list)
 		wh_list = mc_dup_whitelist(wh_list);
 
-	/* Simulate a whitelist which will contain only the Content-Length
-		header in case BODY_COMP_FLG is set */
 	if (flags&HDR_COMP_FLG && wh_list) {
 		/* Remove mandatory headers if they have been set */
 		for (index=0; index < veclen(mnd_hdrs, int); index++) {
@@ -1076,15 +1066,18 @@ static int mc_compress(struct sip_msg* msg, int *algo_p, int *flags_p,
 		}
 	}
 
-
-	/* Content Length must be encoded if asked for body to be encoded*/
 	if (flags&BODY_COMP_FLG) {
+		/* Body compression replaces the original Content-Length on the wire. */
 		if (!wh_list && parse_whitelist(NULL, &wh_list, NULL) < 0) {
 			LM_ERR("could not allocate new list!\n");
 			goto end;
 		}
 		wh_list->hdr_mask[HDR_CONTENTLENGTH_T/MC_BYTE_SIZE] |=
 					1 << (HDR_CONTENTLENGTH_T%MC_BYTE_SIZE);
+	} else if (wh_list) {
+		/* Keep Content-Length alongside the uncompressed body. */
+		wh_list->hdr_mask[HDR_CONTENTLENGTH_T/MC_BYTE_SIZE] &=
+					~(1 << (HDR_CONTENTLENGTH_T%MC_BYTE_SIZE));
 	}
 
 	args=pkg_malloc(sizeof(struct mc_comp_args));
@@ -1219,7 +1212,6 @@ int mc_compress_cb(char** buf_p, void* param, int type, int* olen)
 			}
 			uncompress_len += hf->len;
 		}
-		hf = 0;
 	}
 
 	str buf2compress={NULL, 0};
@@ -1725,6 +1717,12 @@ static int mc_decompress(struct sip_msg* msg)
 							2 Headers-Algo
 							3 Content-Encoding*/
 
+	/* This module rewrites msg->buf in place and then frees the message. */
+	if (msg->pkg_buf) {
+		LM_ERR("cannot decompress a message with a rebuilt pkg buffer\n");
+		return -1;
+	}
+
 	memset(hdr_vec, 0, HDRS_TO_SKIP * sizeof(struct hdr_field*));
 
 	if (parse_headers(msg, HDR_EOH_F, 0) != 0) {
@@ -1834,7 +1832,7 @@ static int mc_decompress(struct sip_msg* msg)
 
 	switch (hdrs_algo) {
 		case 0: /* deflate */
-			temp = (unsigned long)BUFLEN;
+			temp = (unsigned long)sizeof(hdr_buf);
 
 			rc = uncompress((unsigned char*)hdr_buf,
 					&temp,

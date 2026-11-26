@@ -149,7 +149,7 @@ int pv_set_sdp(struct sip_msg *msg, pv_param_t *param,
 		ops->rebuilt_sdp.s = NULL;
 
 	} else {
-		LM_ERR("sdp-set: non-NULL!\n");
+		LM_DBG("sdp-set: replacing existing SDP body\n");
 
 		if (!(val->flags & PV_VAL_STR) || val->rs.len <= 0) {
 			LM_ERR("non-empty str value required to set SDP body\n");
@@ -409,6 +409,12 @@ int sdp_ops_parse_lines(struct sdp_body_part_ops *ops, str *body)
 		if (*p != sep || (sep_len == 2 && p < (lim-1) && *(p+1) != '\n'))
 			continue;
 
+		if (i >= SDP_MAX_LINES) {
+			LM_ERR("SDP body exceeds maximum line count (%d)\n",
+					SDP_MAX_LINES);
+			return -1;
+		}
+
 		/* lines are stored *without* the ending separator */
 		ops->lines[i].line.s = start;
 		ops->lines[i].line.len = p - start;
@@ -419,6 +425,12 @@ int sdp_ops_parse_lines(struct sdp_body_part_ops *ops, str *body)
 
 	/* edge-case: the very last SDP line does not include a separator... */
 	if (start < lim) {
+		if (i >= SDP_MAX_LINES) {
+			LM_ERR("SDP body exceeds maximum line count (%d)\n",
+					SDP_MAX_LINES);
+			return -1;
+		}
+
 		ops->lines[i].line.s = start;
 		ops->lines[i].line.len = p - start;
 		ops->lines[i++].newbuf = 0;
@@ -618,6 +630,9 @@ int pv_get_sdp_line(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
 			start = p;
 			while (start < lim && is_ws(*start))
 				start++;
+			if (start >= lim)
+				break;
+			p = start - 1;
 			continue;
 		}
 
@@ -710,6 +725,18 @@ int pv_set_sdp_line(struct sip_msg *msg, pv_param_t *param,
 
 	if (pvp->match_token.prefix.s)
 		goto handle_token_edit;
+
+	if (insert) {
+		if (ops->lines_sz >= SDP_MAX_LINES) {
+			LM_ERR("cannot insert SDP line: maximum line count (%d) reached\n",
+					SDP_MAX_LINES);
+			return -1;
+		}
+	} else if (idx >= ops->lines_sz) {
+		LM_ERR("cannot edit SDP line %d: have %d lines\n", idx,
+				ops->lines_sz);
+		return -1;
+	}
 
 	/* delete line operation -> ignore the index */
 	if (!val) {
@@ -1046,6 +1073,9 @@ int pv_get_sdp_stream(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
 			start = p;
 			while (start < lim && is_ws(*start))
 				start++;
+			if (start >= lim)
+				break;
+			p = start - 1;
 			continue;
 		}
 
@@ -1138,6 +1168,18 @@ int pv_set_sdp_stream(struct sip_msg *msg, pv_param_t *param,
 
 	if (pvp->match_token.prefix.s)
 		goto handle_token_edit;
+
+	if (insert) {
+		if (ops->lines_sz >= SDP_MAX_LINES) {
+			LM_ERR("cannot insert SDP line: maximum line count (%d) reached\n",
+					SDP_MAX_LINES);
+			return -1;
+		}
+	} else if (idx >= ops->lines_sz) {
+		LM_ERR("cannot edit SDP line %d: have %d lines\n", idx,
+				ops->lines_sz);
+		return -1;
+	}
 
 	/* delete line operation -> ignore the index */
 	if (!val) {
@@ -1326,6 +1368,9 @@ int pv_get_sdp_session(struct sip_msg *msg, pv_param_t *param, pv_value_t *res)
 			start = p;
 			while (start < lim && is_ws(*start))
 				start++;
+			if (start >= lim)
+				break;
+			p = start - 1;
 			continue;
 		}
 
@@ -1418,6 +1463,18 @@ int pv_set_sdp_session(struct sip_msg *msg, pv_param_t *param,
 
 	if (pvp->match_token.prefix.s)
 		goto handle_token_edit;
+
+	if (insert) {
+		if (ops->lines_sz >= SDP_MAX_LINES) {
+			LM_ERR("cannot insert SDP line: maximum line count (%d) reached\n",
+					SDP_MAX_LINES);
+			return -1;
+		}
+	} else if (idx >= ops->lines_sz) {
+		LM_ERR("cannot edit SDP line %d: have %d lines\n", idx,
+				ops->lines_sz);
+		return -1;
+	}
 
 	/* delete line operation -> ignore the index */
 	if (!val) {

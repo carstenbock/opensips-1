@@ -88,32 +88,35 @@ static_defs=$(foreach mod, $(static_modules), \
 override extra_defs+=$(static_defs) $(EXTRA_DEFS)
 export extra_defs
 
-# If modules is supplied, only do those. If not, use all modules when
-# building documentation.
-ifeq ($(modules),)
-	doc_modules=$(all_modules)
+# Discover modules from every configured source directory.  include_modules
+# wins over exclude_modules in every collection.
+all_module_paths=$(foreach d,$(MODULE_DIRS), \
+		$(patsubst %/Makefile,%,$(wildcard $(d)/*/Makefile)))
+effective_exclude_modules=$(filter-out $(include_modules),$(exclude_modules))
+enabled_module_paths=$(filter-out \
+		$(foreach d,$(MODULE_DIRS),$(addprefix $(d)/,$(effective_exclude_modules))) \
+		$(addprefix modules/,$(static_modules)), \
+		$(all_module_paths))
+
+ifeq ($(origin modules),command line)
+selected_module_paths=$(modules)
+else ifneq ($(module),)
+selected_module_paths=$(addprefix modules/,$(module))
 else
-	doc_modules=$(modules)
+selected_module_paths=$(enabled_module_paths)
 endif
 
-# Take subset of all modules, excluding the exclude_modules and the
-# static_modules.
-modules=$(filter-out $(addprefix modules/, \
-			$(exclude_modules) $(static_modules)), \
-			$(wildcard modules/*))
-# Let modules consist of modules and include_modules (but remove
-# duplicates).
-modules:=$(filter-out $(modules), $(addprefix modules/, $(include_modules) )) \
-			$(modules)
-
-ifneq ($(module),)
-	modules:=$(addprefix modules/, $(module))
+# The default target and install select only the core-maintained collection.
+ifeq ($(origin modules),command line)
+modules=$(selected_module_paths)
+else
+modules=$(filter modules/%,$(selected_module_paths))
 endif
+all_modules_to_build=$(selected_module_paths)
 
-modules_names=$(patsubst modules/%, %.so, $(modules))
-modules_basenames=$(patsubst modules/%, %, $(modules))
-db_modules_basenames=$(filter db_%, $(modules_basenames))
-modules_full_path=$(join $(modules), $(addprefix /, $(modules_names)))
+modules_basenames=$(notdir $(modules))
+db_module_paths=$(filter modules/db_% modules-contrib/db_%,$(modules))
+modules_full_path=$(foreach m,$(modules),$(m)/$(notdir $(m)).so)
 
 ALLDEP=Makefile Makefile.sources Makefile.defs Makefile.rules Makefile.conf $(deps_gen)
 
@@ -181,23 +184,18 @@ all: $(NAME) modules utils
 app: $(NAME)
 
 
-.PHONY: _modules
-_modules: $(modules)
-
-.PHONY: $(modules)
-$(modules):
+.PHONY: $(all_module_paths)
+$(all_module_paths):
 	@$(MAKE) --no-print-directory -C $@ && \
 		echo "Building $(notdir $@) module succeeded" || (\
 			status=$$?; \
 			echo "ERROR: Building $(notdir $@) module failed!"; \
 			exit $$status; \
 		)
-
-.PHONY: modules
-modules: $(deps_gen) gen_misclibs
 ifeq (,$(FASTER))
+define build_module_collection
 	@set -e; \
-	for r in $(modules); do \
+	for r in $(1); do \
 		if [ -n "$$r" ]; then \
 			if [ -d "$$r" ]; then \
 				echo  "" ; \
@@ -206,16 +204,29 @@ ifeq (,$(FASTER))
 			fi ; \
 		fi ; \
 	done
+endef
 else
-	@$(MAKE) _modules || ( \
+define build_module_collection
+	@if [ -n "$(strip $(1))" ]; then \
+	$(MAKE) $(1) || ( \
 		status=$$?; \
 		if echo $(MAKEFLAGS) | grep -q -- --jobserver; then \
 			printf '\nBuilding one or more modules failed!\n'; \
 			printf 'Please re-run make without -j / --jobs to find out which.\n\n'; \
 		fi; \
 		exit $$status \
-	)
+	); fi
+endef
 endif
+
+.PHONY: $(MODULE_DIRS)
+$(MODULE_DIRS): $(deps_gen) gen_misclibs
+	$(call build_module_collection,$(if $(filter command line,$(origin modules)), \
+		$(selected_module_paths),$(filter $@/%,$(selected_module_paths))))
+
+.PHONY: all-modules
+all-modules: $(deps_gen) gen_misclibs
+	$(call build_module_collection,$(all_modules_to_build))
 
 gen_misclibs:
 	@set -e; \
@@ -225,155 +236,42 @@ gen_misclibs:
 		$(MAKE) -C $$r ; \
 	done
 
-.PHONY: tool-docbook2pdf
-tool-docbook2pdf:
-	@if [ -z "$(DBXML2PDF)" ]; then \
-		echo "error: docbook2pdf not found"; exit 1; \
-	fi
-
-.PHONY: tool-lynx
-tool-lynx:
-	@if [ -z "$(DBHTML2TXT)" ]; then \
-		echo "error: lynx not found"; exit 1; \
-	fi
-
-.PHONY: tool-xsltproc
-tool-xsltproc:
-	@if [ -z "$(DBXML2HTML)" ]; then \
-		echo "error: xsltproc not found"; exit 1; \
-	fi
-	@if [ -z "$(DBHTMLXSL)" ]; then \
-		echo "error: docbook.xsl not found (docbook-xsl)"; exit 1; \
-	fi
-
 .PHONY: git-dir
 git-dir:
 	@if [ ! -r .git ]; then \
 		echo "error: Not a git repo! (.git dir not found)"; exit 1; \
 	fi
 
-.PHONY: modules-contrib
-modules-contrib: git-dir
-	@set -e; ./doc/build-contrib.sh $(modules)
-
-.PHONY: modules-readme
-modules-readme: tool-lynx tool-xsltproc
-	@set -e; \
-	for mod in $(doc_modules); do \
-		r=`basename $$mod`;\
-		echo "Reading directory $$mod for module $$r";\
-		if [ ! -d "$$mod/doc" ]; then \
-			continue; \
-		fi; \
-		cd "$$mod/doc"; \
-		if [ -f "$$r".xml ]; then \
-			echo "docbook xml to html: $$r.xml"; \
-			$(DBXML2HTML) -o $$r.html $(DBXML2HTMLPARAMS) $(DBHTMLXSL) \
-						$$r.xml; \
-			echo "docbook html to txt: $$r.html"; \
-			$(DBHTML2TXT) $(DBHTML2TXTPARAMS) $$r.html >$$r.txt; \
-			echo "docbook txt to readme: $$r.txt"; \
-			rm $$r.html; \
-			mv $$r.txt ../README; \
-			echo ""; \
-		fi; \
-		cd ../../..; \
-	done
-
-.PHONY: modules-docbook-txt
-modules-docbook-txt: tool-lynx tool-xsltproc
-	@set -e; \
-	for mod in $(doc_modules); do \
-		r=`basename $$mod`;\
-		echo "Reading directory $$mod for module $$r";\
-		if [ ! -d "$$mod/doc" ]; then \
-			continue; \
-		fi; \
-		cd "$$mod/doc"; \
-		if [ -f "$$r".xml ]; then \
-			echo ""; \
-			echo "docbook xml to html: $$r.xml"; \
-			$(DBXML2HTML) -o $$r.html $(DBXML2HTMLPARAMS) $(DBHTMLXSL) \
-						$$r.xml; \
-			echo "docbook html to txt: $$r.html"; \
-			$(DBHTML2TXT) $(DBHTML2TXTPARAMS) $$r.html >$$r.txt; \
-			rm $$r.html; \
-			echo ""; \
-		fi; \
-		cd ../../..; \
-	done
-
-.PHONY: modules-docbook-html
-modules-docbook-html: tool-xsltproc
-	@set -e; \
-	for mod in $(doc_modules); do \
-		r=`basename $$mod`;\
-		echo "Reading directory $$mod for module $$r";\
-		if [ ! -d "$$mod/doc" ]; then \
-			continue; \
-		fi; \
-		cd "$$mod/doc"; \
-		if [ -f "$$r".xml ]; then \
-			echo ""; \
-			echo "docbook xml to html: $$r.xml"; \
-			$(DBXML2HTML) -o $$r.html $(DBXML2HTMLPARAMS) $(DBHTMLXSL) \
-						$$r.xml; \
-			echo ""; \
-		fi; \
-		cd ../../..; \
-	done
-
-.PHONY: modules-docbook-pdf
-modules-docbook-pdf: tool-docbook2pdf
-	@set -e; \
-	for mod in $(doc_modules); do \
-		r=`basename $$mod`;\
-		echo "Reading directory $$mod for module $$r";\
-		if [ ! -d "$$mod/doc" ]; then \
-			continue; \
-		fi; \
-		cd "$$mod/doc"; \
-		if [ -f "$$r".xml ]; then \
-			echo ""; \
-			echo "docbook xml to pdf: $$r.xml"; \
-			$(DBXML2PDF) "$$r".xml; \
-		fi; \
-		cd ../../..; \
-	done
-
-.PHONY: modules-docbook
-modules-docbook: modules-docbook-txt modules-docbook-html modules-docbook-pdf
-
 .PHONY: dbschema-docbook-txt
 dbschema-docbook-txt: dbschema
 	@set -e; \
-	for r in $(wildcard doc/database/*.sgml) "" ; do \
+	for r in $(wildcard docs/database/*.sgml) "" ; do \
 		if [ -f "$$r" ]; then \
 			echo  "" ; \
 			echo  "docbook2txt $$r" ; \
-			docbook2txt -o "doc/database/" "$$r" ; \
+			docbook2txt -o "docs/database/" "$$r" ; \
 		fi ; \
 	done
 
 .PHONY: dbschema-docbook-html
 dbschema-docbook-html: dbschema
 	@set -e; \
-	for r in $(wildcard doc/database/*.sgml) "" ; do \
+	for r in $(wildcard docs/database/*.sgml) "" ; do \
 		if [ -f "$$r" ]; then \
 			echo  "" ; \
 			echo  "docbook2html $$r" ; \
-			docbook2html --nochunks -o "doc/database/" "$$r" ; \
+			docbook2html --nochunks -o "docs/database/" "$$r" ; \
 		fi ; \
 	done
 
 .PHONY: dbschema-docbook-pdf
 dbschema-docbook-pdf: dbschema
 	@set -e; \
-	for r in $(wildcard doc/database/*.sgml) "" ; do \
+	for r in $(wildcard docs/database/*.sgml) "" ; do \
 		if [ -f "$$r" ]; then \
 			echo  "" ; \
 			echo  "docbook2pdf $$r" ; \
-			docbook2pdf -o "doc/database/" "$$r" ; \
+			docbook2pdf -o "docs/database/" "$$r" ; \
 		fi ; \
 	done
 
@@ -472,28 +370,40 @@ sunpkg:
 	rm -rf tmp/$(NAME)_sun_pkg
 
 
-.PHONY: install-app install-modules-all install
+.PHONY: install-app install-config-templates install-modules-all install
 # Install app only, excluding console, modules and module docs
 install-app: mk-install-dirs install-cfg install-bin \
-	install-app-doc install-man
+	install-app-doc install-man install-config-templates install-pi-framework
 
-# Install all module stuff (except modules-docbook?)
+# Install all module stuff
+.PHONY: install-modules-files install-modules-all
 install-modules-files: install-modules install-modules-doc
 install-modules-all: install-modules-files install-modules-dbschema
 
-# Install everything (except modules-docbook?)
+# Install everything
 install: install-app install-modules-all
 
-opensipsmc: $(cfg_prefix)/$(cfg_dir) $(data_prefix)/$(data_dir)
-	$(MAKE) -C menuconfig proper
-	$(MAKE) -C menuconfig \
-		MENUCONFIG_CFG_PATH=$(data_target)/menuconfig_templates/ \
-		MENUCONFIG_GEN_PATH=$(cfg_target) MENUCONFIG_HAVE_SOURCES=0
-	mkdir -p $(data_prefix)/$(data_dir)/menuconfig_templates/
-	$(INSTALL_TOUCH) menuconfig/configs/* $(data_prefix)/$(data_dir)/menuconfig_templates/
-	$(INSTALL_CFG) menuconfig/configs/* $(data_prefix)/$(data_dir)/menuconfig_templates/
+install-config-templates: $(data_prefix)/$(data_dir)
+	mkdir -p $(data_prefix)/$(data_dir)/examples/templates/
+	$(INSTALL_TOUCH) examples/templates/*.m4 examples/templates/README.md \
+		$(data_prefix)/$(data_dir)/examples/templates/
+	$(INSTALL_CFG) examples/templates/*.m4 \
+		$(data_prefix)/$(data_dir)/examples/templates/
+	$(INSTALL_DOC) examples/templates/README.md \
+		$(data_prefix)/$(data_dir)/examples/templates/README.md
 	sed -i -e "s#/usr/.*lib/$(NAME)/modules/#$(modules_target)#" \
-		$(data_prefix)/$(data_dir)/menuconfig_templates/*
+		$(data_prefix)/$(data_dir)/examples/templates/*.m4
+
+install-pi-framework: $(data_prefix)/$(data_dir)
+	mkdir -p $(data_prefix)/$(data_dir)/pi
+	for FILE in $(wildcard scripts/pi/*) ; do \
+		if [ -f $$FILE ] ; then \
+			$(INSTALL_TOUCH) $$FILE \
+				$(data_prefix)/$(data_dir)/pi/`basename "$$FILE"` ; \
+			$(INSTALL_CFG) $$FILE \
+				$(data_prefix)/$(data_dir)/pi/`basename "$$FILE"` ; \
+		fi ; \
+	done
 
 .PHONY: dbschema
 dbschema:
@@ -521,13 +431,10 @@ install-cfg: $(cfg_prefix)/$(cfg_dir)
 				$(cfg_prefix)/$(cfg_dir)$(NAME).cfg; \
 		fi
 
-install-bin: app $(bin_prefix)/$(bin_dir) opensipsmc utils
+install-bin: app $(bin_prefix)/$(bin_dir) utils
 		# install opensips binary
 		$(INSTALL_TOUCH) $(bin_prefix)/$(bin_dir)/$(NAME)
 		$(INSTALL_BIN) $(NAME) $(bin_prefix)/$(bin_dir)
-		# install opensips menuconfig
-		$(INSTALL_TOUCH) $(bin_prefix)/$(bin_dir)/osipsconfig
-		$(INSTALL_BIN) menuconfig/configure $(bin_prefix)/$(bin_dir)/osipsconfig
 
 .PHONY: utils
 utils:
@@ -553,10 +460,10 @@ install-modules: modules $(modules_prefix)/$(modules_dir)
 	done
 
 install-modules-dbschema:
-	@for r in $(db_modules_basenames) "" ; do \
+	@for r in $(db_module_paths) "" ; do \
 		if [ -n "$$r" ]; then \
-			if [ -f modules/"$$r"/Makefile ]; then \
-				$(MAKE) -C modules/"$$r" install_module_dbschema ; \
+			if [ -f "$$r"/Makefile ]; then \
+				$(MAKE) -C "$$r" install_module_dbschema ; \
 			fi ;\
 		fi ; \
 	done
@@ -575,12 +482,13 @@ install-app-doc: $(doc_prefix)/$(doc_dir)
 
 
 install-modules-doc: $(doc_prefix)/$(doc_dir)
-	-@for r in $(modules_basenames) "" ; do \
+	-@for r in $(modules) "" ; do \
 		if [ -n "$$r" ]; then \
-			if [ -f modules/"$$r"/README ]; then \
-				$(INSTALL_TOUCH)  $(doc_prefix)/$(doc_dir)/README."$$r" ; \
-				$(INSTALL_DOC)  modules/"$$r"/README  \
-									$(doc_prefix)/$(doc_dir)/README."$$r" ; \
+			if [ -f "$$r"/README.md ]; then \
+				name=`basename "$$r"`; \
+				$(INSTALL_TOUCH) $(doc_prefix)/$(doc_dir)/README."$$name" ; \
+				$(INSTALL_DOC) "$$r"/README.md \
+					$(doc_prefix)/$(doc_dir)/README."$$name" ; \
 			fi ; \
 		fi ; \
 	done
@@ -600,38 +508,10 @@ install-man: $(man_prefix)/$(man_dir)/man8 $(man_prefix)/$(man_dir)/man5
 			< $(NAME).cfg.5 >  $(man_prefix)/$(man_dir)/man5/$(NAME).cfg.5
 		chmod 644  $(man_prefix)/$(man_dir)/man5/$(NAME).cfg.5
 
-install-modules-docbook: $(doc_prefix)/$(doc_dir)
-	-@for r in $(modules_basenames) "" ; do \
-		if [ -n "$$r" ]; then \
-			if [ -d modules/"$$r"/doc ]; then \
-				if [ -f modules/"$$r"/doc/"$$r".txt ]; then \
-					$(INSTALL_TOUCH)  $(doc_prefix)/$(doc_dir)/"$$r".txt ; \
-					$(INSTALL_DOC)  modules/"$$r"/doc/"$$r".txt  \
-									$(doc_prefix)/$(doc_dir)/"$$r".txt ; \
-				fi ; \
-				if [ -f modules/"$$r"/doc/"$$r".html ]; then \
-					$(INSTALL_TOUCH)  $(doc_prefix)/$(doc_dir)/"$$r".html ; \
-					$(INSTALL_DOC)  modules/"$$r"/doc/"$$r".html  \
-									$(doc_prefix)/$(doc_dir)/"$$r".html ; \
-				fi ; \
-				if [ -f modules/"$$r"/doc/"$$r".pdf ]; then \
-					$(INSTALL_TOUCH)  $(doc_prefix)/$(doc_dir)/"$$r".pdf ; \
-					$(INSTALL_DOC)  modules/"$$r"/doc/"$$r".pdf  \
-									$(doc_prefix)/$(doc_dir)/"$$r".pdf ; \
-				fi ; \
-			fi ; \
-		fi ; \
-	done
-
 doxygen:
 	-@echo "Create Doxygen documentation"
 	# disable call graphes, because of the DOT dependencies
-	(cat doc/doxygen/opensips-doxygen; \
+	(cat docs/doxygen/opensips-doxygen; \
 	echo "HAVE_DOT=no" ;\
 	echo "PROJECT_NUMBER=$(NAME)-$(RELEASE)" )| doxygen -
 	-@echo "Doxygen documentation created"
-
-comp_menuconfig:
-	$(MAKE) -C menuconfig
-menuconfig: comp_menuconfig
-	./menuconfig/configure --local

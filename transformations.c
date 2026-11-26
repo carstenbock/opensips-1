@@ -76,6 +76,7 @@ trans_extra_t *tr_extra_list;
 
 static const trans_export_t core_trans[] = {
 	{str_const_init("s"), tr_parse_string, tr_eval_string},
+	{str_const_init("i"), tr_parse_integer, tr_eval_integer},
 	{str_const_init("uri"), tr_parse_uri, tr_eval_uri},
 	{str_const_init("via"), tr_parse_via, tr_eval_via},
 	{str_const_init("param"), tr_parse_paramlist, tr_eval_paramlist},
@@ -261,7 +262,7 @@ int tr_eval_string(struct sip_msg *msg, tr_param_t *tp, int subtype,
 {
 	int i, j;
 	char *p, *s, *_tr_buffer = get_tr_buffer();
-	str st;
+	str st = {0};
 	pv_value_t v;
 	pv_elem_p el=NULL;
 
@@ -324,19 +325,23 @@ int tr_eval_string(struct sip_msg *msg, tr_param_t *tp, int subtype,
 			unsigned char sha_buf[64];
 			int sha_hash_len = 0;
 
-			if (tp != 0) { // We have parameter (hmac function)
-				if(tp->type==TR_PARAM_STRING)
+			if (tp == 0 && (subtype == TR_S_SHA1_HMAC ||
+					subtype == TR_S_SHA224_HMAC || subtype == TR_S_SHA256_HMAC ||
+					subtype == TR_S_SHA384_HMAC || subtype == TR_S_SHA512_HMAC)) {
+				LM_ERR("sha hmac transformation requires a key parameter\n");
+				goto error;
+			}
+
+			if (tp != 0 && tp->type==TR_PARAM_STRING) {
+				st = tp->v.s;
+			} else if (tp != 0) {
+				if(pv_get_spec_value(msg, (pv_spec_p)tp->v.data, &v)!=0
+					|| (!(v.flags&PV_VAL_STR)) || v.rs.len<=0)
 				{
-					st = tp->v.s;
-				} else {
-					if(pv_get_spec_value(msg, (pv_spec_p)tp->v.data, &v)!=0
-						|| (!(v.flags&PV_VAL_STR)) || v.rs.len<=0)
-					{
-						LM_ERR("sha hmac transformation cannot get p1\n");
-						goto error;
-					}
-					st = v.rs;
+					LM_ERR("sha hmac transformation cannot get p1\n");
+					goto error;
 				}
+				st = v.rs;
 			}
 
 			if (subtype == TR_S_SHA1) {
@@ -957,7 +962,8 @@ int tr_eval_string(struct sip_msg *msg, tr_param_t *tp, int subtype,
 				val->flags |= PV_VAL_STR;
 				break;
 			}
-			if(val->rs.len>TR_BUFFER_SIZE-1) {
+			if(val->rs.len>TR_BUFFER_SIZE-1 ||
+				calc_base64_encode_len(val->rs.len)>TR_BUFFER_SIZE) {
 				LM_ERR("b64encode value larger than buffer\n");
 				goto error;
 			}
@@ -1105,6 +1111,34 @@ int tr_eval_string(struct sip_msg *msg, tr_param_t *tp, int subtype,
 	}
 
 	return 0;
+error:
+	val->flags = PV_VAL_NULL;
+	return -1;
+}
+
+int tr_eval_integer(struct sip_msg *msg, tr_param_t *tp, int subtype,
+		pv_value_t *val)
+{
+	if (!val)
+		return -1;
+
+	if (val->flags & PV_VAL_NULL)
+		return 0;
+
+	if (subtype != TR_I_BOOL) {
+		LM_ERR("unknown subtype %d\n", subtype);
+		goto error;
+	}
+
+	if (!pvv_is_int(val)) {
+		LM_ERR("boolean transformation requires an integer value\n");
+		goto error;
+	}
+
+	*val = val->ri ? pv_true : pv_false;
+	val->flags |= PV_VAL_BOOL;
+	return 0;
+
 error:
 	val->flags = PV_VAL_NULL;
 	return -1;
@@ -1937,6 +1971,8 @@ int tr_eval_ip(struct sip_msg *msg, tr_param_t *tp,int subtype,
 			val->flags = PV_VAL_STR;
 			break;
 		case TR_IP_RESOLVE:
+		case TR_IP_RESOLVE_V4:
+		case TR_IP_RESOLVE_V6:
 			val->flags = PV_VAL_STR;
 			if (val->rs.len + 1 > TR_BUFFER_SIZE) {
 				LM_ERR("failed to resolve host, length too large (%d)\n",
@@ -1946,7 +1982,12 @@ int tr_eval_ip(struct sip_msg *msg, tr_param_t *tp,int subtype,
 			memcpy(_tr_buffer, val->rs.s, val->rs.len);
 			_tr_buffer[val->rs.len] = '\0';
 
-			server = resolvehost(_tr_buffer, 0);
+			if (subtype == TR_IP_RESOLVE_V4)
+				server = resolvehost_af(_tr_buffer, 0, AF_INET);
+			else if (subtype == TR_IP_RESOLVE_V6)
+				server = resolvehost_af(_tr_buffer, 0, AF_INET6);
+			else
+				server = resolvehost(_tr_buffer, 0);
 			if (!server || !server->h_addr)
 			{
 				val->flags = PV_VAL_NULL;
@@ -2578,6 +2619,8 @@ int tr_eval_nameaddr(struct sip_msg *msg, tr_param_t *tp, int subtype,
 			val->flags |= (val->rs.len) ? 0 : PV_VAL_NULL;
 			break;
 		case TR_NA_PARAM:
+			if (!tp)
+				goto error;
 			if(tp->type != TR_PARAM_STRING)
 			{
 				LM_ERR("Wrong type for parameter, it must string\n");
@@ -2823,11 +2866,13 @@ error:
  * Not all transformation string parameters have the same meaning
  * Some of them are SIP headers, thus they cannot contain whitespace,
  * while others may just be strings with no additional restrictions.
- * Set "skip_param_ws" to 1 if your param may contain inside whitespace
+ * Set the mode to TR_PARSE_SPARAM_WS if your param may contain
+ * whitespace
  *		-> e.g. ' ', "foo bar", "foob\tar" ...
  */
 
-char *tr_parse_sparam(char *p, str *in, tr_param_t **tp, int skip_param_ws)
+char *tr_parse_sparam(char *p, str *in, tr_param_t **tp,
+		enum tr_parse_sparam_mode mode)
 {
 	char *p0, *ps;
 	pv_spec_t *spec = NULL;
@@ -2862,8 +2907,11 @@ char *tr_parse_sparam(char *p, str *in, tr_param_t **tp, int skip_param_ws)
 		return p;
 	} else { /* string */
 		ps = p;
-		while (is_in_str(p, in) && (skip_param_ws || !is_ws(*p))) {
-			if ((*p == TR_PARAM_MARKER || *p == TR_RBRACKET) &&
+		while (is_in_str(p, in) &&
+				(mode != TR_PARSE_SPARAM_NO_WS || !is_ws(*p))) {
+			if ((*p == TR_PARAM_MARKER ||
+					(*p == TR_RBRACKET &&
+							mode != TR_PARSE_SPARAM_WS_RBRACKET)) &&
 					(p - 1 < ps || *(p - 1) != '\\'))
 				break;
 			p++;
@@ -2976,7 +3024,7 @@ int tr_parse_string(str* in, trans_t *t)
 			goto error;
 		}
 		p++;
-		if ((p = tr_parse_sparam(p, in, &tp, 0)) == NULL)
+		if ((p = tr_parse_sparam(p, in, &tp, TR_PARSE_SPARAM_NO_WS)) == NULL)
 			goto error;
 		t->params = tp;
 		tp = 0;
@@ -3007,7 +3055,7 @@ int tr_parse_string(str* in, trans_t *t)
 			goto error;
 		}
 		p++;
-		if ((p = tr_parse_sparam(p, in, &tp, 0)) == NULL)
+		if ((p = tr_parse_sparam(p, in, &tp, TR_PARSE_SPARAM_NO_WS)) == NULL)
 			goto error;
 		t->params = tp;
 		tp = 0;
@@ -3100,7 +3148,7 @@ int tr_parse_string(str* in, trans_t *t)
 			goto error;
 		}
 		p++;
-		if ((p = tr_parse_sparam(p, in, &tp, 1)) == NULL)
+		if ((p = tr_parse_sparam(p, in, &tp, TR_PARSE_SPARAM_WS)) == NULL)
 			goto error;
 		if (tp->type == TR_PARAM_SPEC)
 		{
@@ -3196,7 +3244,7 @@ int tr_parse_string(str* in, trans_t *t)
 			goto error;
 		}
 		p++;
-		if (tr_parse_sparam(p, in, &tp, 0) == NULL)
+		if (tr_parse_sparam(p, in, &tp, TR_PARSE_SPARAM_NO_WS) == NULL)
 			goto error;
 		t->params = tp;
 		tp = 0;
@@ -3260,7 +3308,7 @@ int tr_parse_string(str* in, trans_t *t)
 			goto error;
 		}
 		p++;
-		if (tr_parse_sparam(p, in, &tp, 0) == NULL)
+		if (tr_parse_sparam(p, in, &tp, TR_PARSE_SPARAM_NO_WS) == NULL)
 			goto error;
 		t->params = tp;
 		tp = 0;
@@ -3274,6 +3322,26 @@ unknown:
 error:
 	if(tp)
 		free_tr_param(tp);
+	return -1;
+}
+
+int tr_parse_integer(str *in, trans_t *t)
+{
+	str name;
+
+	if (!in || !t)
+		return -1;
+
+	name = *in;
+	trim(&name);
+
+	if (name.len == 4 && strncasecmp(name.s, "bool", 4) == 0) {
+		t->subtype = TR_I_BOOL;
+		return 0;
+	}
+
+	LM_ERR("unknown transformation: %.*s/%.*s/%d!\n", in->len, in->s,
+			name.len, name.s, name.len);
 	return -1;
 }
 
@@ -3323,7 +3391,7 @@ int tr_parse_uri(str* in, trans_t *t)
 			goto error;
 		}
 		p++;
-		if (tr_parse_sparam(p, in, &tp, 0) == NULL)
+		if (tr_parse_sparam(p, in, &tp, TR_PARSE_SPARAM_NO_WS) == NULL)
 			goto error;
 		t->params = tp;
 		return 0;
@@ -3413,7 +3481,7 @@ int tr_parse_via(str* in, trans_t *t)
 			goto error;
 		}
 		p++;
-		if (tr_parse_sparam(p, in, &tp, 0) == NULL)
+		if (tr_parse_sparam(p, in, &tp, TR_PARSE_SPARAM_NO_WS) == NULL)
 			goto error;
 		t->params = tp;
 
@@ -3472,7 +3540,7 @@ int tr_parse_paramlist(str* in, trans_t *t)
 			goto error;
 		}
 		p++;
-		if (tr_parse_sparam(p, in, &tp, 0) == NULL)
+		if (tr_parse_sparam(p, in, &tp, TR_PARSE_SPARAM_NO_WS) == NULL)
 			goto error;
 		t->params = tp;
 
@@ -3488,7 +3556,7 @@ int tr_parse_paramlist(str* in, trans_t *t)
 			goto error;
 		}
 		p++;
-		if (tr_parse_sparam(p, in, &tp, 0) == NULL)
+		if (tr_parse_sparam(p, in, &tp, TR_PARSE_SPARAM_NO_WS) == NULL)
 			goto error;
 		t->params = tp;
 
@@ -3593,7 +3661,7 @@ parse_name:
 			goto error;
 		}
 		p++;
-		if (tr_parse_sparam(p, in, &tp, 0) == NULL)
+		if (tr_parse_sparam(p, in, &tp, TR_PARSE_SPARAM_NO_WS) == NULL)
 			goto error;
 		if (t->params)
 			t->params->next = tp;
@@ -3699,7 +3767,7 @@ int tr_parse_sdp(str *in, trans_t *t)
 			goto error;
 		}
 		p++;
-		if ((p = tr_parse_sparam(p, in, &tp, 0)) == NULL)
+		if ((p = tr_parse_sparam(p, in, &tp, TR_PARSE_SPARAM_NO_WS)) == NULL)
 			goto error;
 		t->params = tp;
 		tp = 0;
@@ -3745,7 +3813,7 @@ int tr_parse_sdp(str *in, trans_t *t)
 			goto error;
 		}
 		p++;
-		if ((p = tr_parse_sparam(p, in, &tp, 0)) == NULL)
+		if ((p = tr_parse_sparam(p, in, &tp, TR_PARSE_SPARAM_NO_WS)) == NULL)
 			goto error;
 		/* if it is a static numeric, convert it now */
 		if (tp->type == TR_PARAM_STRING) {
@@ -3810,6 +3878,12 @@ int tr_parse_ip(str *in, trans_t *t)
 	} else if (name.len == 7 && strncasecmp(name.s,"resolve",7) == 0) {
 		t->subtype = TR_IP_RESOLVE;
 		return 0;
+	} else if (name.len == 8 && strncasecmp(name.s,"resolve4",8) == 0) {
+		t->subtype = TR_IP_RESOLVE_V4;
+		return 0;
+	} else if (name.len == 8 && strncasecmp(name.s,"resolve6",8) == 0) {
+		t->subtype = TR_IP_RESOLVE_V6;
+		return 0;
 	} else if (name.len == 7 && strncasecmp(name.s,"matches",5) == 0) {
 		t->subtype = TR_IP_MATCHES;
 		if(*p!=TR_PARAM_MARKER)
@@ -3820,7 +3894,7 @@ int tr_parse_ip(str *in, trans_t *t)
 		}
 		p++;
 		LM_DBG("preparing to parse param\n");
-		if (tr_parse_sparam(p, in, &t->params, 0) == NULL)
+		if (tr_parse_sparam(p, in, &t->params, TR_PARSE_SPARAM_NO_WS) == NULL)
 			goto error;
 		return 0;
 	} else if (name.len == 9 && strncasecmp(name.s,"isprivate",9) == 0) {
@@ -3870,7 +3944,9 @@ int tr_parse_re(str *in,trans_t *t)
 		}
 		p++;
 		LM_DBG("preparing to parse param\n");
-		if (tr_parse_sparam(p, in, &tp, 1) == NULL)
+		/* The substitution expression may contain unescaped regex braces. */
+		if (tr_parse_sparam(p, in, &tp,
+				TR_PARSE_SPARAM_WS_RBRACKET) == NULL)
 			goto error;
 		t->params = tp;
 		tp = 0;

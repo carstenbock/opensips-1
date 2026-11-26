@@ -52,6 +52,7 @@ int testing_framework;
 char *testing_module = "core";
 
 char* cfg_file = 0;
+str pi_framework = {0, 0};
 char *preproc = NULL;
 unsigned int maxbuffer = MAX_RECV_BUFFER_SIZE; /* maximum buffer size we do
 						  not want to exceed during the
@@ -77,6 +78,12 @@ int no_daemon_mode = 0;
 int enable_asserts = 1;
 #else
 int enable_asserts = 0;
+#endif
+
+#ifdef EXTRA_DEBUG
+int reactor_dbg_fd_check = 1;
+#else
+int reactor_dbg_fd_check = 0;
 #endif
 /* abort process on failed assertion. disabled by default */
 int abort_on_assert = 0;

@@ -20,6 +20,7 @@
 
 #include <freeDiameter/extension.h>
 #include <sys/eventfd.h>
+#include <inttypes.h>
 
 #include "../../ut.h"
 #include "../../lib/list.h"
@@ -27,6 +28,7 @@
 #include "../../lib/hash.h"
 #include "../../evi/evi_modules.h"
 #include "../../ipc.h"
+#include "../../mem/mem.h"
 
 #include "dm_impl.h"
 #include "dm_evi.h"
@@ -114,6 +116,7 @@ static struct dm_cond *dm_get_cond(int type, diameter_reply_cb *cb, void *param)
 		return NULL;
 	}
 	memset(cond, 0, sizeof *cond);
+	cond->ref = 1;
 	cond->type = type;
 	switch (type) {
 	case DM_TYPE_EVENT:
@@ -180,7 +183,7 @@ static inline void dm_update_unreplied_req(struct msg *req)
 			LM_DBG("Diameter request timeout (unhandled), cleaning up\n");
 			list_del(&rit->list);
 			fd_msg_free(rit->req);
-			free(rit);
+			thread_free(rit);
 		} else {
 			break;
 		}
@@ -188,9 +191,8 @@ static inline void dm_update_unreplied_req(struct msg *req)
 
 	lock_release(&dm_unreplied_req_lk);
 
-	/* libc, not pkg: this runs on freeDiameter's threads, and the pkg
-	 * allocator of the process is not thread-safe */
-	ml = malloc(sizeof *ml);
+	/* freeDiameter dispatch threads share the non-thread-safe process PKG pool */
+	ml = thread_malloc(sizeof *ml);
 	if (!ml) {
 		LM_ERR("oom\n");
 		return;
@@ -220,7 +222,7 @@ int dm_remove_unreplied_req(struct msg *req)
 			list_del(&rit->list);
 			lock_release(&dm_unreplied_req_lk);
 			LM_DBG("matched unreplied req, removing from list\n");
-			free(rit);
+			thread_free(rit);
 			return 0;
 		}
 	}
@@ -267,7 +269,11 @@ out:
 
 static gen_lock_t *dm_cond_lk;
 
-static void dm_free_cond(struct dm_cond *cond)
+/* The requester gave up on @cond (see dm_cond_abandon()) and the caller is
+ * done with it: drops the reply nobody will read and the caller's reference.
+ * A DM_TYPE_COND cond is not reference counted (see dm_cond_unref()); its
+ * requester replaced it when it timed out, so it is freed here. */
+static void dm_cond_drop_abandoned(struct dm_cond *cond)
 {
 	if (cond->rpl.json) {
 		cJSON_InitHooks(&shm_mem_hooks);
@@ -278,8 +284,10 @@ static void dm_free_cond(struct dm_cond *cond)
 	if (cond->type == DM_TYPE_COND) {
 		pthread_cond_destroy(&cond->sync.cond.cond);
 		pthread_mutex_destroy(&cond->sync.cond.mutex);
+		shm_free(cond);
+		return;
 	}
-	shm_free(cond);
+	dm_cond_unref(cond);
 }
 
 int dm_cond_abandon(struct dm_cond *cond)
@@ -293,8 +301,8 @@ int dm_cond_abandon(struct dm_cond *cond)
 	return answered;
 }
 
-/* Answer side: returns 1 if the requester gave up (the caller then owns and
- * frees @cond), else 0 and the requester will be signalled */
+/* Answer side: returns 1 if the requester gave up (the caller then calls
+ * dm_cond_drop_abandoned()), else 0 and the requester will be signalled */
 static int dm_cond_answer(struct dm_cond *cond)
 {
 	int abandoned;
@@ -317,7 +325,7 @@ static void dm_cond_event_resume(int sender, void *param)
 		/* the async request timed out while this answer was on its way;
 		 * its eventfd is already closed */
 		LM_INFO("late Diameter answer for a timed-out request, dropping\n");
-		dm_free_cond(cond);
+		dm_cond_drop_abandoned(cond);
 		return;
 	}
 
@@ -327,6 +335,8 @@ static void dm_cond_event_resume(int sender, void *param)
 	} while (ret < 0 && (errno == EINTR || errno == EAGAIN));
 	if (ret < 0)
 		LM_ERR("could not notify resume: %s\n", strerror(errno));
+
+	dm_cond_unref(cond);
 }
 
 /* runs in an OpenSIPS worker, see dm_cond_signal() */
@@ -336,7 +346,7 @@ static void dm_cond_cb_run(int sender, void *param)
 
 	if (cond->sync.cb.f)
 		cond->sync.cb.f(NULL, &cond->rpl, cond->sync.cb.p);
-	shm_free(cond);
+	dm_cond_unref(cond);
 }
 
 static void dm_cond_signal(struct dm_cond *cond)
@@ -344,9 +354,10 @@ static void dm_cond_signal(struct dm_cond *cond)
 	LM_INFO("singalling %p/%d\n", cond, cond->type);
 	switch (cond->type) {
 	case DM_TYPE_EVENT:
+		dm_cond_ref(cond);
 		if (ipc_send_rpc(cond->sync.event.pid, dm_cond_event_resume, cond) < 0) {
 			LM_ERR("could not resume async MI command!\n");
-			shm_free(cond);
+			dm_cond_unref(cond);
 		}
 		break;
 	case DM_TYPE_COND:
@@ -361,7 +372,9 @@ static void dm_cond_signal(struct dm_cond *cond)
 		 * is another module's code written for a single-threaded process:
 		 * auth_aka's handler uses pkg memory and its CacheDB connection,
 		 * and two MAAs handled together corrupted the pkg allocator
-		 * ("freeing already freed pointer", S-CSCF abort). */
+		 * ("freeing already freed pointer", S-CSCF abort). The worker
+		 * releases the reference taken here. */
+		dm_cond_ref(cond);
 		if (ipc_dispatch_rpc(dm_cond_cb_run, cond) < 0) {
 			LM_ERR("could not dispatch the reply callback, running it inline\n");
 			dm_cond_cb_run(0, cond);
@@ -377,7 +390,7 @@ static int dm_auth_reply(struct msg **_msg, struct avp * avp, struct session * s
 	struct msg *msg = *_msg;
 	struct avp *a = NULL;
 	struct avp_hdr * h = NULL;
-	int rc;
+	int rc, ret;
 	str callid;
 	struct dm_cond **prpl_cond, *rpl_cond;
 	unsigned int hentry;
@@ -416,7 +429,11 @@ static int dm_auth_reply(struct msg **_msg, struct avp * avp, struct session * s
 	hash_remove_key(pending_replies, callid);
 	hash_unlock(pending_replies, hentry);
 
-	FD_CHECK(fd_msg_search_avp(msg, dm_dict.Error_Message, &a));
+	ret = fd_msg_search_avp(msg, dm_dict.Error_Message, &a);
+	if (ret != 0) {
+		LM_ERR("failed to search for Error-Message AVP: %d\n", ret);
+		a = NULL;
+	}
 	if (a) {
 		rpl_cond->rpl.is_error = 1;
 		FD_CHECK(fd_msg_avp_hdr(a, &h));
@@ -427,9 +444,10 @@ static int dm_auth_reply(struct msg **_msg, struct avp * avp, struct session * s
 	}
 	if (dm_cond_answer(rpl_cond)) {
 		LM_INFO("late Diameter answer for a timed-out request, dropping\n");
-		dm_free_cond(rpl_cond);
+		dm_cond_drop_abandoned(rpl_cond);
 	} else {
 		dm_cond_signal(rpl_cond);
+		dm_cond_unref(rpl_cond);
 	}
 
 out:
@@ -556,7 +574,7 @@ static int dm_avps2json(void *root, cJSON *avps)
 			break;
 
 		case AVP_TYPE_INTEGER64:
-			LM_DBG("%2d. got int64   AVP %s (%u), value: %ld\n", i, dm_avp.avp_name, h->avp_code, h->avp_value->i64);
+			LM_DBG("%2d. got int64   AVP %s (%u), value: %" PRId64 "\n", i, dm_avp.avp_name, h->avp_code, h->avp_value->i64);
 			num_val = (double)h->avp_value->i64;
 			break;
 
@@ -566,7 +584,7 @@ static int dm_avps2json(void *root, cJSON *avps)
 			break;
 
 		case AVP_TYPE_UNSIGNED64:
-			LM_DBG("%2d. got uint64  AVP %s (%u), value: %lu\n", i, dm_avp.avp_name, h->avp_code, h->avp_value->u64);
+			LM_DBG("%2d. got uint64  AVP %s (%u), value: %" PRIu64 "\n", i, dm_avp.avp_name, h->avp_code, h->avp_value->u64);
 			num_val = (double)h->avp_value->u64;
 			break;
 
@@ -594,8 +612,9 @@ static int dm_avps2json(void *root, cJSON *avps)
 add:
 		cJSON_AddItemToObject(item, dm_avp.avp_name, val);
 		cJSON_AddItemToArray(avps, item);
+		item = NULL;
 
-skip:		
+skip:
 		FD_CHECK_GT(fd_msg_browse(it, MSG_BRW_NEXT, &it, NULL));
 		i++;
 	}
@@ -628,13 +647,28 @@ static int dm_receive_req(struct msg **_req, struct avp * avp, struct session * 
 	avps = cJSON_CreateArray();
 	if (!avps) {
 		LM_ERR("oom 1\n");
+		cJSON_InitHooks(NULL);
 		goto error;
 	}
 
 	if (dm_avps2json(req, avps) != 0) {
 		LM_ERR("failed to pack request AVPs as JSON string\n");
-		goto error;
+		cJSON_Delete(avps);
+		avps = NULL;
+	} else {
+		avp_arr.s = cJSON_PrintUnformatted(avps);
+		if (!avp_arr.s) {
+			LM_ERR("cJSON_PrintUnformatted failed\n");
+			cJSON_Delete(avps);
+			avps = NULL;
+		} else {
+			avp_arr.len = strlen(avp_arr.s);
+		}
 	}
+	cJSON_InitHooks(NULL);
+
+	if (!avps)
+		goto error;
 
 	/* search for any "transaction identifier" in the request */
 	for (it = avps->child; it; it = it->next) {
@@ -653,8 +687,6 @@ static int dm_receive_req(struct msg **_req, struct avp * avp, struct session * 
 			break;
 		}
 	}
-
-	init_str(&avp_arr, cJSON_PrintUnformatted(avps));
 
 	/* keep the request for a while in order to be able to generate the answer */
 	if (!dm_server_autoreply_error)
@@ -684,9 +716,12 @@ static int dm_receive_req(struct msg **_req, struct avp * avp, struct session * 
 error:
 	FD_CHECK(fd_msg_free(req));
 out:
-	cJSON_PurgeString(avp_arr.s);
-	cJSON_Delete(avps);
-	cJSON_InitHooks(NULL);
+	if (avp_arr.s || avps) {
+		cJSON_InitHooks(&shm_mem_hooks);
+		cJSON_PurgeString(avp_arr.s);
+		cJSON_Delete(avps);
+		cJSON_InitHooks(NULL);
+	}
 
 	/* Release lock */
 	lock_release(&dm_inbound_req_lk);
@@ -720,6 +755,7 @@ static int dm_receive_msg(struct msg **_msg, struct avp * avp, struct session * 
 	avps = cJSON_CreateArray();
 	if (!avps) {
 		LM_ERR("oom 1\n");
+		cJSON_InitHooks(NULL);
 		goto out;
 	}
 
@@ -729,11 +765,13 @@ static int dm_receive_msg(struct msg **_msg, struct avp * avp, struct session * 
 		LM_ERR("failed to pack Message AVPs as JSON string\n");
 		cJSON_Delete(avps);
 		avps = cJSON_CreateArray();
-		if (!avps) {
-			LM_ERR("oom 2\n");
-			goto out;
-		}
 		conv_failed = 1;
+	}
+	cJSON_InitHooks(NULL);
+
+	if (!avps) {
+		LM_ERR("oom 2\n");
+		goto out;
 	}
 
 	/* Find the waiting request through the query freeDiameter matched this
@@ -794,7 +832,7 @@ static int dm_receive_msg(struct msg **_msg, struct avp * avp, struct session * 
 		}
 	}
 
-	fd_msg_search_avp(msg, dm_dict.Error_Message, &a);
+	FD_CHECK(fd_msg_search_avp(msg, dm_dict.Error_Message, &a));
 	if (a) {
 		rpl_cond->rpl.is_error = 1;
 		rc = fd_msg_avp_hdr(a, &h);
@@ -806,15 +844,19 @@ static int dm_receive_msg(struct msg **_msg, struct avp * avp, struct session * 
 	if (dm_cond_answer(rpl_cond)) {
 		/* the requester timed out: nobody will read this answer */
 		LM_INFO("late Diameter answer for a timed-out request, dropping\n");
-		dm_free_cond(rpl_cond); /* still under the shm cJSON hooks */
+		dm_cond_drop_abandoned(rpl_cond);
 	} else {
 		dm_cond_signal(rpl_cond);
+		dm_cond_unref(rpl_cond);
 	}
 
 out:
-	if (avps)
-		cJSON_Delete(avps); /* not handed over: unmatched or duplicate answer */
-	cJSON_InitHooks(NULL);
+	if (avps) {
+		/* not handed over: unmatched or duplicate answer */
+		cJSON_InitHooks(&shm_mem_hooks);
+		cJSON_Delete(avps);
+		cJSON_InitHooks(NULL);
+	}
 
 	FD_CHECK(fd_msg_free(msg));
 	*_msg = NULL;
@@ -838,10 +880,12 @@ void dm_custom_req_expired(void *data, DiamId_t sentto, size_t sentto_len,
 	 * callback, never both, so the cond is completed exactly once */
 	cond->rpl.rc = 0;
 	cond->rpl.is_error = 1;
-	if (dm_cond_answer(cond))
-		dm_free_cond(cond); /* the requester timed out first */
-	else
+	if (dm_cond_answer(cond)) {
+		dm_cond_drop_abandoned(cond); /* the requester timed out first */
+	} else {
 		dm_cond_signal(cond);
+		dm_cond_unref(cond);
+	}
 
 	fd_msg_free(*req);
 	*req = NULL;
@@ -953,7 +997,53 @@ int dm_add_pending_reply(const str *callid, struct dm_cond *reply_cond)
 	}
 
 	*cond_holder = reply_cond;
+	dm_cond_ref(reply_cond);
 	hash_unlock(pending_replies, hentry);
+
+	return 0;
+}
+
+struct dm_find_cond_ctx {
+	struct dm_cond *cond;
+	str key;
+	int found;
+};
+
+static int dm_match_pending_cond(void *param, str key, void *value)
+{
+	struct dm_find_cond_ctx *ctx = (struct dm_find_cond_ctx *)param;
+
+	if (value != ctx->cond)
+		return 0;
+
+	ctx->key = key;
+	ctx->found = 1;
+	return 1;
+}
+
+int dm_drop_pending_reply_cond(struct dm_cond *reply_cond)
+{
+	struct dm_find_cond_ctx ctx;
+	unsigned int hentry;
+
+	if (!reply_cond)
+		return 0;
+
+	for (hentry = 0; hentry < hash_size(pending_replies); hentry++) {
+		memset(&ctx, 0, sizeof ctx);
+		ctx.cond = reply_cond;
+
+		hash_lock(pending_replies, hentry);
+		map_for_each(pending_replies->entries[hentry], dm_match_pending_cond, &ctx);
+		if (!ctx.found) {
+			hash_unlock(pending_replies, hentry);
+			continue;
+		}
+
+		hash_remove(pending_replies, hentry, ctx.key);
+		hash_unlock(pending_replies, hentry);
+		return 1;
+	}
 
 	return 0;
 }
@@ -2008,9 +2098,9 @@ int dm_build_avps(struct list_head *out_avps, cJSON *array)
 				goto error;
 			} else if (ret == 0) {
 				ret = _dm_avp_add(NULL, out_avps, &my_avp, st.s, st.len, 0);
-				/* if a string, release whatever was alocated in the enc_func */
+				/* release the temporary thread buffer allocated by enc_func */
 				if (st.len >= 0)
-					pkg_free(st.s);
+					thread_free(st.s);
 				if (ret != 0) {
 					LM_ERR("failed to add encoded AVP %d, aborting request\n", code);
 					goto error;
@@ -2066,27 +2156,22 @@ static void dm_push_queue(aaa_message *msg, struct dm_cond *cond)
 	pthread_mutex_unlock(msg_send_lk);
 }
 
-/* @reply_cond is returned here because @req must not be read once it is
- * queued: the Diameter process may send and free it at once. */
-int _dm_send_message_async(aaa_conn *_, aaa_message *req, int *fd,
-		struct dm_cond **reply_cond)
+int _dm_send_message_async(aaa_conn *_, aaa_message *req, int *fd, struct dm_cond **cond)
 {
-	struct dm_cond *cond;
+	struct dm_cond *_cond;
 
 	if (!req)
 		return -1;
 
-	cond = dm_get_cond(DM_TYPE_EVENT, NULL, NULL);
-	if (!cond) {
+	_cond = dm_get_cond(DM_TYPE_EVENT, NULL, NULL);
+	if (!_cond) {
 		LM_ERR("out of memory for cond\n");
 		return -1;
 	}
 
-	*fd = cond->sync.event.fd;
-	if (reply_cond)
-		*reply_cond = cond;
-	dm_push_queue(req, cond);
-	/* WARNING: @req *cannot* be read anymore here! (dangling pointer) */
+	*fd = _cond->sync.event.fd;
+	*cond = _cond;
+	dm_push_queue(req, _cond);
 
 	LM_DBG("message queued for async sending\n");
 
@@ -2136,23 +2221,15 @@ static int _dm_get_message_reply(struct dm_cond *cond, diameter_reply *rpl)
 
 int _dm_get_message_response(struct dm_cond *cond, char **rpl_avps)
 {
-	cJSON *obj;
-	diameter_reply rpl;
-	int rc = _dm_get_message_reply(cond, &rpl);
+	int rc;
+
+	LM_DBG("reply received, Result-Code: %d (%s)\n", cond->rpl.rc,
+			cond->rpl.is_error ? "FAILURE" : "SUCCESS");
+	rc = (cond->rpl.is_error ? -1 : 0);
 
 	if (rpl_avps) {
-		obj = dm_api_get_reply(&rpl);
-		*rpl_avps = cJSON_PrintUnformatted(obj);
+		*rpl_avps = cJSON_PrintUnformatted(cond->rpl.json);
 		LM_DBG("AVPs: %s\n", *rpl_avps);
-	}
-
-	/* _dm_get_message_reply() detached the reply from @cond, so
-	 * _dm_release_message_response() can no longer free it: without this,
-	 * every answer leaked its AVP tree in shm */
-	if (rpl.json) {
-		cJSON_InitHooks(&shm_mem_hooks);
-		cJSON_Delete(rpl.json);
-		cJSON_InitHooks(NULL);
 	}
 	return rc;
 }
@@ -2172,6 +2249,7 @@ int _dm_send_message(aaa_conn *_, aaa_message *msg, struct dm_cond **reply_cond)
 	LM_DBG("queue message for sending, type %d\n", msg->type);
 
 	pthread_mutex_lock(&my_reply_cond->sync.cond.mutex);
+	my_reply_cond->answered = 0; /* reused for every request of this process */
 	dm_push_queue(msg, my_reply_cond);
 	/* WARNING: @msg *cannot* be read anymore here! (dangling pointer) */
 
@@ -2190,8 +2268,13 @@ int _dm_send_message(aaa_conn *_, aaa_message *msg, struct dm_cond **reply_cond)
 	wait_until.tv_sec = res.tv_sec;
 	wait_until.tv_nsec = res.tv_usec * 1000UL;
 
-	rc = pthread_cond_timedwait(&my_reply_cond->sync.cond.cond,
+	/* Wait for "answered", not for a non-zero rpl.rc: an answer may carry
+	 * only an Experimental-Result, and an expired request has no result
+	 * code at all (see dm_custom_req_expired()) */
+	do {
+		rc = pthread_cond_timedwait(&my_reply_cond->sync.cond.cond,
 				&my_reply_cond->sync.cond.mutex, &wait_until);
+	} while (rc == 0 && !my_reply_cond->answered);
 	pthread_mutex_unlock(&my_reply_cond->sync.cond.mutex);
 	if (rc != 0) {
 		LM_ERR("timeout (errno: %d '%s') while awaiting Diameter "
@@ -2339,6 +2422,7 @@ void _dm_destroy_message(aaa_message *msg)
 
 	dm = (struct dm_message *)msg->avpair;
 	dm_free_avps(&dm->avps);
+	dm_cond_unref(dm->reply_cond);
 	shm_free(dm);
 
 	shm_free(msg);
@@ -2469,6 +2553,8 @@ static struct dict_avp_enc_f *dm_enc_get(int code, int vendor)
 	return a?enc_type2func(a->enc):NULL;
 }
 
+/* These helpers may run on concurrent freeDiameter callback threads, so their
+ * temporary buffers must use the thread-safe allocator rather than PKG. */
 static int dict_avp_enc_ip(cJSON *obj, struct dict_avp_data *avp, int _, str *ret)
 {
 	int af;
@@ -2484,7 +2570,7 @@ static int dict_avp_enc_ip(cJSON *obj, struct dict_avp_data *avp, int _, str *re
 	if (inet_pton(af, obj->valuestring, buf) <= 0)
 		return 1; /* not a valid format */
 	ret->len = (af == AF_INET?sizeof(struct in_addr):sizeof(struct in6_addr));
-	ret->s = pkg_malloc(ret->len);
+	ret->s = thread_malloc(ret->len);
 	if (!ret->s) {
 		LM_ERR("oom in IP\n");
 		return -1;
@@ -2529,7 +2615,7 @@ static int dict_avp_enc_hex(cJSON *obj, struct dict_avp_data *avp, int _, str *r
 	if ((obj->type & cJSON_String) == 0)
 		return 1; /* encode it as it is */
 	len = strlen(obj->valuestring);
-	buf = pkg_malloc(len/2);
+	buf = thread_malloc(len/2);
 	if (!buf) {
 		LM_ERR("oom for hex encoding\n");
 		return -1;
@@ -2541,7 +2627,7 @@ static int dict_avp_enc_hex(cJSON *obj, struct dict_avp_data *avp, int _, str *r
 	ret->len = len;
 	return 0;
 error:
-	pkg_free(buf);
+	thread_free(buf);
 	LM_ERR("invalid hex encoding\n");
 	return 1;
 }
@@ -2556,20 +2642,16 @@ static cJSON *dict_avp_dec_hex(struct avp_hdr * h, struct dict_avp_data *avp)
 		LM_ERR("invalid base type for IP: %d\n", avp->avp_basetype);
 		return NULL;
 	}
-	/* libc, not pkg: answers are decoded on freeDiameter's threads, several
-	 * at a time, and the pkg allocator of the process is not thread-safe.
-	 * Two MAAs decoded together corrupted it ("freeing already freed
-	 * pointer", S-CSCF abort). */
 	if (h->avp_value->os.len == 0)
 		return cJSON_CreateString(""); /* string2hex() would write "0" */
-	buf = malloc(h->avp_value->os.len * 2 + 1);
+	buf = thread_malloc(h->avp_value->os.len * 2 + 1);
 	if (!buf) {
 		LM_ERR("oom for hex buffer\n");
 		return NULL;
 	}
 	len = string2hex((const char *)h->avp_value->os.data, h->avp_value->os.len, buf);
 	obj = cJSON_CreateStr(buf, len);
-	free(buf);
+	thread_free(buf);
 	return obj;
 }
 
@@ -2583,7 +2665,7 @@ static int dict_avp_enc_time(cJSON *obj, struct dict_avp_data *avp, int _, str *
 	if ((obj->type & cJSON_Number) == 0)
 		return 1; /* encode it as it is */
 
-	buf = pkg_malloc(sizeof(uint32_t));
+	buf = thread_malloc(sizeof(uint32_t));
 	if (!buf) {
 		LM_ERR("oom for hex encoding\n");
 		return -1;

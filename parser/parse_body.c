@@ -130,6 +130,10 @@ static char *find_line_delimiter(char* p, char* plimit, str delimiter)
 			cp1 = l_memmem(cp, delimiterhead, plimit-cp, 2);
 			if (cp1 == NULL)
 				return NULL;
+			/* ensure enough room for the delimiter match */
+			if (plimit - cp1 < 2 + delimiter.len) {
+				return NULL;
+			}
 			/* We matched '--',
 			 * now let's match the boundary delimiter */
 			if (strncmp(cp1+2, delimiter.s, delimiter.len) == 0)
@@ -141,8 +145,6 @@ static char *find_line_delimiter(char* p, char* plimit, str delimiter)
 		}
 		if (cp1[-1] == '\n' || cp1[-1] == '\r')
 			return cp1;
-		if (plimit - cp1 < 2 + delimiter.len)
-			return NULL;
 		cp = cp1 + 2 + delimiter.len;
 	}
 }
@@ -177,8 +179,8 @@ static int parse_single_part(struct body_part *part, char * start, char * end)
 		return -1;
 	}
 
-	LM_DBG("parsing part [%.*s...]\n",
-		(int)((end-start)<25?end-start:25), start);
+	LM_DBG("parsing part [%p,%p] (len=%d) [%.*s...]\n",start,end,
+		(int)(end-start), (int)((end-start)<25?(end-start):25), start);
 
 	tmp = start;
 	while (1)
@@ -208,21 +210,26 @@ static int parse_single_part(struct body_part *part, char * start, char * end)
 		}
 
 		if (hd.type == HDR_EOH_T)
-		{
-			/* remove the last \n\r from the body */
-			tmp += 2;
 			break;
-		}
 	}
 
 	part->headers.s = start;
-	part->headers.len = (tmp-2) - start;
+	part->headers.len = tmp - start;
 
 	if (part->mime < 0)
 		part->mime = ((TYPE_TEXT) << 16) + SUBTYPE_PLAIN;
 
-	part->body.s = tmp;
-	part->body.len = end - part->body.s;
+	if (tmp>end-2) {
+		/* we hit the end of body part while looking for EOH, so
+		 * it means there is no actual body */
+		part->body.s = NULL;
+		part->body.len = 0;
+	} else {
+		/* we hit the hdr<>body separator inside the body part, so
+		 * let's skip it*/
+		part->body.s = tmp + 2;
+		part->body.len = end - part->body.s;
+	}
 
 	return 0;
 };
@@ -288,8 +295,8 @@ int parse_sip_body(struct sip_msg * msg)
 
 		while (1)
 		{
-			end = find_line_delimiter(start + 1, body.s + body.len,
-				delimiter);
+			end = find_line_delimiter(start + delimiter.len + 2,
+				body.s + body.len, delimiter);
 			if (end == NULL)
 				break;
 

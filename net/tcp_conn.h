@@ -48,55 +48,8 @@
 #define DEFAULT_TCP_CONNECT_TIMEOUT 100
 /*!< Maximum number of connections */
 #define DEFAULT_TCP_MAX_CONNECTIONS 2048
-/*!< After 5 seconds, the child "returns"
-  the connection to the tcp master process */
-#define TCP_CHILD_TIMEOUT 5
 /*!< how often "tcp main" checks for timeout*/
-#define TCP_MAIN_SELECT_TIMEOUT 5
-/*!< the same as above but for children */
-#define TCP_CHILD_SELECT_TIMEOUT 2
-
-
-/* fd communication commands - internal usage ONLY */
-enum conn_cmds { CONN_DESTROY=-4, CONN_ERROR_TCPW=-3,CONN_ERROR_GENW=-2,
-		CONN_EOF=-1, CONN_RELEASE, CONN_GET_FD, CONN_NEW, ASYNC_CONNECT,
-		ASYNC_WRITE_TCPW, ASYNC_WRITE_GENW, CONN_RELEASE_WRITE };
-/* CONN_RELEASE[_WRITE], EOF, ERROR_TCPW, ASYNC_WRITE_TCPW, DESTROY can be
- *    used by TCP "reader" workers/processes
- * CONN_GET_FD, NEW, CONNECT, ERROR_GENW, ASYNC_WRITE_GENW only by generic
- *    writer workers/processes */
-
-#ifdef TCP_DEBUG_CONN
-#define tcpconn_check_add(c) \
-	do { \
-		if ((c)->proc_id > 0) { \
-			LM_CRIT("add: conn=%p already in process %d\n", \
-					(c), (c)->proc_id); \
-			abort(); \
-		} \
-		if ((c)->c_next || ((c)->c_prev)) { \
-			LM_CRIT("add: conn=%p already linked somewhere else " \
-					"prev=%p next=%p\n", (c), (c)->c_prev, (c)->c_next); \
-			abort(); \
-		} \
-	} while(0)
-
-#define tcpconn_check_del(c) \
-	do { \
-		if ((c)->proc_id != process_no) { \
-			if ((c)->proc_id != -1) { \
-				LM_CRIT("del: conn=%p already in process %d\n", \
-						(c), (c)->proc_id); \
-				abort(); \
-			} else { \
-				LM_WARN("del: conn=%p removed before proc was assigned\n", (c)); \
-			} \
-		} \
-	} while(0)
-#else
-#define tcpconn_check_add(c)
-#define tcpconn_check_del(c)
-#endif
+#define TCP_MAIN_SELECT_TIMEOUT 1000 /* ms */
 
 
 /*! \brief add a tcpconn to a list
@@ -119,19 +72,6 @@ enum conn_cmds { CONN_DESTROY=-4, CONN_ERROR_TCPW=-3,CONN_ERROR_GENW=-2,
 		if ((c)->prev) (c)->prev->next=(c)->next; \
 		(c)->prev = (c)->next = NULL; \
 	}while(0)
-
-/*! \brief look up a tcpconn in a list */
-static inline int tcpconn_list_find(struct tcp_connection *con,
-                                    struct tcp_connection *list)
-{
-	for (; list; list = list->c_next) {
-		if (con == list) {
-			return 1;
-		}
-	}
-
-	return 0;
-}
 
 #define TCPCONN_GET_PART(_id)  (_id%TCP_PARTITION_SIZE)
 #define TCP_PART(_id)  (tcp_parts[TCPCONN_GET_PART(_id)])
@@ -162,4 +102,3 @@ void tcpconn_put(struct tcp_connection* c);
 
 
 #endif
-

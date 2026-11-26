@@ -50,6 +50,7 @@
 #include "../xlog.h"
 #include "../cfg_reload.h"
 #include "../status_report.h"
+#include "../db/db_pi.h"
 #include "mi.h"
 #include "mi_trace.h"
 
@@ -213,20 +214,48 @@ static mi_response_t *mi_which_cmd(const mi_params_t *params,
 {
 	mi_item_t *resp_arr, *cmd_arr;
 	mi_response_t *resp;
+	struct mi_cmd *cmds;
 	struct mi_cmd *cmd;
 	str cmd_str;
+	int found;
+	int size;
 	int i, j;
+
+	if (get_mi_string_param(params, "command", &cmd_str.s, &cmd_str.len) < 0)
+		return init_mi_param_error();
 
 	resp = init_mi_result_array(&resp_arr);
 	if (!resp)
 		return 0;
 
-	if (get_mi_string_param(params, "command", &cmd_str.s, &cmd_str.len) < 0)
-		return init_mi_param_error();
+	if (cmd_str.len > 0 && cmd_str.s[cmd_str.len - 1] == ':') {
+		found = 0;
+		get_mi_cmds(&cmds, &size);
+		for (i = 0; i < size; i++) {
+			if (cmds[i].name.len < cmd_str.len ||
+					memcmp(cmds[i].name.s, cmd_str.s, cmd_str.len) != 0)
+				continue;
+			found = 1;
+			if (add_mi_string(resp_arr, 0, 0,
+					cmds[i].name.s, cmds[i].name.len) < 0) {
+				LM_ERR("failed to add mi item\n");
+				free_mi_response(resp);
+				return 0;
+			}
+		}
+
+		if (found)
+			return resp;
+
+		free_mi_response(resp);
+		return init_mi_error(404, MI_SSTR("unknown MI command"));
+	}
 
 	cmd = lookup_mi_cmd(cmd_str.s, cmd_str.len);
-	if (!cmd)
+	if (!cmd) {
+		free_mi_response(resp);
 		return init_mi_error(404, MI_SSTR("unknown MI command"));
+	}
 	for (i = 0; i < MAX_MI_RECIPES && cmd->recipes[i].cmd; i++) {
 		cmd_arr = add_mi_array(resp_arr, NULL, 0);
 		if (! cmd_arr) {
@@ -270,7 +299,98 @@ static mi_response_t *mi_which(const mi_params_t *params, struct mi_handler *asy
 		}
 	}
 
+	/* fork: list the aliases (the command names before they got their
+	 * module prefix) as well. opensips-cli only runs what "which" lists,
+	 * so without them "opensips-cli -x mi ul_dump" and the like stop
+	 * working, although the server still accepts these names. */
+	{
+		struct mi_cmd_alias *aliases;
+		int aliases_no;
+
+		get_mi_cmd_aliases(&aliases, &aliases_no);
+		for (i = 0; i < aliases_no; i++) {
+			if (add_mi_string(resp_arr, 0, 0,
+				aliases[i].name.s, aliases[i].name.len) < 0) {
+				LM_ERR("failed to add mi item\n");
+				free_mi_response(resp);
+				return 0;
+			}
+		}
+	}
+
 	return resp;
+}
+
+static mi_response_t *mi_which_aliases(const mi_params_t *params,
+		struct mi_handler *async_hdl)
+{
+	mi_response_t *resp;
+	mi_item_t *resp_arr, *alias_obj;
+	struct mi_cmd *cmds;
+	struct mi_cmd_alias *aliases;
+	int cmds_no, aliases_no;
+	int i;
+
+	resp = init_mi_result_array(&resp_arr);
+	if (!resp)
+		return 0;
+
+	get_mi_cmds(&cmds, &cmds_no);
+	get_mi_cmd_aliases(&aliases, &aliases_no);
+	for (i = 0; i < aliases_no; i++) {
+		if (aliases[i].cmd_idx < 0 || aliases[i].cmd_idx >= cmds_no) {
+			LM_ERR("invalid MI alias command index %d\n",
+					aliases[i].cmd_idx);
+			free_mi_response(resp);
+			return 0;
+		}
+
+		alias_obj = add_mi_object(resp_arr, NULL, 0);
+		if (!alias_obj ||
+				add_mi_string(alias_obj, MI_SSTR("alias"),
+					aliases[i].name.s, aliases[i].name.len) < 0 ||
+				add_mi_string(alias_obj, MI_SSTR("command"),
+					cmds[aliases[i].cmd_idx].name.s,
+					cmds[aliases[i].cmd_idx].name.len) < 0) {
+			LM_ERR("failed to add MI alias item\n");
+			free_mi_response(resp);
+			return 0;
+		}
+	}
+
+	return resp;
+}
+
+static mi_response_t *mi_which_alias(const mi_params_t *params,
+		struct mi_handler *async_hdl)
+{
+	struct mi_cmd *cmds;
+	struct mi_cmd_alias *aliases;
+	str alias;
+	int cmds_no, aliases_no;
+	int cmd_idx = -1;
+	int i;
+
+	if (get_mi_string_param(params, "alias", &alias.s, &alias.len) < 0)
+		return init_mi_param_error();
+
+	get_mi_cmds(&cmds, &cmds_no);
+	get_mi_cmd_aliases(&aliases, &aliases_no);
+	for (i = 0; i < aliases_no; i++) {
+		if (aliases[i].name.len != alias.len ||
+				memcmp(aliases[i].name.s, alias.s, alias.len) != 0)
+			continue;
+		if (cmd_idx >= 0 && cmd_idx != aliases[i].cmd_idx)
+			return init_mi_error(JSONRPC_AMBIG_METHOD_CODE,
+					MI_SSTR(JSONRPC_AMBIG_METHOD_MSG));
+		cmd_idx = aliases[i].cmd_idx;
+	}
+
+	if (cmd_idx < 0 || cmd_idx >= cmds_no)
+		return init_mi_error(404, MI_SSTR("unknown MI alias"));
+
+	return init_mi_result_string(cmds[cmd_idx].name.s,
+			cmds[cmd_idx].name.len);
 }
 
 
@@ -429,6 +549,109 @@ static mi_response_t *w_log_level_2(const mi_params_t *params,
 		return init_mi_param_error();
 
 	return mi_log_level(params, pid);
+}
+
+static int mi_add_profiling_proc_item(mi_item_t *procs_arr, int i)
+{
+	mi_item_t *proc_item;
+
+	proc_item = add_mi_object(procs_arr, NULL, 0);
+	if (!proc_item)
+		return -1;
+
+	if (add_mi_number(proc_item, MI_SSTR("ID"), i) < 0)
+		return -1;
+
+	if (add_mi_number(proc_item, MI_SSTR("PID"), pt[i].pid) < 0)
+		return -1;
+
+	if (add_mi_number(proc_item, MI_SSTR("Profiling level"),
+		pt[i].profiling_proc_level) < 0)
+		return -1;
+
+	if (add_mi_string(proc_item, MI_SSTR("Type"),
+		pt[i].desc, strlen(pt[i].desc)) < 0)
+		return -1;
+
+	return 0;
+}
+
+static mi_response_t *w_profiling_proc(const mi_params_t *params,
+								struct mi_handler *async_hdl)
+{
+	int id;
+	int pid;
+	int level;
+	int have_id;
+	int have_pid;
+	int have_level;
+	int target_idx = -1;
+	int i;
+	mi_response_t *resp;
+	mi_item_t *resp_obj;
+	mi_item_t *procs_arr;
+
+	have_id = (try_get_mi_int_param(params, "id", &id) == 0);
+	have_pid = (try_get_mi_int_param(params, "pid", &pid) == 0);
+	have_level = (try_get_mi_int_param(params, "level", &level) == 0);
+
+	if (have_id && have_pid)
+		return init_mi_error_extra(JSONRPC_INVAL_PARAMS_CODE,
+			MI_SSTR(JSONRPC_INVAL_PARAMS_MSG),
+			MI_SSTR("Only one of 'id' or 'pid' is allowed"));
+
+	if (have_id) {
+		if (id < 0 || id >= counted_max_processes)
+			return init_mi_error_extra(JSONRPC_INVAL_PARAMS_CODE,
+				MI_SSTR(JSONRPC_INVAL_PARAMS_MSG),
+				MI_SSTR("Bad process ID"));
+		target_idx = id;
+	} else if (have_pid) {
+		target_idx = get_process_ID_by_PID(pid);
+		if (target_idx < 0)
+			return init_mi_error_extra(JSONRPC_INVAL_PARAMS_CODE,
+				MI_SSTR(JSONRPC_INVAL_PARAMS_MSG), MI_SSTR("Bad PID"));
+	}
+
+	if (have_level) {
+		if (level < LEVEL_OFF)
+			level = LEVEL_OFF;
+		else if (level > LEVEL_FULL)
+			level = LEVEL_FULL;
+
+		if (target_idx >= 0) {
+			pt[target_idx].profiling_proc_level = level;
+		} else {
+			for (i = 0; i < counted_max_processes; i++)
+				pt[i].profiling_proc_level = level;
+		}
+		return init_mi_result_ok();
+	}
+
+	resp = init_mi_result_object(&resp_obj);
+	if (!resp)
+		return 0;
+
+	procs_arr = add_mi_array(resp_obj, MI_SSTR("Processes"));
+	if (!procs_arr) {
+		free_mi_response(resp);
+		return 0;
+	}
+
+	if (target_idx >= 0) {
+		if (mi_add_profiling_proc_item(procs_arr, target_idx) < 0) {
+			free_mi_response(resp);
+			return 0;
+		}
+	} else {
+		for (i = 0; i < counted_max_processes; i++)
+			if (mi_add_profiling_proc_item(procs_arr, i) < 0) {
+				free_mi_response(resp);
+				return 0;
+			}
+	}
+
+	return resp;
 }
 
 static mi_response_t *w_xlog_level(const mi_params_t *params,
@@ -851,188 +1074,200 @@ static mi_response_t *w_reload_routes(const mi_params_t *params,
 
 
 static const mi_export_t mi_core_cmds[] = {
+	{ "pi_list", "lists the provisioning framework", 0, 0, {
+		{w_mi_pi_list, {0}},
+		{EMPTY_MI_RECIPE}}, {0}
+	},
+	{ "pi_reload", "reloads the provisioning framework", 0, 0, {
+		{w_mi_pi_reload, {0}},
+		{EMPTY_MI_RECIPE}}, {0}
+	},
 	{ "uptime", "prints various time information about OpenSIPS - "
 		"when it started to run, for how long it runs", 0, init_mi_uptime, {
 		{mi_uptime, {0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "version", "prints the version string of a runningOpenSIPS", 0, 0, {
 		{mi_version, {0}},
 		{mi_version_1, {"revision", 0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "pwd", "prints the working directory of OpenSIPS", 0, 0, {
 		{mi_pwd, {0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "arg", "returns the full list of arguments used at startup", 0, 0, {
 		{mi_arg, {0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "which", "lists all available MI commands", 0, 0, {
 		{mi_which, {0}},
 		{mi_which_cmd, {"command", 0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {0}
+	},
+	{ "which_aliases", "lists all MI command aliases and their canonical commands", 0, 0, {
+		{mi_which_aliases, {0}},
+		{mi_which_alias, {"alias", 0}},
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "ps", "lists all processes used by OpenSIPS", 0, 0, {
 		{mi_ps, {0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "kill", "terminates OpenSIPS", 0, 0, {
 		{mi_kill, {0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "log_level", "gets/sets the per process or global log level in OpenSIPS",
 		0, 0, {
 		{w_log_level, 	{0}},
 		{w_log_level_1, {"level", 0}},
 		{w_log_level_2, {"level", "pid", 0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "xlog_level", "gets/sets the per process or global xlog level in OpenSIPS",
 		0, 0, {
 		{w_xlog_level, 	{0}},
 		{w_xlog_level_1, {"level", 0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {0}
+	},
+	{ "profiling_proc", "get/set profiling by process id, pid or all", 0, 0, {
+		{w_profiling_proc, {0}},
+		{w_profiling_proc, {"id", 0}},
+		{w_profiling_proc, {"pid", 0}},
+		{w_profiling_proc, {"level", 0}},
+		{w_profiling_proc, {"id", "level", 0}},
+		{w_profiling_proc, {"pid", "level", 0}},
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "log_level_filter", "gets/sets the per consumer log level filter",
 		0, 0, {
 		{w_log_level_filter_1, {"consumer", 0}},
 		{w_log_level_filter_2, {"consumer", "level_filter", 0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
 	{ "log_mute_state", "mute/unmute a log consumer",
 		0, 0, {
 		{w_log_mute_state_1, {"consumer", 0}},
 		{w_log_mute_state_2, {"consumer", "mute_state", 0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {0}
 	},
+	{ "reload_routes", "triggers the script (routes only) reload", 0, 0, {
+		{w_reload_routes, {0}},
+		{EMPTY_MI_RECIPE}}, {0}
+	},
+	{ "help", "prints information about MI commands usage", 0, 0, {
+		{w_mi_help, {0}},
+		{w_mi_help_1, {"mi_cmd", 0}},
+		{EMPTY_MI_RECIPE}}, {0}
+	},
+	{EMPTY_MI_EXPORT}
+};
 
+static const mi_export_t mi_tcp_cmds[] = {
+	{ "list", "list all ongoing TCP based connections, optionally filtered by proto", 0, 0, {
+		{mi_tcp_list_conns, {0}},
+		{mi_tcp_list_conns, {"proto", 0}},
+		{EMPTY_MI_RECIPE}}, {"list_tcp_conns", 0}
+	},
+	{ "close", "close a given TCP connection", 0, 0, {
+		{mi_tcp_close_conn, {"ipport", 0}},
+		{EMPTY_MI_RECIPE}}, {0}
+	},
+	{EMPTY_MI_EXPORT}
+};
+static const mi_export_t mi_mem_cmds[] = {
 #if defined(Q_MALLOC) && defined(DBG_MALLOC)
 	{ "shm_check", "complete scan of the shared memory pool "
 		"(if any error is found, OpenSIPS will abort!)", 0, 0, {
 		{mi_shm_check, {0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {"mem_shm_check", 0}
 	},
 #endif
-	{ "cache_store", "stores in a cache system a string value", 0, 0, {
-		{w_cachestore, {"system", "attr", "value", 0}},
-		{w_cachestore_1, {"system", "attr", "value", "expire", 0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
-	{ "cache_fetch", "queries for a cache stored value", 0, 0, {
-		{mi_cachefetch, {"system", "attr", 0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
-	{ "cache_remove", "removes a record from the cache system", 0, 0, {
-		{mi_cacheremove, {"system", "attr", 0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
-	{ "event_subscribe", "subscribes an event to the Event Interface", 0, 0, {
-		{w_mi_event_subscribe, {"event", "socket", 0}},
-		{w_mi_event_subscribe_1, {"event", "socket", "expire", 0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
-	{ "events_list", "lists all the events advertised through the "
-		"Event Interface", 0, 0, {
-		{mi_events_list, {0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
-	{ "subscribers_list", "lists all the Event Interface subscribers; "
-		"Params: [ event [ subscriber ]]", 0, 0, {
-		{w_mi_subscribers_list, {0}},
-		{w_mi_subscribers_list_1, {"event", 0}},
-		{w_mi_subscribers_list_2, {"event", "socket", 0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
-	{ "raise_event", "raises an event through the Event Interface; "
-		"Params: event [ params ]", 0, 0, {
-		{w_mi_raise_event, {"event", 0}},
-		{w_mi_raise_event, {"event", "params", 0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
-	{ "list_tcp_conns", "list all ongoing TCP based connections", 0, 0, {
-		{mi_tcp_list_conns, {0}},
-		{EMPTY_MI_RECIPE}
-		}
-	},
-	{ "mem_pkg_dump", "forces a status dump of the pkg memory (per process)", 0, 0, {
+	{ "pkg_dump", "forces a status dump of the pkg memory (per process)", 0, 0, {
 		{w_mem_pkg_dump_1, {"pid", 0}},
 		{w_mem_pkg_dump_2, {"pid", "log_level", 0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {"mem_pkg_dump", 0}
 	},
-	{ "mem_shm_dump", "forces a status dump of the shm memory", 0, 0, {
+	{ "shm_dump", "forces a status dump of the shm memory", 0, 0, {
 		{w_mem_shm_dump, {0}},
 		{w_mem_shm_dump_1, {"log_level", 0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {"mem_shm_dump", 0}
 	},
-	{ "mem_rpm_dump", "forces a status dump of the restart persistent memory", 0, 0, {
+	{ "rpm_dump", "forces a status dump of the restart persistent memory", 0, 0, {
 		{w_mem_rpm_dump, {0}},
 		{w_mem_rpm_dump_1, {"log_level", 0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {"mem_rpm_dump", 0}
 	},
-	{ "reload_routes", "triggers the script (routes only) reload", 0, 0, {
-		{w_reload_routes, {0}},
-		{EMPTY_MI_RECIPE}
-		}
+	{EMPTY_MI_EXPORT}
+};
+static const mi_export_t mi_cache_cmds[] = {
+	{ "store", "stores in a cache system a string value", 0, 0, {
+		{w_cachestore, {"system", "attr", "value", 0}},
+		{w_cachestore_1, {"system", "attr", "value", "expire", 0}},
+		{EMPTY_MI_RECIPE}}, {"cache_store", 0}
 	},
-	{ "sr_get_status", "gets the status (only) of a 'status-report' "
+	{ "fetch", "queries for a cache stored value", 0, 0, {
+		{mi_cachefetch, {"system", "attr", 0}},
+		{EMPTY_MI_RECIPE}}, {"cache_fetch", 0}
+	},
+	{ "remove", "removes a record from the cache system", 0, 0, {
+		{mi_cacheremove, {"system", "attr", 0}},
+		{EMPTY_MI_RECIPE}}, {"cache_remove", 0}
+	},
+	{EMPTY_MI_EXPORT}
+};
+static const mi_export_t mi_status_report_cmds[] = {
+	{ "get", "gets the status (only) of a 'status-report' "
 	"group/identifier", 0, 0, {
 		{mi_sr_get_status, {"group",0}},
 		{mi_sr_get_status, {"group","identifier",0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {"sr_get_status", 0}
 	},
-	{ "sr_list_status", "list the status of all the identifiers in OpenSIPS"
+	{ "status", "list the status of all the identifiers in OpenSIPS"
 	" or from a certain 'status-report' group", 0, 0, {
 		{mi_sr_list_status, {0}},
 		{mi_sr_list_status, {"group",0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {"sr_list_status", 0}
 	},
-	{ "sr_list_reports", "list the reports produced by some 'status-report' "
+	{ "reports", "list the reports produced by some 'status-report' "
 	"identifiers / groups" , 0, 0, {
 		{mi_sr_list_reports, {0}},
 		{mi_sr_list_reports, {"group",0}},
 		{mi_sr_list_reports, {"group","identifier",0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {"sr_list_reports", 0}
 	},
-	{ "sr_list_identifiers", "list the identifiers from a group or all",
+	{ "identifiers", "list the identifiers from a group or all",
 	0, 0, {
 		{mi_sr_list_identifiers, {0}},
 		{mi_sr_list_identifiers, {"group",0}},
-		{EMPTY_MI_RECIPE}
-		}
+		{EMPTY_MI_RECIPE}}, {"sr_list_identifiers", 0}
 	},
-
-	{ "help", "prints information about MI commands usage", 0, 0, {
-		{w_mi_help, {0}},
-		{w_mi_help_1, {"mi_cmd", 0}},
-		{EMPTY_MI_RECIPE}
-		}
+	{EMPTY_MI_EXPORT}
+};
+static const mi_export_t mi_evi_cmds[] = {
+	{ "subscribe", "subscribes an event to the Event Interface", 0, 0, {
+		{w_mi_event_subscribe, {"event", "socket", 0}},
+		{w_mi_event_subscribe_1, {"event", "socket", "expire", 0}},
+		{EMPTY_MI_RECIPE}}, {"event_subscribe", 0}
+	},
+	{ "list", "lists all the events advertised through the "
+		"Event Interface", 0, 0, {
+		{mi_events_list, {0}},
+		{EMPTY_MI_RECIPE}}, {"events_list", 0}
+	},
+	{ "subscribers", "lists all the Event Interface subscribers; "
+		"Params: [ event [ subscriber ]]", 0, 0, {
+		{w_mi_subscribers_list, {0}},
+		{w_mi_subscribers_list_1, {"event", 0}},
+		{w_mi_subscribers_list_2, {"event", "socket", 0}},
+		{EMPTY_MI_RECIPE}}, {"subscribers_list", 0}
+	},
+	{ "raise", "raises an event through the Event Interface; "
+		"Params: event [ params ]", 0, 0, {
+		{w_mi_raise_event, {"event", 0}},
+		{w_mi_raise_event, {"event", "params", 0}},
+		{EMPTY_MI_RECIPE}}, {"raise_event", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };
@@ -1043,6 +1278,26 @@ int init_mi_core(void)
 {
 	if (register_mi_mod( "core", mi_core_cmds)<0) {
 		LM_ERR("unable to register core MI cmds\n");
+		return -1;
+	}
+	if (register_mi_mod( "tcp", mi_tcp_cmds)<0) {
+		LM_ERR("unable to register tcp MI cmds\n");
+		return -1;
+	}
+	if (register_mi_mod( "mem", mi_mem_cmds)<0) {
+		LM_ERR("unable to register mem MI cmds\n");
+		return -1;
+	}
+	if (register_mi_mod( "cache", mi_cache_cmds)<0) {
+		LM_ERR("unable to register cache MI cmds\n");
+		return -1;
+	}
+	if (register_mi_mod( "status_report", mi_status_report_cmds)<0) {
+		LM_ERR("unable to register status_report MI cmds\n");
+		return -1;
+	}
+	if (register_mi_mod( "evi", mi_evi_cmds)<0) {
+		LM_ERR("unable to register evi MI cmds\n");
 		return -1;
 	}
 

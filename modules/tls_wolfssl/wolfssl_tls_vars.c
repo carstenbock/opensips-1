@@ -32,8 +32,6 @@
  *
  */
 
-#include "wolfssl_mem.h"
-
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
 #include <wolfssl/error-ssl.h>
@@ -273,13 +271,14 @@ int _wolfssl_tls_var_comp(int ind, void *ssl, str *res)
 		res->s = buf;
 		res->len = text.len;
 
-		oss_wolfSSL_Free(text.s);
+		wolfSSL_Free(text.s);
 	}
 	if (!my) wolfSSL_X509_free(cert);
 
 	return 0;
  err:
-	if (text.s) oss_wolfSSL_Free(text.s);
+	if (text.s)
+		wolfSSL_Free(text.s);
 	if (!my) wolfSSL_X509_free(cert);
 	return -1;
 }
@@ -345,6 +344,8 @@ int _wolfssl_tls_var_alt(int ind, void *ssl, str *res)
 
 		case GEN_IPADD:
 			ip.len = nm->d.iPAddress->length;
+			if (ip.len != 4 && ip.len != 16)
+				goto err;
 			ip.af = (ip.len == 16) ? AF_INET6 : AF_INET;
 			memcpy(ip.u.addr, nm->d.iPAddress->data, ip.len);
 			text.s = ip_addr2a(&ip);

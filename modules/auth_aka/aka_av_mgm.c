@@ -807,6 +807,7 @@ int aka_av_add(str *pub_id, str *priv_id, int algmask,
 		str *authenticate, str *authorize, str *ck, str *ik)
 {
 	int ret = -1;
+	struct aka_async_param *async_param = NULL;
 	struct aka_av *av;
 	struct aka_user *user = aka_user_get(pub_id, priv_id);
 	if (!user) {
@@ -819,14 +820,16 @@ int aka_av_add(str *pub_id, str *priv_id, int algmask,
 		LM_ERR("could not create new AV\n");
 		goto end;
 	}
+	av->ts = av->new_ts = get_ticks();
 	cond_lock(&user->cond);
 	aka_av_insert(user, av);
 	/* we also need to inform users we have an AV */
 	if (!list_empty(&user->async))
-		aka_signal_async(user, user->async.next);
+		async_param = aka_prepare_async(user->async.next);
 	cond_signal(&user->cond);
 	cond_unlock(&user->cond);
-	av->ts = av->new_ts = get_ticks();
+	if (async_param)
+		aka_signal_async(async_param);
 	ret = 1;
 	LM_DBG("adding av %p\n", av);
 
@@ -899,6 +902,7 @@ int aka_av_fail(str *pub_id, str *priv_id, int count)
 
 int aka_av_fail_rc(str *pub_id, str *priv_id, int count, int rc, int exp_rc)
 {
+	struct aka_async_param *async_param = NULL;
 	struct aka_user *user = aka_user_find(pub_id, priv_id);
 
 	if (!user) {
@@ -911,9 +915,11 @@ int aka_av_fail_rc(str *pub_id, str *priv_id, int count, int rc, int exp_rc)
 	user->fail_rc = rc;
 	user->fail_exp_rc = exp_rc;
 	if (!list_empty(&user->async))
-		aka_signal_async(user, user->async.next);
+		async_param = aka_prepare_async(user->async.next);
 	cond_signal(&user->cond);
 	cond_unlock(&user->cond);
+	if (async_param)
+		aka_signal_async(async_param);
 	aka_user_release(user);
 	return 0;
 }
@@ -955,10 +961,15 @@ struct aka_user_idle {
 };
 static struct aka_user_idle *aka_idle_users;
 
+struct aka_expire_ctx {
+	unsigned int ticks;
+	struct list_head expired;
+};
+
 static int aka_async_hash_iterator(void *param, str key, void *value)
 {
 	struct list_head *it, *safe, *uit, *usafe;
-	unsigned int ticks = *(unsigned int*)param;
+	struct aka_expire_ctx *ctx = param;
 	struct aka_user *user;
 	struct aka_user_impi *impi = (struct aka_user_impi *)value;
 	struct aka_user_idle *idle;
@@ -973,10 +984,10 @@ static int aka_async_hash_iterator(void *param, str key, void *value)
 		user = list_entry(uit, struct aka_user, list);
 		cond_lock(&user->cond);
 		list_for_each_safe(it, safe, &user->async) {
-			aka_check_expire_async(ticks, it);
+			aka_check_expire_async(ctx->ticks, it, &ctx->expired);
 		}
 		list_for_each_safe(it, safe, &user->avs) {
-			aka_check_expire_av(ticks, list_entry(it, struct aka_av, list),
+			aka_check_expire_av(ctx->ticks, list_entry(it, struct aka_av, list),
 				&user->impu, &user->impi->impi);
 		}
 		is_idle = (user->ref == 0 && list_empty(&user->avs) &&
@@ -1000,12 +1011,15 @@ static int aka_async_hash_iterator(void *param, str key, void *value)
 
 void aka_async_expire(unsigned int ticks, void* param)
 {
+	struct aka_expire_ctx ctx;
 	struct aka_user_idle *idle;
 	int i;
 
+	ctx.ticks = ticks;
+	INIT_LIST_HEAD(&ctx.expired);
 	for (i = 0; i < aka_users->size; i++) {
 		hash_lock(aka_users, i);
-		hash_for_each_entry(aka_users, i, aka_async_hash_iterator, &ticks);
+		hash_for_each_entry(aka_users, i, aka_async_hash_iterator, &ctx);
 		/* still under the lock of this entry, so none of them was taken
 		 * into use again */
 		while ((idle = aka_idle_users) != NULL) {
@@ -1015,4 +1029,5 @@ void aka_async_expire(unsigned int ticks, void* param)
 		}
 		hash_unlock(aka_users, i);
 	}
+	aka_resume_expired_async(&ctx.expired);
 }

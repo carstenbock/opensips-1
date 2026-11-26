@@ -251,15 +251,16 @@ error:
 	} while (0)
 
 
-sec_agree_body_t *parse_sec_agree_body(str *body)
+sec_agree_body_t *parse_sec_agree_body(const str *body)
 {
 	sec_agree_body_t *sa = NULL, *last = NULL, *first = NULL;
-	char *p, *s = NULL, *end = body->s + body->len;
+	str body_copy = *body;
+	char *p, *s = NULL, *end = body_copy.s + body_copy.len;
 	enum sec_agree_state state = SEC_AGREE_STATE_START;
 	str name, value;
 
-	LM_DBG("parsing %.*s\n", body->len, body->s);
-	for (p = body->s; p < end; p++) {
+	LM_DBG("parsing %.*s\n", body_copy.len, body_copy.s);
+	for (p = body_copy.s; p < end; p++) {
 		switch (state) {
 		case SEC_AGREE_STATE_START:
 
@@ -300,6 +301,7 @@ sec_agree_body_t *parse_sec_agree_body(str *body)
 				break;
 			case ',':
 				state = SEC_AGREE_STATE_START;
+				sa = NULL;
 				break;
 			default:
 				s = p;
@@ -331,10 +333,12 @@ sec_agree_body_t *parse_sec_agree_body(str *body)
 				break;
 			case ',':
 				state = SEC_AGREE_STATE_START;
+				sa = NULL;
 				break;
 			case '"':
 				state = SEC_AGREE_STATE_PARAM_VALUE_ENC;
 				s = p + 1;
+				break;
 			default:
 				state = SEC_AGREE_STATE_PARAM_VALUE;
 				s = p;
@@ -400,9 +404,10 @@ sec_agree_body_t *parse_sec_agree_body(str *body)
 					state = SEC_AGREE_STATE_INVALID;
 				} else {
 					if (!parse_sec_agree_parameter(sa, &name, &value))
-						if (*p == ',')
+						if (*p == ',') {
 							state = SEC_AGREE_STATE_START;
-						else
+							sa = NULL;
+						} else
 							state = SEC_AGREE_STATE_PARAM_NAME_START;
 					else
 						state = SEC_AGREE_STATE_INVALID;
@@ -446,6 +451,7 @@ sec_agree_body_t *parse_sec_agree_body(str *body)
 		case SEC_AGREE_STATE_PARAM_VALUE:
 			value.s = s;
 			value.len = p - s;
+			/* fall through */
 		case SEC_AGREE_STATE_PARAM_VALUE_END:
 			if (value.len <= 0 || parse_sec_agree_parameter(sa, &name, &value) < 0) {
 				LM_ERR("invalid parameter %.*s value len\n", name.len, name.s);

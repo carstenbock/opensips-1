@@ -20,6 +20,7 @@
  */
 
 
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -49,6 +50,8 @@
 extern str       rr_param;
 
 static int       default_timeout;
+static int       default_options_ping_interval;
+static int       default_reinvite_ping_interval;
 static int       shutdown_done = 0;
 
 extern int       seq_match_mode;
@@ -63,6 +66,8 @@ extern stat_var *failed_dlgs;
 
 int ctx_lastdstleg_idx = -1;
 int ctx_timeout_idx = -1;
+int ctx_options_ping_interval_idx = -1;
+int ctx_reinvite_ping_interval_idx = -1;
 
 static inline int dlg_update_contact(struct dlg_cell *dlg, struct sip_msg *msg,
 		unsigned int leg);
@@ -73,6 +78,121 @@ static inline int dlg_update_sdp(struct dlg_cell *dlg, struct sip_msg *msg,
 static inline void dlg_merge_tmp_sdp(struct dlg_cell *dlg, unsigned int leg);
 static void dlg_update_req_info(str *buffer, struct dlg_cell *dlg, int leg,
 		struct sip_msg *req, struct cell *t);
+
+int dlg_prepare_prack_headers(struct sip_msg *msg, str *headers, str *out,
+		int enforce_onreply_route)
+{
+	struct cseq_body *cseq;
+	str rseq_val;
+	struct hdr_field *rseq_hdr;
+	int len;
+
+	if (enforce_onreply_route &&
+		(route_type != ONREPLY_ROUTE || msg->first_line.type != SIP_REPLY ||
+		msg->first_line.u.reply.statuscode < 101 ||
+		msg->first_line.u.reply.statuscode >= 200)) {
+		if (route_type == ONREPLY_ROUTE && msg->first_line.type == SIP_REPLY &&
+				msg->first_line.u.reply.statuscode == 100) {
+			LM_ERR("scripting error: PRACK cannot be generated for 100 Trying, needs to be 101-199\n");
+			return -1;
+		}
+
+		LM_ERR("PRACK can only be generated from onreply_route for 101-199 provisional replies\n");
+		return -1;
+	}
+
+	if ((!msg->cseq && parse_headers(msg, HDR_CSEQ_F, 0) < 0) || !msg->cseq ||
+			!(cseq = get_cseq(msg))) {
+		if (enforce_onreply_route)
+			LM_ERR("missing or invalid CSeq in provisional reply\n");
+		else
+			LM_DBG("manual PRACK: no usable CSeq for RAck auto-generation\n");
+		return -1;
+	}
+	if (cseq->method_id != METHOD_INVITE) {
+		if (enforce_onreply_route)
+			LM_ERR("PRACK can only be generated for provisional INVITE replies\n");
+		else
+			LM_DBG("manual PRACK: reply CSeq method is not INVITE, skipping RAck auto-generation\n");
+		return -1;
+	}
+	if (parse_headers(msg, HDR_EOH_F, 0) < 0) {
+		if (enforce_onreply_route)
+			LM_ERR("failed to parse SIP reply headers\n");
+		else
+			LM_DBG("manual PRACK: failed to parse reply headers for RAck auto-generation\n");
+		return -1;
+	}
+
+	rseq_hdr = get_header_by_static_name(msg, "RSeq");
+	if (!rseq_hdr) {
+		LM_DBG("missing RSeq header in provisional reply\n");
+		return -2;
+	}
+	rseq_val = rseq_hdr->body;
+	trim(&rseq_val);
+	if (!rseq_val.len) {
+		LM_DBG("empty RSeq header in provisional reply\n");
+		return -2;
+	}
+
+	out->len = (headers ? headers->len : 0) + strlen("RAck: ") + rseq_val.len + 1 +
+		cseq->number.len + 1 + strlen("INVITE\r\n");
+	out->s = pkg_malloc(out->len + 1);
+	if (!out->s) {
+		LM_ERR("oom while building RAck header\n");
+		return -1;
+	}
+
+	len = 0;
+	if (headers && headers->len) {
+		memcpy(out->s, headers->s, headers->len);
+		len = headers->len;
+	}
+
+	len += snprintf(out->s + len, out->len - len + 1, "RAck: %.*s %.*s INVITE\r\n",
+			rseq_val.len, rseq_val.s, cseq->number.len, cseq->number.s);
+	if (len != out->len) {
+		LM_ERR("failed to format RAck header\n");
+		pkg_free(out->s);
+		out->s = NULL;
+		out->len = 0;
+		return -1;
+	}
+
+	return 0;
+}
+
+static void dlg_auto_prack(struct dlg_cell *dlg, struct sip_msg *rpl)
+{
+	str extra_hdrs = {0, 0};
+	int rc;
+
+	if (!(dlg->flags & DLG_FLAG_AUTOPRACK))
+		return;
+	if (!rpl || rpl == FAKED_REPLY)
+		return;
+	if (rpl->first_line.type != SIP_REPLY ||
+			rpl->first_line.u.reply.statuscode < 101 ||
+			rpl->first_line.u.reply.statuscode >= 200)
+		return;
+
+	rc = dlg_prepare_prack_headers(rpl, NULL, &extra_hdrs, 0);
+	if (rc == -2)
+		return;
+	if (rc < 0) {
+		LM_ERR("failed to prepare automatic PRACK for dialog %p [%u:%u]\n",
+			dlg, dlg->h_entry, dlg->h_id);
+		return;
+	}
+
+	rc = send_prack_indialog_request(dlg, rpl, callee_idx(dlg), NULL, NULL,
+			&extra_hdrs, NULL, NULL, NULL);
+	pkg_free(extra_hdrs.s);
+	if (rc < 0)
+		LM_ERR("failed to send automatic PRACK for dialog %p [%u:%u]\n",
+			dlg, dlg->h_entry, dlg->h_id);
+}
 
 
 static void dlg_update_ack_sdp(struct sip_msg* req, str *buffer, int rpl_code,
@@ -89,9 +209,13 @@ static void dlg_update_ack_sdp(struct sip_msg* req, str *buffer, int rpl_code,
 }
 
 
-void init_dlg_handlers(int default_timeout_p)
+void init_dlg_handlers(int default_timeout_p,
+		int default_options_ping_interval_p,
+		int default_reinvite_ping_interval_p)
 {
 	default_timeout = default_timeout_p;
+	default_options_ping_interval = default_options_ping_interval_p;
+	default_reinvite_ping_interval = default_reinvite_ping_interval_p;
 
 	/* statelessly forwarded ACK requests with SDP */
 	if (register_slcb(SLCB_REQUEST_OUT, FL_ACK_WITH_BODY,
@@ -297,7 +421,7 @@ static inline int add_dlg_rr_param(struct sip_msg *req, struct dlg_cell *dlg)
  * below ours; a UE that left out one of two identical S-CSCF entries made
  * the P-CSCF send its PRACK to the IPsec gateway's UE-facing IPv6 address.
  * Returns 0 when our entry is not found, so the caller keeps its count. */
-static unsigned int dlg_rr_skip_to_own(struct sip_msg *rpl, struct dlg_cell *dlg)
+unsigned int dlg_rr_skip_to_own(struct sip_msg *rpl, struct dlg_cell *dlg)
 {
 	char buf[RR_DLG_PARAM_SIZE];
 	struct hdr_field *hdr;
@@ -673,11 +797,21 @@ static inline void push_reply_in_dialog(struct sip_msg *req, struct sip_msg *rpl
 		}
 	}
 
-	leg = d_tmb.get_branch_index() + 1;
-
+	leg = DLG_FIRST_CALLEE_LEG;
+	/* find the first leg belonging to this transaction branch */
+	while (leg<dlg->legs_no[DLG_LEGS_USED] &&
+			dlg->legs[leg].branch_id != d_tmb.get_branch_index() + 1)
+		leg++;
+	if (leg >= dlg->legs_no[DLG_LEGS_USED]) {
+		LM_BUG("dialog leg %d[%.*s] without tm %d branch\n",
+				leg, tag.len, tag.s, d_tmb.get_branch_index() + 1);
+		if (ensure_leg_array(leg + 1, dlg) != 0)
+			goto out;
+		leg = dlg->legs_no[DLG_LEGS_USED]++;
+		dlg->legs[leg].branch_id = d_tmb.get_branch_index() + 1;
+	} else if (leg_is_answered(&dlg->legs[leg])) {
 	/* has the downstream element forked an extra branch starting from ours?
 	 * Treat these extra branches exactly the same (a callee leg) */
-	if (leg_is_answered(&dlg->legs[leg])) {
 		leg = dlg_clone_callee_leg(dlg, leg);
 		if (leg < 0) {
 			LM_ERR("failed to add callee leg!\n");
@@ -705,7 +839,10 @@ routing_info:
 	 * skip_rrs=0 would keep the full end-to-end set and the request would loop
 	 * back through the S-CSCF and this proxy instead of reaching the UE.
 	 * Topology hiding is already handled in update_leg_info(). */
-	if (rpl->REPLY_STATUS>100 && rpl->REPLY_STATUS<200 && tag.len &&
+	/* dlg_ensure_reply_leg() has no transaction at hand */
+	if (!t && (t = d_tmb.t_gett()) == T_UNDEFINED)
+		t = NULL;
+	if (rpl->REPLY_STATUS>100 && rpl->REPLY_STATUS<200 && tag.len && t &&
 	!(dlg->mod_flags & TOPOH_ONGOING)) {
 		skip_rrs = dlg->from_rr_nb +
 				TM_BRANCH(t, d_tmb.get_branch_index()).added_rr;
@@ -725,13 +862,28 @@ routing_info:
 		if (!dlg->legs_no[DLG_LEG_200OK])
 			dlg->legs_no[DLG_LEG_200OK] = leg;
 
+		/* remember the CSeq the INVITE had on this (callee) leg, as answered by
+		 * it - the initial ACK has to carry it (RFC 3261 13.2.2.4). It differs
+		 * from the caller's when the INVITE was re-sent (uac_auth), and it is not
+		 * last_gen_cseq when PRACKs were generated in between ("auto-prack") */
+		if (leg != DLG_CALLER_LEG && !dlg->legs[leg].inv_cseq.s &&
+		dlg_update_cseq(dlg, leg, &get_cseq(rpl)->number, 1) != 0)
+			LM_ERR("failed to store the INVITE cseq of leg %d\n", leg);
+
 		if (dlg->flags & DLG_FLAG_CSEQ_ENFORCE) {
 			/* increase all future requests going to this leg */
 			if (str2int( &(get_cseq(rpl)->number), &cseq_no) < 0) {
 				LM_ERR("Failed to convert cseq to integer \n");
 			} else {
-				LM_DBG("last_gen_cseq = cseq_no [%d] for method id [%d]\n", cseq_no, get_cseq(rpl)->method_id);
-				dlg->legs[dlg->legs_no[DLG_LEG_200OK]].last_gen_cseq = cseq_no;
+				if (dlg->legs[dlg->legs_no[DLG_LEG_200OK]].last_gen_cseq < cseq_no) {
+					LM_DBG("updating last_gen_cseq to reply cseq [%d] for method id [%d]\n",
+						cseq_no, get_cseq(rpl)->method_id);
+					dlg->legs[dlg->legs_no[DLG_LEG_200OK]].last_gen_cseq = cseq_no;
+				} else {
+					LM_DBG("keeping higher last_gen_cseq [%d] over reply cseq [%d] for method id [%d]\n",
+						dlg->legs[dlg->legs_no[DLG_LEG_200OK]].last_gen_cseq,
+						cseq_no, get_cseq(rpl)->method_id);
+				}
 			}
 		}
 
@@ -758,6 +910,21 @@ routing_info:
 
 out:
 	dlg_unlock_dlg(dlg);
+}
+
+/* Manual PRACK may be generated from onreply_route before the dialog reply
+ * callback has materialized the current early-dialog leg. Push the reply into
+ * dialog state first, then return the matched/newly-created callee leg. */
+int dlg_ensure_reply_leg(struct dlg_cell *dlg, struct sip_msg *rpl)
+{
+	long leg_idx = -1;
+	str empty = {0, 0};
+
+	if (!dlg || !rpl || rpl == FAKED_REPLY)
+		return -1;
+
+	push_reply_in_dialog(NULL, rpl, NULL, dlg, &empty, &empty, &leg_idx);
+	return (int)leg_idx;
 }
 
 static void _dlg_setup_reinvite_callbacks(struct cell *t, struct sip_msg *req,
@@ -898,21 +1065,24 @@ static void dlg_onreply(struct cell* t, int type, struct tmcb_params *param)
 		return;
 	}
 
-	if (type==TMCB_TRANS_DELETED) {
+	if (type==TMCB_TRANS_DELETED)
 		event = DLG_EVENT_TDEL;
-	} else if (param->code<200) {
+	else if (param->code<200)
 		event = DLG_EVENT_RPL1xx;
-		ctx_lastdstleg_set(DLG_CALLER_LEG);
-	} else if (param->code<300) {
+	else if (param->code<300)
 		event = DLG_EVENT_RPL2xx;
-		ctx_lastdstleg_set(DLG_CALLER_LEG);
-	} else {
+	else
 		event = DLG_EVENT_RPL3xx;
+
+	/* Some locally generated replies may run without a processing context. */
+	if (event != DLG_EVENT_TDEL && current_processing_ctx)
 		ctx_lastdstleg_set(DLG_CALLER_LEG);
-	}
 
 	next_state_dlg(dlg, event, DLG_DIR_UPSTREAM, &old_state, &new_state,
 	               &unref, DLG_CALLER_LEG, 1);
+
+	if (event == DLG_EVENT_RPL1xx)
+		dlg_auto_prack(dlg, rpl);
 
 	if (new_state==DLG_STATE_EARLY && old_state!=DLG_STATE_EARLY) {
 		run_dlg_callbacks(DLGCB_EARLY, dlg, rpl, DLG_DIR_UPSTREAM,
@@ -1148,8 +1318,9 @@ static void dlg_update_req_info(str *buffer, struct dlg_cell *dlg, int leg,
 	if (req && req->REQ_METHOD != METHOD_ACK)
 		dlg_update_contact(dlg, req, leg);
 	if (t && is_invite(t))
-		dlg_leg_push_cseq_map(dlg, t, DLG_CALLER_LEG, &msg);
+		dlg_leg_push_cseq_map(dlg, t, leg, &msg);
 	dlg_update_out_sdp(dlg, leg, other_leg(dlg, leg), &msg,
+			msg.first_line.type == SIP_REQUEST &&
 			msg.REQ_METHOD != METHOD_ACK);
 	free_sip_msg(&msg);
 }
@@ -1408,6 +1579,18 @@ inline static int get_dlg_timeout(struct sip_msg *msg)
 			ctx_timeout_get() : default_timeout;
 }
 
+inline static int get_dlg_options_ping_interval(struct sip_msg *msg)
+{
+	return (current_processing_ctx && (ctx_options_ping_interval_get()!=0)) ?
+			ctx_options_ping_interval_get() : default_options_ping_interval;
+}
+
+inline static int get_dlg_reinvite_ping_interval(struct sip_msg *msg)
+{
+	return (current_processing_ctx && (ctx_reinvite_ping_interval_get()!=0)) ?
+			ctx_reinvite_ping_interval_get() : default_reinvite_ping_interval;
+}
+
 
 static void unreference_dialog_cseq(void *cseq_wrap)
 {
@@ -1606,19 +1789,15 @@ static void dlg_onreq_out(struct cell* t, int type, struct tmcb_params *ps)
 	 */
 	dlg_lock_dlg(dlg);
 
-	callee_leg = d_tmb.get_branch_index() + 1;
-	LM_DBG("pushing new leg %d/%d\n",
-				callee_leg, dlg->legs_no[DLG_LEGS_USED]);
+	callee_leg = dlg->legs_no[DLG_LEGS_USED];
+	LM_DBG("pushing new leg %d\n", callee_leg);
 	if (ensure_leg_array(callee_leg + 1, dlg) != 0)
 		goto out_free;
 
 	/* store the caller SDP into each callee leg, useful for Re-INVITE pings */
 	leg = &dlg->legs[callee_leg];
-	if (callee_leg >= dlg->legs_no[DLG_LEGS_USED])
-		dlg->legs_no[DLG_LEGS_USED] = callee_leg + 1;
-	else
-		LM_BUG("wrongfully increasing callee_leg %d/%d\n",
-				callee_leg, dlg->legs_no[DLG_LEGS_USED]);
+	leg->branch_id = d_tmb.get_branch_index() + 1;
+	dlg->legs_no[DLG_LEGS_USED] = callee_leg + 1;
 
 	dlg_unlock_dlg(dlg);
 
@@ -1845,7 +2024,8 @@ int dlg_create_dialog(struct cell* t, struct sip_msg *req,unsigned int flags)
 		/* a dialog is already created - just update flags, if provisioned */
 		if (flags) {
 			dlg->flags &= ~(DLG_FLAG_PING_CALLER | DLG_FLAG_PING_CALLEE |
-			DLG_FLAG_BYEONTIMEOUT | DLG_FLAG_REINVITE_PING_CALLER | DLG_FLAG_REINVITE_PING_CALLEE);
+			DLG_FLAG_BYEONTIMEOUT | DLG_FLAG_REINVITE_PING_CALLER |
+			DLG_FLAG_REINVITE_PING_CALLEE | DLG_FLAG_AUTOPRACK);
 			dlg->flags |= flags;
 			dlg_setup_reinvite_callbacks(t, req, dlg);
 		}
@@ -1926,7 +2106,18 @@ int dlg_create_dialog(struct cell* t, struct sip_msg *req,unsigned int flags)
 		t->dialog_ctx = (void*) dlg;
 		dlg->flags |= DLG_FLAG_ISINIT;
 	}
+
 	dlg->lifetime = get_dlg_timeout(req);
+
+	if (dlg_has_options_pinging(dlg))
+		dlg->options_ping_interval = get_dlg_options_ping_interval(req);
+	else
+		dlg->options_ping_interval = 0;
+
+	if (dlg_has_reinvite_pinging(dlg))
+		dlg->reinvite_ping_interval = get_dlg_reinvite_ping_interval(req);
+	else
+		dlg->reinvite_ping_interval = 0;
 
 	_dlg_setup_reinvite_callbacks(t, req, dlg);
 
@@ -2043,6 +2234,31 @@ static unsigned int dlg_leg_get_cseq(struct dlg_cell *dlg, unsigned int leg,
 	}
 	LM_DBG("no cseq found in map for leg [%d]\n", leg);
 	return 0;
+}
+
+/* the ACK carries the CSeq of the INVITE the source leg sent to create the dialog */
+static int dlg_ack_of_initial_invite(struct dlg_cell *dlg, unsigned int leg,
+		struct sip_msg *msg)
+{
+	unsigned int ack_cseq, inv_cseq;
+
+	if (msg->REQ_METHOD != METHOD_ACK || !msg->cseq || !msg->cseq->parsed)
+		return 0;
+	if (str2int(&get_cseq(msg)->number, &ack_cseq) < 0 ||
+			str2int(&dlg->legs[leg].inv_cseq, &inv_cseq) < 0)
+		return 0;
+	return ack_cseq == inv_cseq;
+}
+
+/* CSeq number of the INVITE as seen on this leg (0 if unknown) */
+static unsigned int dlg_leg_inv_cseq(struct dlg_cell *dlg, unsigned int leg)
+{
+	unsigned int cseq;
+
+	if (!dlg->legs[leg].inv_cseq.s || !dlg->legs[leg].inv_cseq.len ||
+			str2int(&dlg->legs[leg].inv_cseq, &cseq) < 0)
+		return 0;
+	return cseq;
 }
 
 static inline void log_bogus_dst_leg(struct dlg_cell *dlg)
@@ -2351,8 +2567,11 @@ after_unlock5:
 		return;
 	}
 
-	if ( (event==DLG_EVENT_REQ || event==DLG_EVENT_REQACK)
+	if ( (event==DLG_EVENT_REQ || event==DLG_EVENT_REQACK || event==DLG_EVENT_REQPRACK)
 	&& (new_state==DLG_STATE_CONFIRMED || new_state==DLG_STATE_CONFIRMED_NA) ) {
+		int update_options_ping_timer = 0;
+		int update_reinvite_ping_timer = 0;
+
 		LM_DBG("sequential request successfully processed (dst_leg=%d)\n",
 			dst_leg);
 
@@ -2361,9 +2580,32 @@ after_unlock5:
 			dlg->lifetime = ctx_timeout_get();
 			dlg->lifetime_dirty = 1;
 		}
+		if (dlg_has_options_pinging(dlg))
+			/* update the dialog options_ping_interval timer from the processing context */
+			if (current_processing_ctx && (ctx_options_ping_interval_get()!=0) ) {
+				LM_DBG("Setting dlg->options_ping_interval from ctx_options_ping_interval_get()\n");
+				dlg->options_ping_interval = ctx_options_ping_interval_get();
+				if (dlg->state == DLG_STATE_CONFIRMED_NA ||
+				dlg->state == DLG_STATE_CONFIRMED)
+					update_options_ping_timer = 1;
+			}
+		if (dlg_has_reinvite_pinging(dlg))
+			/* update the dialog reinvite_ping_interval timer from the processing context */
+			if (current_processing_ctx && (ctx_reinvite_ping_interval_get()!=0) ) {
+				LM_DBG("Setting dlg->reinvite_ping_interval from ctx_reinvite_ping_interval_get()\n");
+				dlg->reinvite_ping_interval = ctx_reinvite_ping_interval_get();
+				if (dlg->state == DLG_STATE_CONFIRMED_NA ||
+				dlg->state == DLG_STATE_CONFIRMED)
+					update_reinvite_ping_timer = 1;
+			}
 
 		/* within dialog request */
 		run_dlg_callbacks(DLGCB_REQ_WITHIN, dlg, req, dir, dst_leg, NULL, 0, 1);
+
+		if (update_options_ping_timer)
+			update_dlg_ping_timer(dlg->pl, dlg->options_ping_interval, 0);
+		if (update_reinvite_ping_timer)
+			update_dlg_ping_timer(dlg->reinvite_pl, dlg->reinvite_ping_interval, 1);
 
 		/* update timer during sequential request? */
 		if (dlg->lifetime_dirty) {
@@ -2476,21 +2718,24 @@ after_unlock5:
 			dlg->legs[src_leg].cseq_maps) {
 				LM_DBG("dlg_leg_get_cseq(dlg, [%d], req)\n", src_leg);
 				update_val = dlg_leg_get_cseq(dlg, src_leg, req);
-				if (update_val == 0) {
-					/* No CSeq mapping exists for this ACK, which means the
-					 * INVITE it acknowledges was forwarded verbatim (its
-					 * CSeq was NOT renumbered by the dialog module). This is
-					 * the case for the initial INVITE when the proxy issued
-					 * in-dialog requests (e.g. PRACK/UPDATE for RFC 3312
-					 * preconditions) that advanced last_gen_cseq before the
-					 * ACK arrived. Per RFC 3261 13.2.2.4 / 17.1.1.3 the ACK
-					 * MUST carry the same CSeq as the acknowledged INVITE,
-					 * so leave it untouched instead of forcing it to
-					 * last_gen_cseq (a different, later in-dialog
-					 * transaction), which makes the UAS discard the ACK. */
-					LM_DBG("no cseq map for ACK on leg %d; preserving "
-						"original CSeq (last_gen_cseq=%d)\n",
-						src_leg, dlg->legs[dst_leg].last_gen_cseq);
+				if (update_val == 0 && dlg_ack_of_initial_invite(dlg, src_leg, req) &&
+				(update_val = dlg_leg_inv_cseq(dlg, dst_leg)) != 0) {
+					/* ACK of the INVITE that created the dialog: use the CSeq that INVITE
+					 * had on the destination leg (as answered by it). last_gen_cseq is not
+					 * safe here - it also counts PRACKs generated by "auto-prack" */
+					LM_DBG("using dst leg INVITE cseq [%d] for initial ACK on leg [%d]\n",
+						update_val, dst_leg);
+				} else if (update_val == 0) {
+					if (dlg->legs[dst_leg].last_gen_cseq) {
+						LM_DBG("using last generated cseq [%d] for ACK on leg [%d]\n",
+							dlg->legs[dst_leg].last_gen_cseq, dst_leg);
+						update_val = dlg->legs[dst_leg].last_gen_cseq;
+					} else if (str2int(&dlg->legs[src_leg].inv_cseq, &update_val) == 0) {
+						LM_DBG("using INVITE cseq [%d] for ACK on leg [%d]\n",
+							update_val, src_leg);
+					} else {
+						update_val = 0;
+					}
 				}
 				else {
 					LM_DBG("update_val=[%d]\n", update_val);

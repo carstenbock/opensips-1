@@ -35,16 +35,16 @@ int tcp_sync_connect_fd(const union sockaddr_union* src, const union sockaddr_un
 
 struct tcp_connection* tcp_sync_connect(const struct socket_info* send_sock,
                const union sockaddr_union* server, struct tcp_conn_profile *prof,
-               int *fd, int send2main);
+               int *fd);
 
-/* Attempts do a connect to the given destination. It returns:
- *   1 - connect was done local (completed)
- *   0 - connect launched as async (in progress)
+/* Creates a shared connection shell and lets TCP main do the real connect.
+ * Returns:
+ *   0 - connection shell created
  *  -1 - error
  */
 int tcp_async_connect(const struct socket_info* send_sock,
            const union sockaddr_union* server, struct tcp_conn_profile *prof,
-           int timeout, struct tcp_connection** c, int *ret_fd, int send2main);
+           struct tcp_connection** c, int *ret_fd);
 
 /* Responsible for writing the TCP send chunks - called under con write lock
  *	* if returns = 1 : the connection will be released for more writting
@@ -58,7 +58,21 @@ int tcp_write_on_socket(struct tcp_connection* con, int fd,
 
 /* adds an async chunk to the connection pending list */
 int tcp_async_add_chunk(struct tcp_connection *con, char *buf,
-		int len, int lock);
+			int len, int lock);
+
+/* appends a list of buffers to the async write queue */
+int tcp_async_add_chunks(struct tcp_connection *con, const struct iovec *iov,
+			int iovcnt, int lock);
+
+/*
+ * Register callbacks for subsequently queued async chunks.  The registered
+ * list is copied to every chunk until it is cleared.
+ */
+int tcp_register_fail_cb(tcp_fail_f *f, void *param, tcp_fail_free_f *free);
+/* clear the callback registered for subsequently queued chunks */
+void tcp_clear_fail_cb(void);
+
+void tcp_async_fail_chunks(struct tcp_connection *con);
 
 /* returns the first chunk to be written */
 struct tcp_async_chunk *tcp_async_get_chunk(struct tcp_connection *con);
@@ -66,5 +80,7 @@ struct tcp_async_chunk *tcp_async_get_chunk(struct tcp_connection *con);
 void tcp_async_update_write(struct tcp_connection *con, int len);
 
 int tcp_read(struct tcp_connection *c,struct tcp_req *r);
+
+int tcp_check_con_data(struct tcp_connection *c,struct tcp_req *r);
 
 #endif /* _NET_TCP_COMMON_H_ */

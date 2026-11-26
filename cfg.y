@@ -111,6 +111,7 @@
 #include "config.h"
 #include "mem/rpm_mem.h"
 #include "poll_types.h"
+#include "reactor_defs.h"
 
 #ifdef SHM_EXTRA_STATS
 #include "mem/module_info.h"
@@ -158,8 +159,10 @@ static inline void warn(char* s);
 static struct socket_id* mk_listen_id(char*, enum sip_protos, int);
 static struct socket_id* mk_listen_id_range(char*, enum sip_protos, struct port_range *);
 static struct socket_id* set_listen_id_adv(struct socket_id *, char *, int);
+static struct socket_id* mk_bond_id(char*, struct socket_bond_elem *);
 static struct multi_str *new_string(char *s);
 static struct port_range* mk_port_range(int, int);
+static struct socket_bond_elem *new_socket_bond_elem(char *name);
 static int parse_ipnet(char *in, int len, struct net **ipnet);
 static struct script_return_param *mk_script_return(enum script_return_type type)
 {
@@ -257,6 +260,7 @@ extern int cfg_parse_only_routes;
 	struct net* ipnet;
 	struct ip_addr* ipaddr;
 	struct socket_id* sockid;
+	struct socket_bond_elem* bondlst;
 	struct listen_param* listen_param;
 	struct _pv_spec *specval;
 	struct multi_str* multistr;
@@ -273,6 +277,7 @@ extern int cfg_parse_only_routes;
 %token EXIT
 %token RETURN
 %token LOG_TOK
+%token PI_FRAMEWORK
 %token ERROR
 %token ROUTE
 %token ROUTE_FAILURE
@@ -310,23 +315,21 @@ extern int cfg_parse_only_routes;
 %token LOGLEVEL
 %token LOGPREFIX
 %token LOGSTDOUT
-%token LOGSTDERROR
 %token STDERROR_ENABLED
 %token SYSLOG_ENABLED
 %token LOG_EVENT_ENABLED
 %token STDERROR_LEVEL_FILTER
 %token SYSLOG_LEVEL_FILTER
 %token LOG_EVENT_LEVEL_FILTER
+%token PARSE_ERR_LOG_LEVEL
 %token STDERROR_FORMAT
 %token SYSLOG_FORMAT
 %token LOG_JSON_BUF_SIZE
 %token LOG_MSG_BUF_SIZE
-%token LOGFACILITY
+%token LOG_RATELIMIT_PERIOD
 %token SYSLOG_FACILITY
-%token LOGNAME
 %token SYSLOG_NAME
 %token AVP_ALIASES
-%token LISTEN
 %token SOCKET
 %token MEMGROUP
 %token ALIAS
@@ -342,6 +345,8 @@ extern int cfg_parse_only_routes;
 %token DNS_USE_SEARCH
 %token MAX_WHILE_LOOPS
 %token UDP_WORKERS
+%token UDP_RX_MODE
+%token TCP_DISPATCH_MODE
 %token CHECK_VIA
 %token SHM_HASH_SPLIT_PERCENTAGE
 %token SHM_SECONDARY_HASH_SIZE
@@ -354,6 +359,7 @@ extern int cfg_parse_only_routes;
 %token MEMDUMP
 %token SHM_MEMLOG_SIZE
 %token EXECMSGTHRESHOLD
+%token WORKER_REACTOR_TIMEOUT
 %token EXECDNSTHRESHOLD
 %token TCPTHRESHOLD
 %token EVENT_SHM_THRESHOLD
@@ -381,11 +387,12 @@ extern int cfg_parse_only_routes;
 %token TCP_NO_NEW_CONN_BFLAG
 %token TCP_NO_NEW_CONN_RPLFLAG
 %token TCP_KEEPALIVE
+%token REACTOR_DBG_FD_CHECK
 %token TCP_KEEPCOUNT
 %token TCP_KEEPIDLE
 %token TCP_KEEPINTERVAL
 %token TCP_MAX_MSG_TIME
-%token TCP_PARALLEL_READ_ON_WORKERS
+%token TCP_THREADS
 %token ADVERTISED_ADDRESS
 %token ADVERTISED_PORT
 %token DISABLE_CORE
@@ -471,6 +478,9 @@ extern int cfg_parse_only_routes;
 %token ACCEPT_SUBDOMAIN
 %token FRAG
 %token REUSE_PORT
+%token ALLOW_PROXY_PROTOCOL
+%token SEND_PROXY_PROTOCOL
+%token PROXY_PROTOCOL
 %token SCRIPTVARERR
 %token SCALE_UP_TO
 %token SCALE_DOWN_TO
@@ -478,6 +488,7 @@ extern int cfg_parse_only_routes;
 %token CYCLES
 %token CYCLES_WITHIN
 %token PERCENTAGE
+%token BOND
 
 
 /*non-terminals */
@@ -497,6 +508,7 @@ extern int cfg_parse_only_routes;
 %type <sockid> any_alias
 %type <sockid> listen_id_def
 %type <sockid> phostport phostportrange
+%type <bondlst> socket_bond_elems
 %type <intval> proto port any_proto
 %type <strval> host_sep
 %type <intval> equalop compop matchop strop intop
@@ -744,6 +756,15 @@ socket_def_param: ANYCAST { IFOR();
 				| ACCEPT_SUBDOMAIN { IFOR();
 					p_tmp.flags |= SI_ACCEPT_SUBDOMAIN_ALIAS;
 					}
+				| ALLOW_PROXY_PROTOCOL { IFOR();
+					p_tmp.flags |= SI_PROXY_IN;
+					}
+				| SEND_PROXY_PROTOCOL { IFOR();
+					p_tmp.flags |= SI_PROXY_OUT;
+					}
+				| PROXY_PROTOCOL { IFOR();
+					p_tmp.flags |= SI_PROXY;
+					}
 				| USE_WORKERS NUMBER { IFOR();
 					p_tmp.workers=$2;
 					}
@@ -765,11 +786,32 @@ socket_def_params:	socket_def_param
 				 |	socket_def_param socket_def_params
 				 ;
 
+socket_bond_elems:	STRING { IFOR();
+				$$ = new_socket_bond_elem($1);
+				if (!$$) {
+					yyerror("failed to alloc BOND element\n");YYABORT;
+				}
+			}
+		|	STRING COMMA socket_bond_elems { IFOR();
+				$$ = new_socket_bond_elem($1);
+				if (!$$) {
+					yyerror("failed to alloc BOND element\n");YYABORT;
+				}
+				$$->next = $3;
+			}
+		;
+
 socket_def:	phostportrange	{ $$=$1; }
 			| phostportrange { IFOR();
 					memset(&p_tmp, 0, sizeof(p_tmp));
 				} socket_def_params	{ IFOR();
 					$$=$1; fill_socket_id(&p_tmp, $$);
+				}
+			| BOND COLON ID LBRACE socket_bond_elems RBRACE { IFOR();
+				if (!mk_bond_id($3, $5)) {
+					yyerror("failed to add new BOND socket\n");YYABORT;
+				}
+				$$ = NULL; /*trick to avoid being added as regular interface*/
 				}
 			;
 
@@ -922,6 +964,11 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 			/* in debug mode, force logging to DEBUG level*/
 			*log_level = debug_mode?L_DBG:$3;
 			}
+		| PI_FRAMEWORK EQUAL STRING { IFOR();
+			pi_framework.s = $3;
+			pi_framework.len = strlen($3);
+			}
+		| PI_FRAMEWORK EQUAL error { yyerror("string value expected"); }
 		| LOGPREFIX EQUAL STRING { IFOR();
 			if (*$3) {
 				int len = strlen($3);
@@ -960,28 +1007,6 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 			/* may be useful when integrating 3rd party libraries */
 			{ IFOR(); log_stdout=$3; }
 		| LOGSTDOUT EQUAL error { yyerror("boolean value expected"); }
-		| LOGSTDERROR EQUAL NUMBER {
-			IFOR();
-			warn("'log_stderror' is deprecated, use 'stderror_enabled' and/or"
-				"'syslog_enabled' instead");
-			if (!config_check && !debug_mode) {
-				if ($3) {
-					stderr_enabled=1;
-					syslog_enabled=0;
-				} else {
-					stderr_enabled=0;
-					syslog_enabled=1;
-				}
-
-				s_tmp.s=STDERR_CONSUMER_NAME;
-				s_tmp.len=strlen(STDERR_CONSUMER_NAME);
-				set_log_consumer_mute_state(&s_tmp, !$3);
-				s_tmp.s=SYSLOG_CONSUMER_NAME;
-				s_tmp.len=strlen(SYSLOG_CONSUMER_NAME);
-				set_log_consumer_mute_state(&s_tmp, $3);
-			}
-			}
-		| LOGSTDERROR EQUAL error { yyerror("boolean value expected"); }
 		| STDERROR_ENABLED EQUAL NUMBER {
 			/* in config-check or debug mode we force logging
 			 * to standard error */
@@ -1033,6 +1058,9 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 		| LOG_EVENT_LEVEL_FILTER EQUAL snumber { IFOR();
 							log_event_level_filter = $3; }
 		| LOG_EVENT_LEVEL_FILTER EQUAL error { yyerror("number expected"); }
+		| PARSE_ERR_LOG_LEVEL EQUAL snumber { IFOR();
+							parse_err_log_level = $3; }
+		| PARSE_ERR_LOG_LEVEL EQUAL error { yyerror("number expected"); }
 		| STDERROR_FORMAT EQUAL STRING { IFOR();
 			s_tmp.s = $3;
 			s_tmp.len = strlen($3);
@@ -1101,14 +1129,17 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 			}
 			}
 		| LOG_MSG_BUF_SIZE EQUAL error { yyerror("number expected"); }
-		| LOGFACILITY EQUAL ID { IFOR();
-			warn("'log_facility' is deprecated, use 'syslog_facility' instead");
-			if ( (i_tmp=str2facility($3))==-1)
-				yyerror("bad facility (see syslog(3) man page)");
-			if (!config_check)
-				log_facility=i_tmp;
+		| LOG_RATELIMIT_PERIOD EQUAL NUMBER { IFOR();
+			if ($3 > LOG_RATELIMIT_PERIOD_MAX) {
+				LM_WARN("config file %s, line %d: log_ratelimit_period %ld is "
+					"above the maximum, using %d\n", get_cfg_file_name, line,
+					$3, LOG_RATELIMIT_PERIOD_MAX);
+				log_ratelimit_period = LOG_RATELIMIT_PERIOD_MAX;
+			} else {
+				log_ratelimit_period = $3;
 			}
-		| LOGFACILITY EQUAL error { yyerror("ID expected"); }
+			}
+		| LOG_RATELIMIT_PERIOD EQUAL error { yyerror("number expected"); }
 		| SYSLOG_FACILITY EQUAL ID { IFOR();
 			if ( (i_tmp=str2facility($3))==-1)
 				yyerror("bad facility (see syslog(3) man page)");
@@ -1116,10 +1147,6 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 				log_facility=i_tmp;
 			}
 		| SYSLOG_FACILITY EQUAL error { yyerror("ID expected"); }
-		| LOGNAME EQUAL STRING { IFOR();
-			warn("'log_name' is deprecated, use 'syslog_name' instead");
-			log_name=$3; }
-		| LOGNAME EQUAL error { yyerror("string value expected"); }
 		| SYSLOG_NAME EQUAL STRING { IFOR(); log_name=$3; }
 		| SYSLOG_NAME EQUAL error { yyerror("string value expected"); }
 		| DNS EQUAL NUMBER   { IFOR(); received_dns|= ($3)?DO_DNS:0; }
@@ -1148,6 +1175,16 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 				udp_auto_scaling_profile=$5;
 		}
 		| UDP_WORKERS EQUAL error { yyerror("number expected"); }
+		| UDP_RX_MODE EQUAL STRING { IFOR();
+				if (parse_udp_rx_mode($3) < 0)
+					yyerror("udp_rx_mode: auto, shared, exclusive or reuseport expected");
+				}
+		| UDP_RX_MODE EQUAL error { yyerror("string value expected"); }
+		| TCP_DISPATCH_MODE EQUAL STRING { IFOR();
+				if (parse_tcp_dispatch_mode($3) < 0)
+					yyerror("tcp_dispatch_mode: auto, shared, exclusive or per_worker expected");
+				}
+		| TCP_DISPATCH_MODE EQUAL error { yyerror("string value expected"); }
 		| TIMER_WORKERS EQUAL NUMBER { IFOR();
 				timer_workers_no=$3;
 		}
@@ -1253,6 +1290,8 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 		| MEMDUMP EQUAL error { yyerror("int value expected"); }
 		| EXECMSGTHRESHOLD EQUAL NUMBER {  IFOR();execmsgthreshold=$3; }
 		| EXECMSGTHRESHOLD EQUAL error { yyerror("int value expected"); }
+		| WORKER_REACTOR_TIMEOUT EQUAL NUMBER { IFOR(); worker_reactor_timeout=$3; }
+		| WORKER_REACTOR_TIMEOUT EQUAL error { yyerror("int value expected"); }
 		| EXECDNSTHRESHOLD EQUAL NUMBER { IFOR(); execdnsthreshold=$3; }
 		| EXECDNSTHRESHOLD EQUAL error { yyerror("int value expected"); }
 		| TCPTHRESHOLD EQUAL NUMBER { IFOR(); tcpthreshold=$3; }
@@ -1371,15 +1410,21 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 				tcp_keepalive=!!$3;
 		}
 		| TCP_KEEPALIVE EQUAL error { yyerror("boolean value expected"); }
+		| REACTOR_DBG_FD_CHECK EQUAL NUMBER { IFOR();
+				reactor_dbg_fd_check=!!$3;
+				}
+		| REACTOR_DBG_FD_CHECK EQUAL error { yyerror("boolean value expected"); }
 		| TCP_MAX_MSG_TIME EQUAL NUMBER { IFOR();
 				tcp_max_msg_time=$3;
 		}
-		| TCP_MAX_MSG_TIME EQUAL error { yyerror("boolean value expected"); }
-		| TCP_PARALLEL_READ_ON_WORKERS EQUAL NUMBER { IFOR();
-				tcp_parallel_read_on_workers=!!$3;
+		| TCP_MAX_MSG_TIME EQUAL error { yyerror("number expected"); }
+		| TCP_THREADS EQUAL NUMBER { IFOR();
+				if ($3 <= 0)
+					yyerror("invalid 'tcp_threads' value");
+				tcp_threads=$3;
 		}
-		| TCP_PARALLEL_READ_ON_WORKERS EQUAL error {
-			yyerror("boolean value expected");
+		| TCP_THREADS EQUAL error {
+			yyerror("number value expected");
 		}
 		| TCP_KEEPCOUNT EQUAL NUMBER 		{ IFOR();
 			#ifndef HAVE_TCP_KEEPCNT
@@ -1442,19 +1487,6 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 							}
 						}
 		| SOCKET EQUAL  error { yyerror("ip address or hostname "
-						"expected (use quotes if the hostname includes"
-						" config keywords)"); }
-		| LISTEN EQUAL socket_def { IFOR();
-							warn("'listen' is deprecated, use 'socket' instead");
-							for (lst_tmp = $3; lst_tmp; lst_tmp = lst_tmp->next) {
-								if (add_listening_socket(lst_tmp)!=0){
-									LM_CRIT("cfg. parser: failed"
-											" to add listen address\n");
-									break;
-								}
-							}
-						}
-		| LISTEN EQUAL  error { yyerror("ip address or hostname "
 						"expected (use quotes if the hostname includes"
 						" config keywords)"); }
 		| MEMGROUP EQUAL STRING COLON multi_string { IFOR();
@@ -2743,6 +2775,21 @@ static struct socket_id* mk_listen_id(char* host, enum sip_protos proto,
 	return l;
 }
 
+static struct socket_id* mk_bond_id(char *bond_name,
+		struct socket_bond_elem *bond_list)
+{
+	struct socket_id *sid;
+
+	sid = mk_listen_id( bond_name, PROTO_BOND, 0);
+	if (!sid) {
+		LM_CRIT("cfg. parser: out of memory.\n");
+		return NULL;
+	}
+	sid->bond_list = bond_list;
+	add_bond_socket_id(sid);
+	return sid;
+}
+
 static struct socket_id* mk_listen_id_range(char* host, enum sip_protos proto, struct port_range *pr)
 {
 	int port;
@@ -2760,6 +2807,20 @@ static struct socket_id* mk_listen_id_range(char* host, enum sip_protos proto, s
 		pr = pr->next;
 	}
 	return first_sid;
+}
+
+static struct socket_bond_elem *new_socket_bond_elem(char *name)
+{
+	struct socket_bond_elem *elem = pkg_malloc(sizeof *elem);
+
+	if (!elem) {
+		LM_CRIT("cfg. parser: out of memory.\n");
+		pkg_free(name);
+		return NULL;
+	}
+	elem->name = name;
+	elem->next = NULL;
+	return elem;
 }
 
 static void fill_socket_id(struct listen_param *param, struct socket_id *s)

@@ -139,88 +139,6 @@ static inline int find_first_route(struct sip_msg* _m)
 
 
 /*
- * Find out if a URI contains r2 parameter which indicates
- * that we put 2 record routes
- */
-static inline int is_2rr(str* _params)
-{
-	str s;
-	int i, state = 0;
-
-	if (_params->len == 0) return 0;
-	s = *_params;
-
-	for(i = 0; i < s.len; i++) {
-		switch(state) {
-		case 0:
-			switch(s.s[i]) {
-			case ' ':
-			case '\r':
-			case '\n':
-			case '\t':           break;
-			case 'r':
-			case 'R': state = 1; break;
-			default:  state = 4; break;
-			}
-			break;
-
-		case 1:
-			switch(s.s[i]) {
-			case '2': state = 2; break;
-			default:  state = 4; break;
-			}
-			break;
-
-		case 2:
-			switch(s.s[i]) {
-			case ';':  return 1;
-			case '=':  return 1;
-			case ' ':
-			case '\r':
-			case '\n':
-			case '\t': state = 3; break;
-			default:   state = 4; break;
-			}
-			break;
-
-		case 3:
-			switch(s.s[i]) {
-			case ';':  return 1;
-			case '=':  return 1;
-			case ' ':
-			case '\r':
-			case '\n':
-			case '\t': break;
-			default:   state = 4; break;
-			}
-			break;
-
-		case 4:
-			switch(s.s[i]) {
-			case '\"': state = 5; break;
-			case ';':  state = 0; break;
-			default:              break;
-			}
-			break;
-
-		case 5:
-			switch(s.s[i]) {
-			case '\\': state = 6; break;
-			case '\"': state = 4; break;
-			default:              break;
-			}
-			break;
-
-		case 6: state = 5; break;
-		}
-	}
-
-	if ((state == 2) || (state == 3)) return 1;
-	else return 0;
-}
-
-
-/*
  * Check if URI is myself
  */
 #ifdef ENABLE_USER_CHECK
@@ -358,6 +276,7 @@ static inline int get_maddr_uri(str *uri, struct sip_uri *puri)
 {
 	static char builturi[RH_MADDR_PARAM_MAX_LEN+1];
 	struct sip_uri turi;
+	int len;
 
 	if(uri==NULL || uri->s==NULL)
 		return RR_ERROR;
@@ -380,6 +299,12 @@ static inline int get_maddr_uri(str *uri, struct sip_uri *puri)
 		LM_ERR( "Too long maddr parameter\n");
 		return RR_ERROR;
 	}
+	len = 4 + puri->maddr_val.len
+					+ ((puri->port.len>0)?(1+puri->port.len):0);
+	if( len > RH_MADDR_PARAM_MAX_LEN ) {
+		LM_ERR( "Too long maddr URI\n");
+		return RR_ERROR;
+	}
 	memcpy( builturi, "sip:", 4 );
 	memcpy( builturi+4, puri->maddr_val.s, puri->maddr_val.len );
 
@@ -390,8 +315,7 @@ static inline int get_maddr_uri(str *uri, struct sip_uri *puri)
 				puri->port.len);
 	}
 
-	uri->len = 4+puri->maddr_val.len
-					+ ((puri->port.len>0)?(1+puri->port.len):0);
+	uri->len = len;
 	builturi[uri->len]='\0';
 	uri->s = builturi;
 

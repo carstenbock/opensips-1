@@ -133,13 +133,19 @@ static int cJSON_strcasecmp(const unsigned char *s1, const unsigned char *s2)
     return tolower(*s1) - tolower(*s2);
 }
 
-/* Thread-local: aaa_diameter switches the hooks to shm around every JSON it
- * builds on freeDiameter's threads. With process-wide hooks, one thread
- * resetting them while another was still building made part of that tree
- * come from the process's private pkg memory, and the SIP worker that later
- * read the reply segfaulted on it. */
-static __thread void *(*cJSON_malloc)(size_t sz) = osips_pkg_malloc;
-static __thread void (*cJSON_free)(void *ptr) = osips_pkg_free;
+#if defined(__GNUC__) || defined(__clang__)
+#define CJSON_TLS __thread
+#elif defined(_MSC_VER)
+#define CJSON_TLS __declspec(thread)
+#else
+#error "Thread-local storage support required for cJSON allocator hooks"
+#endif
+
+/* allocator hooks are switched at runtime; keep them thread-local to avoid
+ * cross-thread SHM/PKG allocator mixing when cJSON_InitHooks() is used */
+static CJSON_TLS void *(*cJSON_malloc)(size_t sz) = osips_pkg_malloc;
+static CJSON_TLS void (*cJSON_free)(void *ptr) = osips_pkg_free;
+#undef CJSON_TLS
 
 static unsigned char* cJSON_strdup(const unsigned char* str)
 {

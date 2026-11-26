@@ -174,13 +174,17 @@ int add_event(pres_ev_t* event)
 		}
 	}
 
-	ev->content_type.s = (char*)shm_malloc(event->content_type.len);
-	if(ev->content_type.s== NULL)
-	{
-		ERR_MEM(SHARE_MEM);
+	/* optional - events with no mandatory body may have none */
+	if (event->content_type.s && event->content_type.len > 0) {
+		ev->content_type.s = (char*)shm_malloc(event->content_type.len);
+		if(ev->content_type.s== NULL)
+		{
+			ERR_MEM(SHARE_MEM);
+		}
+		ev->content_type.len= event->content_type.len;
+		memcpy(ev->content_type.s, event->content_type.s,
+			event->content_type.len);
 	}
-	ev->content_type.len= event->content_type.len;
-	memcpy(ev->content_type.s, event->content_type.s, event->content_type.len);
 
 	sep= strchr(event->name.s, '.');
 	if(sep != NULL && strncasecmp(sep+1, "winfo", 5)== 0)
@@ -226,6 +230,7 @@ int add_event(pres_ev_t* event)
 	ev->aux_free_body= event->aux_free_body;
 	ev->free_body= event->free_body;
 	ev->build_empty_pres_info= event->build_empty_pres_info;
+	ev->build_notify_headers = event->build_notify_headers;
 	ev->build_notify_body= event->build_notify_body;
 	ev->default_expires= event->default_expires;
 
@@ -447,4 +452,3 @@ void destroy_evlist(void)
 		shm_free(EvList);
     }
 }
-

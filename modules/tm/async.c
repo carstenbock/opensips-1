@@ -28,7 +28,7 @@
 #include "../../action.h"
 #include "../../context.h"
 #include "../../reactor_defs.h"
-#include "../../route_trace.h"
+#include "../../profiling.h"
 #include <time.h>
 #include "h_table.h"
 #include "t_lookup.h"
@@ -39,7 +39,7 @@
 typedef struct _async_tm_ctx {
 	/* generic async context - MUST BE FIRST */
 	async_ctx  async;
-	route_trace_ctx_t parent_ctx;
+	profiling_ctx_t parent_ctx;
 	int parent_ctx_set;
 	/* the script route to be used to continue after the resume function;
 	 * this is a reference in shm mem, that needs separated free */
@@ -93,6 +93,15 @@ int t_resume_async_request(int fd, void*param, int was_timeout)
 	struct cell *t= ctx->t;
 	int route;
 
+	/* check the marker t==NULL indicating that this resume 
+	 * makes no sense anymore and it should be discarded. This may happen
+	 * when a async start failed and it was handled in sync mode, but
+	 * some resume jobs were left set */
+	if (t==NULL) {
+		LM_DBG("resuming with NULL transaction -> silent discard \n");
+		return 0;
+	}
+
 	if (valid_async_fd(fd))
 		LM_DBG("resuming request on fd %d, transaction %p \n", fd, t);
 	else
@@ -131,8 +140,8 @@ int t_resume_async_request(int fd, void*param, int was_timeout)
 	backup_list = set_avp_list( &t->user_avps );
 	/* set default send address to the saved value */
 	backup_si = bind_address;
-	if (t->uac[0])
-		bind_address = TM_BRANCH( t, 0).request.dst.send_sock;
+	bind_address =
+		t->nr_of_outgoings ? TM_BRANCH( t, 0).request.dst.send_sock : NULL;
 
 	/* the resume function may already reply (e.g. auth_aka sends its
 	 * challenge from there), so it must run under the route type the async
@@ -200,7 +209,7 @@ route:
 			ctx->resume_route->name.s);
 	} else {
 		if (ctx->parent_ctx_set)
-			route_trace_set_ctx(&ctx->parent_ctx);
+			profiling_set_ctx(&ctx->parent_ctx);
 		run_resume_route( ctx->resume_route, &faked_req, 1);
 	}
 
@@ -354,7 +363,7 @@ route:
 	} else {
 		swap_route_type(route, ctx->route_type);
 		if (ctx->parent_ctx_set)
-			route_trace_set_ctx(&ctx->parent_ctx);
+			profiling_set_ctx(&ctx->parent_ctx);
 		/* do not run any post script callback, we are a reply */
 		run_resume_route( ctx->resume_route, ctx->reply, 0);
 		set_route_type(route);
@@ -412,6 +421,7 @@ restore:
 int t_resume_async(int fd, void *param, int was_timeout)
 {
 	async_tm_ctx *ctx = (async_tm_ctx *)param;
+	int rc;
 
 	if (current_processing_ctx) {
 		LM_CRIT("BUG - a context is already set (%p), overwriting it...\n",
@@ -419,12 +429,21 @@ int t_resume_async(int fd, void *param, int was_timeout)
 		set_global_context(NULL);
 	}
 
+	profiling_proc_enter( LEVEL_SIP,
+		sss_merge256( ctx->async.resume_f_name, " -> ",
+			ctx->resume_route->name.s),
+		0 );
+
 	/* for now we only support async in REQUEST and ONREPLY routes,
 	 * dispatch to the correct resume function */
 	if (ctx->reply) {
-		return t_resume_async_reply(fd,param,was_timeout); 
+		rc = t_resume_async_reply(fd,param,was_timeout); 
 	} else
-		return t_resume_async_request(fd,param,was_timeout); 
+		rc = t_resume_async_request(fd,param,was_timeout); 
+
+	profiling_proc_exit( LEVEL_SIP, "async-cfg resume handler", rc );
+
+	return rc;
 }
 
 
@@ -455,7 +474,7 @@ int t_handle_async(struct sip_msg *msg, struct action* a,
 	} else {
 		/* update the cloned UAS (from transaction)
 		 * with data from current msg */
-		if ((t->uas.request) && (route_type==REQUEST_ROUTE) && ((msg->msg_flags & FL_TM_FAKE_REQ) == 0))
+		if ((t->uas.request) && (route_type==REQUEST_ROUTE))
 			update_cloned_msg_from_msg( t->uas.request, msg);
 	}
 
@@ -475,7 +494,7 @@ int t_handle_async(struct sip_msg *msg, struct action* a,
 
 	memset(ctx,0,sizeof(async_tm_ctx));
 	ctx->async.timeout_s = timeout;
-	ctx->parent_ctx_set = route_trace_get_ctx(&ctx->parent_ctx);
+	ctx->parent_ctx_set = profiling_get_ctx(&ctx->parent_ctx);
 	if (ctx->parent_ctx_set) {
 		struct timespec ts;
 		int have_sys = 0;
@@ -567,17 +586,6 @@ async:
 		goto sync;
 	}
 	ctx->route_type = route_type;
-	ctx->msg_ctx = current_processing_ctx;
-	ctx->t = t;
-	ctx->kr = get_kr();
-
-	ctx->cancelled_t = get_cancelled_t();
-	ctx->e2eack_t = get_e2eack_t();
-
-	set_global_context(NULL);
-	set_t(T_UNDEFINED);
-	reset_cancelled_t();
-	reset_e2eack_t();
 
 	if (async_status!=ASYNC_NO_FD) {
 		LM_DBG("placing async job into reactor with timeouts %d/%d\n",
@@ -600,18 +608,32 @@ async:
 			LM_ERR("failed to add async FD to reactor -> act in sync mode\n");
 		 	/* as attaching to reactor failed, we have to run in sync mode,
 			 * so we have to restore the environment -- razvanc */
-			set_global_context(ctx->msg_ctx);
-			set_t(t);
-			set_cancelled_t(ctx->cancelled_t);
-			set_e2eack_t(ctx->e2eack_t);
 			goto sync;
 		}
 	}
+
+	ctx->msg_ctx = current_processing_ctx;
+	ctx->t = t;
+	ctx->kr = get_kr();
+
+	ctx->cancelled_t = get_cancelled_t();
+	ctx->e2eack_t = get_e2eack_t();
+
+	set_global_context(NULL);
+	set_t(T_UNDEFINED);
+	reset_cancelled_t();
+	reset_e2eack_t();
 
 	/* done, break the script */
 	return 0;
 
 sync:
+	/* as a marker of SYNC-handling of an ASYNC operation the `t`
+	 * (transaction) is NULL - this will be used by
+	 * the resume function t_resume_async_request() to actually ignore
+	 * any resume attempts on jobs which actually did not covert into
+	 * an async op (like a failed async +  ebr_wait due to wrong route type) */
+
 	/* run the resume function */
 	do {
 		async_status = ASYNC_DONE;

@@ -129,7 +129,7 @@ int unpack_hepv12(char *buf, int len, struct hep_desc* h)
 	int offset = 0, hl;
 
 	struct hep_hdr *heph;
-	char *hep_payload, *end, *hep_ip;
+	char *hep_payload, *hep_ip;
 	struct hep_timehdr* heptime_tmp, heptime;
 
 	struct hepv12 h12;
@@ -137,7 +137,6 @@ int unpack_hepv12(char *buf, int len, struct hep_desc* h)
     memset(&heptime, 0, sizeof(struct hep_timehdr));
 
 	hl = offset = sizeof(struct hep_hdr);
-    end = buf + len;
 
 	if (len < offset) {
 		LM_ERR("len less than offset [%d] vs [%d]\n", len, offset);
@@ -161,7 +160,7 @@ int unpack_hepv12(char *buf, int len, struct hep_desc* h)
 		break;
 	default:
 		LM_ERR("unsupported family [%d]\n", heph->hp_f);
-		return 0;
+		return -1;
 	}
 
 	/* Check version */
@@ -174,9 +173,11 @@ int unpack_hepv12(char *buf, int len, struct hep_desc* h)
 
 	hep_ip = buf + sizeof(struct hep_hdr);
 
-	if (hep_ip > end){
+	/* the address header ends at buf+hl; make sure it is within the
+	 * received packet before dereferencing it */
+	if (hl > len) {
 		LM_ERR("hep_ip is over buf+len\n");
-		return 0;
+		return -1;
 	}
 
 	switch(heph->hp_f){
@@ -196,13 +197,22 @@ int unpack_hepv12(char *buf, int len, struct hep_desc* h)
 	/* VOIP payload */
 	hep_payload = buf + offset;
 
-	if (hep_payload > end) {
+	/* for HEPv2 a time header is read at hep_payload before the payload,
+	 * so it must fit too; otherwise we read past buf and payload.len below
+	 * underflows to a negative length (the hl check above already
+	 * guarantees offset <= len) */
+	if (heph->hp_v == 2
+	&& len - offset < (int)sizeof(struct hep_timehdr)) {
 		LM_ERR("hep_payload is over buf+len\n");
-		return 0;
+		return -1;
 	}
 
 	/* time */
 	if(heph->hp_v == 2) {
+		if (len - offset < (int)sizeof(struct hep_timehdr)) {
+			LM_ERR("invalid HEPv2 time header length\n");
+			return -1;
+		}
 		offset+=sizeof(struct hep_timehdr);
 		heptime_tmp = (struct hep_timehdr*) hep_payload;
 		hep_payload += sizeof(struct hep_timehdr);
@@ -245,13 +255,22 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 		_len -= _off; \
 	} while (0);
 
+#define CHECK_CHUNK_SIZE(_len, _type) \
+	do { \
+		if ((_len) != sizeof(_type)) { \
+			LM_ERR("invalid HEPv3 chunk %u length %u, expected %zu\n", \
+					chunk_id, (unsigned int)(_len), sizeof(_type)); \
+			goto error; \
+		} \
+	} while (0);
+
 	int rc;
 
 	unsigned char *compressed_payload;
 	unsigned long compress_len;
 
 	struct hepv3 h3;
-	unsigned short tlen;
+	unsigned short tlen, chunk_len;
 	unsigned long decompress_len;
 
 	generic_chunk_t* gen_chunk, *it;
@@ -263,7 +282,17 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 	h->version = 3;
 
+	if (len < sizeof(hep_ctrl_t)) {
+		LM_ERR("invalid HEPv3 packet length %d\n", len);
+		return -1;
+	}
+
 	tlen = ntohs(((hep_ctrl_t*)buf)->length);
+	if (tlen < sizeof(hep_ctrl_t) || tlen > len) {
+		LM_ERR("invalid HEPv3 advertised length %u for packet length %d\n",
+				(unsigned int)tlen, len);
+		return -1;
+	}
 
 	buf += sizeof(hep_ctrl_t);
 	tlen -= sizeof(hep_ctrl_t);
@@ -271,11 +300,26 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 	memset( &h3, 0, sizeof(struct hepv3));
 
 	while (tlen > 0) {
-		/* we don't look at vendor id; we only need to parse the buffer */
-		chunk_id = ((hep_chunk_t*)buf)->type_id;
+		if (tlen < sizeof(hep_chunk_t)) {
+			LM_ERR("truncated HEPv3 chunk header, remaining length %u\n",
+					(unsigned int)tlen);
+			goto error;
+		}
 
-		switch (ntohs(chunk_id)) {
+		/* we don't look at vendor id; we only need to parse the buffer */
+		chunk_id = ntohs(((hep_chunk_t*)buf)->type_id);
+		chunk_len = ntohs(((hep_chunk_t*)buf)->length);
+
+		if (chunk_len < sizeof(hep_chunk_t) || chunk_len > tlen) {
+			LM_ERR("invalid HEPv3 chunk %u length %u, remaining length %u\n",
+					chunk_id, (unsigned int)chunk_len, (unsigned int)tlen);
+			goto error;
+		}
+
+		switch (chunk_id) {
 		case HEP_PROTO_FAMILY:
+			CHECK_CHUNK_SIZE(chunk_len, hep_chunk_uint8_t);
+
 			/* ip family*/
 			h3.hg.ip_family = *((hep_chunk_uint8_t*)buf);
 
@@ -284,6 +328,8 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 			break;
 		case HEP_PROTO_ID:
+			CHECK_CHUNK_SIZE(chunk_len, hep_chunk_uint8_t);
+
 			/* ip protocol ID*/
 			h3.hg.ip_proto = *((hep_chunk_uint8_t*)buf);
 
@@ -292,6 +338,8 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 			break;
 		case HEP_IPV4_SRC:
+			CHECK_CHUNK_SIZE(chunk_len, hep_chunk_ip4_t);
+
 			/* ipv4 source */
 			h3.addr.ip4_addr.src_ip4 = *((hep_chunk_ip4_t*)buf);
 
@@ -300,6 +348,8 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 			break;
 		case HEP_IPV4_DST:
+			CHECK_CHUNK_SIZE(chunk_len, hep_chunk_ip4_t);
+
 			/* ipv4 dest */
 			h3.addr.ip4_addr.dst_ip4 = *((hep_chunk_ip4_t*)buf);
 
@@ -308,6 +358,8 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 			break;
 		case HEP_IPV6_SRC:
+			CHECK_CHUNK_SIZE(chunk_len, hep_chunk_ip6_t);
+
 			/* ipv6 source */
 			h3.addr.ip6_addr.src_ip6 = *((hep_chunk_ip6_t*)buf);
 
@@ -316,6 +368,8 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 			break;
 		case HEP_IPV6_DST:
+			CHECK_CHUNK_SIZE(chunk_len, hep_chunk_ip6_t);
+
 			/* ipv6 dest */
 			h3.addr.ip6_addr.dst_ip6 = *((hep_chunk_ip6_t*)buf);
 
@@ -324,6 +378,8 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 			break;
 		case HEP_SRC_PORT:
+			CHECK_CHUNK_SIZE(chunk_len, hep_chunk_uint16_t);
+
 			/* source port */
 			h3.hg.src_port = *((hep_chunk_uint16_t*)buf);
 
@@ -334,6 +390,8 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 			break;
 		case HEP_DST_PORT:
+			CHECK_CHUNK_SIZE(chunk_len, hep_chunk_uint16_t);
+
 			/* dest port */
 			h3.hg.dst_port = *((hep_chunk_uint16_t*)buf);
 
@@ -344,6 +402,8 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 			break;
 		case HEP_TIMESTAMP:
+			CHECK_CHUNK_SIZE(chunk_len, hep_chunk_uint32_t);
+
 			/* timestamp */
 			h3.hg.time_sec = *((hep_chunk_uint32_t*)buf);
 
@@ -354,6 +414,8 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 			break;
 		case HEP_TIMESTAMP_US:
+			CHECK_CHUNK_SIZE(chunk_len, hep_chunk_uint32_t);
+
 			/* timestamp microsecs offset */
 			h3.hg.time_usec = *((hep_chunk_uint32_t*)buf);
 
@@ -364,6 +426,8 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 			break;
 		case HEP_PROTO_TYPE:
+			CHECK_CHUNK_SIZE(chunk_len, hep_chunk_uint8_t);
+
 			/* proto type */
 			h3.hg.proto_t = *((hep_chunk_uint8_t*)buf);
 
@@ -372,6 +436,8 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 			break;
 		case HEP_AGENT_ID:
+			CHECK_CHUNK_SIZE(chunk_len, hep_chunk_uint32_t);
+
 			/* capture agent id */
 			h3.hg.capt_id = *((hep_chunk_uint32_t*)buf);
 
@@ -383,6 +449,10 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 			break;
 		case HEP_PAYLOAD:
 			/* captured packet payload */
+			if (h3.payload_chunk_free) {
+				pkg_free(h3.payload_chunk.data);
+				h3.payload_chunk_free = 0;
+			}
 			h3.payload_chunk = *((hep_chunk_payload_t*)buf);
 			h3.payload_chunk.data = (char *)buf + sizeof(hep_chunk_t);
 
@@ -393,6 +463,10 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 		case HEP_COMPRESSED_PAYLOAD:
 			/* captured compressed payload(GZIP/inflate)*/
 
+			if (h3.payload_chunk_free) {
+				pkg_free(h3.payload_chunk.data);
+				h3.payload_chunk_free = 0;
+			}
 			h3.payload_chunk = *((hep_chunk_payload_t*)buf);
 			h3.payload_chunk.data = (char *)buf + sizeof(hep_chunk_t);
 
@@ -412,12 +486,16 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 				if (compression_api.check_rc(rc)) {
 					LM_ERR("payload decompression failed!\n");
+					if (decompressed_payload.s)
+						pkg_free(decompressed_payload.s);
 					goto safe_exit;
 				}
 
 				/* update the length based on the new length */
 				h3.payload_chunk.chunk.length += (decompress_len - compress_len);
 				h3.payload_chunk.data = decompressed_payload.s;
+				h3.payload_chunk_free = 1;
+				decompressed_payload.s = NULL;
 			}/* else we're just a proxy; leaving everything as is */
 
 			break;
@@ -426,7 +504,7 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 			 * locking will be required */
 			if ((gen_chunk = shm_malloc(sizeof(generic_chunk_t)))==NULL) {
 				LM_ERR("no more pkg mem!\n");
-				return -1;
+				goto error;
 			}
 
 			memset(gen_chunk, 0, sizeof(generic_chunk_t));
@@ -439,7 +517,8 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 
 			if (gen_chunk->data == NULL) {
 				LM_ERR("no more shared memory!\n");
-				return -1;
+				shm_free(gen_chunk);
+				goto error;
 			}
 
 			memcpy(gen_chunk->data, (char *)buf + sizeof(hep_chunk_t),
@@ -459,10 +538,31 @@ int unpack_hepv3(char *buf, int len, struct hep_desc *h)
 		}
 	}
 
+	if (!h3.payload_chunk.data ||
+			h3.payload_chunk.chunk.length < sizeof(hep_chunk_t)) {
+		LM_ERR("HEPv3 packet missing payload chunk\n");
+		goto error;
+	}
+
 safe_exit:
 	h->u.hepv3 = h3;
 
 	return 0;
+
+error:
+	if (h3.payload_chunk_free)
+		pkg_free(h3.payload_chunk.data);
+
+	while (h3.chunk_list) {
+		it = h3.chunk_list;
+		h3.chunk_list = it->next;
+		shm_free(it->data);
+		shm_free(it);
+	}
+	if (decompressed_payload.s)
+		pkg_free(decompressed_payload.s);
+#undef CHECK_CHUNK_SIZE
+	return -1;
 }
 
 static int
@@ -1746,7 +1846,7 @@ int send_hep_message(trace_message message, trace_dest dest, const struct socket
 
 	// Check cooldown logic
 	if (atomic_load(hep_failed_retries) >= (long)hep_max_retries && (long)(now - atomic_load(hep_last_attempt)) < (long)hep_retry_cooldown) {
-		LM_ERR("HEP send suppressed: too many failures (%ld), in cooldown (%ld seconds left)\n", atomic_load(hep_failed_retries), hep_retry_cooldown - (now - atomic_load(hep_last_attempt)));
+		LMR_ERR("HEP send suppressed: too many failures (%ld), in cooldown (%ld seconds left)\n", atomic_load(hep_failed_retries), hep_retry_cooldown - (now - atomic_load(hep_last_attempt)));
 		free_hep_send_resources(p, to, buf);
 		goto end;
 	}

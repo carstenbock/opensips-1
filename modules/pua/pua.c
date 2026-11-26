@@ -40,6 +40,7 @@
 #include "../../mem/mem.h"
 #include "../../pt.h"
 #include "../../db/db.h"
+#include "../../mi/mi.h"
 #include "../tm/tm_load.h"
 #include "../presence/hash.h"
 #include "pua.h"
@@ -92,15 +93,55 @@ static str str_desired_expires_col= str_init("desired_expires");
 static str str_sh_tag_col= str_init("sharing_tag");
 static str str_version_col = str_init("version");
 
+
+/* Queue entries own their identity strings, never hash-record pointers.
+ * Lock order: hash bucket, then queue. The timer drops the queue lock
+ * before looking up a hash record. */
+struct subs_termination {
+	unsigned int hash_index, local_index, deadline;
+	str id, call_id;
+	struct subs_termination *next;
+};
+
+static struct {
+	gen_lock_t lock;
+	struct subs_termination *head;
+} *subs_terminations;
+
+
 /* module functions */
 
 static int mod_init(void);
 static int child_init(int);
 static void destroy(void);
 
-static int update_pua(ua_pres_t* p, unsigned int hash_code, unsigned int final);
+static int update_pua(ua_pres_t* p, unsigned int hash_code,unsigned int final);
 static void db_update(unsigned int ticks,void *param);
 static void hashT_clean(unsigned int ticks,void *param);
+static mi_response_t *mi_list_presentities(const mi_params_t *params,
+		struct mi_handler *async_hdl);
+static mi_response_t *mi_list_subscription(const mi_params_t *params,
+		struct mi_handler *async_hdl);
+static void subs_termination_timer(unsigned int ticks, void *param);
+
+
+static const mi_export_t mi_cmds[] = {
+	{ "list_presentities", 0,0,0, {
+		{mi_list_presentities, {0}},
+		{mi_list_presentities, {"pres_uri", 0}},
+		{mi_list_presentities, {"event", 0}},
+		{mi_list_presentities, {"pres_uri", "event", 0}},
+		{EMPTY_MI_RECIPE}}, {0}
+	},
+	{ "list_subscription", 0,0,0, {
+		{mi_list_subscription, {0}},
+		{mi_list_subscription, {"pres_uri", 0}},
+		{mi_list_subscription, {"event", 0}},
+		{mi_list_subscription, {"pres_uri", "event", 0}},
+		{EMPTY_MI_RECIPE}}, {0}
+	},
+	{EMPTY_MI_EXPORT}
+};
 
 static const cmd_export_t cmds[]={
 	{"pua_update_contact",(cmd_function)update_contact, {{0,0,0}},
@@ -144,7 +185,7 @@ struct module_exports exports= {
 	0,                          /* exported async functions */
 	params,                     /* exported parameters */
 	0,                          /* exported statistics */
-	0,                          /* exported MI functions */
+	mi_cmds,                    /* exported MI functions */
 	0,                          /* exported pseudo-variables */
 	0,							/* exported transformations */
 	0,                          /* extra processes */
@@ -156,11 +197,166 @@ struct module_exports exports= {
 	0                           /* reload confirm function */
 };
 
+static int mi_print_common(mi_item_t *item, ua_pres_t *p)
+{
+	pua_event_t *event;
+
+	event = get_event(p->event);
+	if (add_mi_string(item, MI_SSTR("pres_uri"),
+			p->pres_uri->s, p->pres_uri->len) < 0 ||
+		(event ? add_mi_string(item, MI_SSTR("event"),
+			event->name.s, event->name.len) :
+			add_mi_number(item, MI_SSTR("event"), p->event)) < 0 ||
+		add_mi_number(item, MI_SSTR("expires"), p->expires) < 0 ||
+		add_mi_number(item, MI_SSTR("desired_expires"), p->desired_expires) < 0 ||
+		add_mi_number(item, MI_SSTR("flag"), p->flag) < 0 ||
+		add_mi_number(item, MI_SSTR("db_flag"), p->db_flag) < 0 ||
+		add_mi_number(item, MI_SSTR("ua_flag"), p->ua_flag) < 0)
+		return -1;
+
+	if (p->sh_tag.len && add_mi_string(item, MI_SSTR("sharing_tag"),
+		p->sh_tag.s, p->sh_tag.len) < 0)
+		return -1;
+	return 0;
+}
+
+static int mi_print_presentity(mi_item_t *array, ua_pres_t *p)
+{
+	mi_item_t *item, *pending, *publ_item;
+	publ_t *publ;
+
+	item = add_mi_object(array, NULL, 0);
+	if (!item || mi_print_common(item, p) < 0)
+		return -1;
+
+	if (add_mi_string(item, MI_SSTR("tuple_id"),
+			p->tuple_id.s, p->tuple_id.len) < 0 ||
+		add_mi_number(item, MI_SSTR("waiting_reply"), p->waiting_reply) < 0)
+		return -1;
+
+	if (p->etag.s && p->etag.len &&
+		add_mi_string(item, MI_SSTR("etag"), p->etag.s, p->etag.len) < 0)
+		return -1;
+
+	pending = add_mi_array(item, MI_SSTR("pending_publ"));
+	if (!pending)
+		return -1;
+	for (publ = p->pending_publ; publ; publ = publ->next) {
+		publ_item = add_mi_object(pending, NULL, 0);
+		if (!publ_item ||
+			add_mi_string(publ_item, MI_SSTR("content_type"),
+				publ->content_type.s, publ->content_type.len) < 0 ||
+			add_mi_string(publ_item, MI_SSTR("body"),
+				publ->body.s, publ->body.len) < 0 ||
+			add_mi_string(publ_item, MI_SSTR("extra_headers"),
+				publ->extra_headers.s, publ->extra_headers.len) < 0 ||
+			add_mi_number(publ_item, MI_SSTR("expires"), publ->expires) < 0)
+			return -1;
+	}
+	return 0;
+}
+
+static int mi_print_subscription(mi_item_t *array, ua_pres_t *p)
+{
+	mi_item_t *item;
+
+	item = add_mi_object(array, NULL, 0);
+	if (!item || mi_print_common(item, p) < 0)
+		return -1;
+
+	if (add_mi_string(item, MI_SSTR("to_uri"), p->to_uri.s, p->to_uri.len) < 0 ||
+		add_mi_string(item, MI_SSTR("watcher_uri"),
+			p->watcher_uri->s, p->watcher_uri->len) < 0 ||
+		add_mi_string(item, MI_SSTR("call_id"), p->call_id.s, p->call_id.len) < 0 ||
+		add_mi_string(item, MI_SSTR("to_tag"), p->to_tag.s, p->to_tag.len) < 0 ||
+		add_mi_string(item, MI_SSTR("from_tag"), p->from_tag.s, p->from_tag.len) < 0 ||
+		add_mi_number(item, MI_SSTR("cseq"), p->cseq) < 0 ||
+		add_mi_number(item, MI_SSTR("version"), p->version) < 0 ||
+		add_mi_number(item, MI_SSTR("watcher_count"), p->watcher_count) < 0 ||
+		add_mi_string(item, MI_SSTR("extra_headers"),
+			p->extra_headers.s, p->extra_headers.len) < 0 ||
+		add_mi_string(item, MI_SSTR("record_route"),
+			p->record_route.s, p->record_route.len) < 0 ||
+		add_mi_string(item, MI_SSTR("remote_contact"),
+			p->remote_contact.s, p->remote_contact.len) < 0 ||
+		add_mi_string(item, MI_SSTR("contact"), p->contact.s, p->contact.len) < 0)
+		return -1;
+
+	if (p->outbound_proxy && p->outbound_proxy->len &&
+		add_mi_string(item, MI_SSTR("outbound_proxy"),
+			p->outbound_proxy->s, p->outbound_proxy->len) < 0)
+		return -1;
+	return 0;
+}
+
+static mi_response_t *mi_list_records(const mi_params_t *params,
+		int subscriptions)
+{
+	mi_response_t *resp;
+	mi_item_t *array;
+	str pres_uri = STR_NULL, event_name = STR_NULL;
+	pua_event_t *event = NULL;
+	ua_pres_t *p;
+	int i, rc, have_pres_uri;
+
+	rc = try_get_mi_string_param(params, "pres_uri", &pres_uri.s, &pres_uri.len);
+	if (rc < -1)
+		return init_mi_param_error();
+	have_pres_uri = (rc == 0);
+	rc = try_get_mi_string_param(params, "event", &event_name.s, &event_name.len);
+	if (rc < -1)
+		return init_mi_param_error();
+	if (rc == 0) {
+		event = contains_pua_event(&event_name);
+		if (!event)
+			return init_mi_error(400, MI_SSTR("Unknown event"));
+	}
+
+	resp = init_mi_result_array(&array);
+	if (!resp)
+		return NULL;
+	for (i = 0; i < HASH_SIZE; i++) {
+		lock_get(&HashT->p_records[i].lock);
+		for (p = HashT->p_records[i].entity->next; p; p = p->next) {
+			/* A watcher URI identifies a subscription record. */
+			if (!!p->watcher_uri != subscriptions)
+				continue;
+			if (have_pres_uri && (p->pres_uri->len != pres_uri.len ||
+				memcmp(p->pres_uri->s, pres_uri.s, pres_uri.len) != 0))
+				continue;
+			if (event && p->event != event->ev_flag)
+				continue;
+			if ((subscriptions ? mi_print_subscription(array, p) :
+				mi_print_presentity(array, p)) < 0) {
+				lock_release(&HashT->p_records[i].lock);
+				free_mi_response(resp);
+				LM_ERR("Unable to create PUA records reply\n");
+				return NULL;
+			}
+		}
+		lock_release(&HashT->p_records[i].lock);
+	}
+	return resp;
+}
+
+static mi_response_t *mi_list_presentities(const mi_params_t *params,
+		struct mi_handler *async_hdl)
+{
+	return mi_list_records(params, 0);
+}
+
+static mi_response_t *mi_list_subscription(const mi_params_t *params,
+		struct mi_handler *async_hdl)
+{
+	return mi_list_records(params, 1);
+}
+
 /**
  * init module function
  */
 static int mod_init(void)
 {
+	int max_hash_exp;
 	load_tm_f  load_tm;
 
 	LM_DBG("...\n");
@@ -216,12 +412,15 @@ static int mod_init(void)
 		HASH_SIZE= 512;
 	else {
 		/* must fit in half of "long" when building the pres_id */
-		if ( HASH_SIZE > (sizeof(long)*8/2) ) {
+		max_hash_exp = (int)(sizeof(long) * 8 / 2);
+		if (max_hash_exp >= (int)(sizeof(HASH_SIZE) * 8) - 1)
+			max_hash_exp = (int)(sizeof(HASH_SIZE) * 8) - 2;
+		if (HASH_SIZE > max_hash_exp) {
 			LM_WARN("hash_size %d too large, limiting to max allowed %d\n",
-				HASH_SIZE, (int)(sizeof(long)*8/2) );
-			HASH_SIZE = (sizeof(long)*8/2);
+				HASH_SIZE, max_hash_exp);
+			HASH_SIZE = max_hash_exp;
 		}
-		HASH_SIZE = 1<<HASH_SIZE;
+		HASH_SIZE = 1U << HASH_SIZE;
 	}
 
 	HashT= new_htable();
@@ -239,6 +438,19 @@ static int mod_init(void)
 	if(db_restore(NULL)< 0)
 	{
 		LM_ERR("while restoring hash_table\n");
+		return -1;
+	}
+
+	subs_terminations = shm_malloc(sizeof(*subs_terminations));
+	if (!subs_terminations) {
+		LM_ERR("failed to shm allocate the subs termination list\n");
+		return -1;
+	}
+	memset(subs_terminations, 0, sizeof(*subs_terminations));
+	if (!lock_init(&subs_terminations->lock)) {
+		shm_free(subs_terminations);
+		subs_terminations = NULL;
+		LM_ERR("failed to init the subs termination lock\n");
 		return -1;
 	}
 
@@ -263,6 +475,9 @@ static int mod_init(void)
 		LM_ERR("while adding events\n");
 		return -1;
 	}
+
+	register_timer("pua_subscription_cleanup", subs_termination_timer, 0, 1,
+		TIMER_FLAG_DELAY_ON_DELAY);
 
 	register_timer("pua_clean", hashT_clean, 0, update_period-5,
 		TIMER_FLAG_DELAY_ON_DELAY);
@@ -301,7 +516,18 @@ static int child_init(int rank)
 
 static void destroy(void)
 {
+	struct subs_termination *entry;
 	LM_DBG("destroying module ...\n");
+
+	if (subs_terminations) {
+		while ((entry = subs_terminations->head) != NULL) {
+			subs_terminations->head = entry->next;
+			shm_free(entry);
+		}
+		lock_destroy(&subs_terminations->lock);
+		shm_free(subs_terminations);
+	}
+
 	if (puacb_list)
 		destroy_puacb_list();
 
@@ -691,6 +917,58 @@ static int sh_tag_matches(str **sh_tags, str *sh_tag)
 }
 
 
+static int queue_subs_termination(ua_pres_t *p)
+{
+	struct subs_termination *entry, *old, **at;
+
+	if (p->expires_queued == p->desired_expires)
+		return 0;
+
+	entry = shm_malloc(sizeof(*entry) + p->id.len + p->call_id.len);
+	if (!entry) {
+		LM_ERR("no more memory fo a subs termination record\n");
+		return -1;
+	}
+
+	entry->hash_index = p->hash_index;
+	entry->local_index = p->local_index;
+	entry->deadline = p->desired_expires;
+	entry->id.s = (char *)(entry + 1);
+	entry->id.len = p->id.len;
+	memcpy(entry->id.s, p->id.s, p->id.len);
+	entry->call_id.s = entry->id.s + entry->id.len;
+	entry->call_id.len = p->call_id.len;
+	memcpy(entry->call_id.s, p->call_id.s, p->call_id.len);
+
+	lock_get(&subs_terminations->lock);
+	/* Replace an older schedule if a refresh moved the desired deadline. */
+	if (p->expires_queued) {
+		for (at = &subs_terminations->head; *at; at = &(*at)->next) {
+			old = *at;
+			if (old->hash_index == p->hash_index
+			&& old->local_index == p->local_index
+			&& str_match(&old->id, &p->id)
+			&& str_match(&old->call_id, &p->call_id)) {
+				*at = old->next;
+				shm_free(old);
+				break;
+			}
+		}
+	}
+
+	/* now link it */
+	for (at = &subs_terminations->head;
+	     *at && (*at)->deadline <= entry->deadline; at = &(*at)->next)
+		;
+	entry->next = *at;
+	*at = entry;
+	p->expires_queued = p->desired_expires;
+	lock_release(&subs_terminations->lock);
+
+	return 0;
+}
+
+
 static void hashT_clean(unsigned int ticks,void *param)
 {
 	int i;
@@ -717,6 +995,32 @@ static void hashT_clean(unsigned int ticks,void *param)
 			print_ua_pres(p);
 			LM_DBG("---\n");
 
+			/* for SUBSCRIBE record only */
+			if (p->watcher_uri) {
+				/* ignore the ones with un-SUBSCRIBE send, but
+				 * waiting for reply */
+				if (p->subs_state == PUA_SUBS_TERMINATING) {
+					p = p->next;
+					continue;
+				}
+				/* purge the ones with completed un-SUBSCRIBE and with
+				* NOTIFY waiting done (extra 5 secs) */
+				if (p->subs_state == PUA_SUBS_TERMINATED) {
+					q = p->next;
+					if (p->expires <= now)
+						delete_htable_safe(p, i);
+					p = q;
+					continue;
+				}
+				/* Discover shortening independently of negotiated expiry. */
+				if (p->desired_expires && p->desired_expires < p->expires) {
+					if (queue_subs_termination(p) < 0)
+						LM_ERR("cannot queue subscription termination\n");
+					p = p->next;
+					continue;
+				}
+			}
+
 			/* handle expired presentities with no sharing tag or with an
 			 * active sharing tag (if clustering is enabled) */
 			if ( (p->expires -update_period < now ) &&
@@ -741,10 +1045,20 @@ static void hashT_clean(unsigned int ticks,void *param)
 
 				LM_DBG("Found expired: uri= %.*s\n", p->pres_uri->len,
 						p->pres_uri->s);
-				if(update_pua(p, i, 1)< 0)
-				{
-					LM_ERR("while updating record\n");
+				if (p->watcher_uri) {
+					/* Subscriptions with matching deadlines expire remotely;
+					 * retain local state until actual expiry,
+					 * without unsubscribing. */
+					if (p->expires > now) {
+						p = p->next;
+						continue;
+					}
+				} else {
+					/* PUBLISH record, just update */
+					if (update_pua(p, i, 1) < 0)
+						LM_ERR("while updating record\n");
 				}
+
 				/* delete it */
 				q = p->next;
 				delete_htable_safe(p, p->hash_index);
@@ -757,6 +1071,54 @@ static void hashT_clean(unsigned int ticks,void *param)
 	}
 }
 
+
+static void subs_termination_timer(unsigned int ticks, void *param)
+{
+	struct subs_termination *entry;
+	ua_pres_t *p;
+	time_t now = time(NULL);
+	str **sh_tags = is_pua_cluster_enabled() ?
+		c_api.shtag_get_all_active(pua_cluster_id) : NULL;
+
+	for (;;) {
+		lock_get(&subs_terminations->lock);
+		entry = subs_terminations->head;
+		if (!entry || entry->deadline > now) {
+			lock_release(&subs_terminations->lock);
+			return;
+		}
+		subs_terminations->head = entry->next;
+		lock_release(&subs_terminations->lock);
+
+		lock_get(&HashT->p_records[entry->hash_index].lock);
+		p = get_htable_safe(entry->hash_index, entry->local_index);
+		if (p && p->watcher_uri && str_match(&p->id, &entry->id)
+						&& str_match(&p->call_id, &entry->call_id)
+		&& p->expires_queued == entry->deadline) {
+			p->expires_queued = 0;
+			if (p->subs_state == PUA_SUBS_ACTIVE && p->desired_expires
+			&& p->desired_expires < p->expires) {
+				if (p->desired_expires > now) {
+					if (queue_subs_termination(p) < 0)
+						LM_ERR("cannot reschedule subscription termination\n");
+				} else if (!sh_tags || !p->sh_tag.s
+				|| sh_tag_matches(sh_tags, &p->sh_tag)) {
+					p->subs_state = PUA_SUBS_TERMINATING;
+					if (update_pua(p, entry->hash_index, 1) < 0) {
+						p->subs_state = PUA_SUBS_ACTIVE;
+						/* Retry on the next full scan, not repeatedly
+						 * in this timer tick. */
+						LM_ERR("cannot send subscription termination\n");
+					}
+				}
+			}
+		}
+		lock_release(&HashT->p_records[entry->hash_index].lock);
+		shm_free(entry);
+	}
+}
+
+
 int update_pua(ua_pres_t* p, unsigned int hash_code, unsigned int final)
 {
 	str* str_hdr= NULL;
@@ -766,7 +1128,8 @@ int update_pua(ua_pres_t* p, unsigned int hash_code, unsigned int final)
 	if(final > 0)
 	{
 		expires= 0;
-		p->desired_expires= 0;
+		if (!p->watcher_uri)
+			p->desired_expires= 0;
 	}
 	else
 	{
@@ -802,7 +1165,7 @@ int update_pua(ua_pres_t* p, unsigned int hash_code, unsigned int final)
 
 		cb_param = PRES_HASH_ID(p);
 
-		result= tmb.t_request(&met,    /* Type of the message*/
+		result= run_tm_api(&tmb, t_request, &met,    /* Type of the message*/
 				p->pres_uri,           /* Request-URI */
 				p->pres_uri,           /* To */
 				p->pres_uri,           /* From */
@@ -835,14 +1198,15 @@ int update_pua(ua_pres_t* p, unsigned int hash_code, unsigned int final)
 			return -1;
 		}
 		cb_param= subs_cbparam_indlg(p, expires, REQ_ME);
+		if (cb_param && final)
+			cb_param->subs_state = p->subs_state;
 		if(cb_param== NULL)
 		{
 			LM_ERR("while constructing subs callback param\n");
 			goto error;
 
 		}
-		result= tmb.t_request_within
-				(&met,
+		result= run_tm_api(&tmb, t_request_within, &met,
 				str_hdr,
 				0,
 				td,
@@ -1160,4 +1524,3 @@ static void db_update(unsigned int ticks,void *param)
 
 	return ;
 }
-

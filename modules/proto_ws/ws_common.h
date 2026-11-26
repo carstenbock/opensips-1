@@ -27,6 +27,7 @@
 #define _WS_COMMON_H_
 
 #include "../../mem/shm_mem.h"
+#include "../../mem/mem.h"
 #include "../../globals.h"
 #include "../../receive.h"
 #include "../../dprint.h"
@@ -139,9 +140,6 @@
 #define ROTATE32(_k) ((((_k) & 0xFF) << 24) | ((_k) >> 8))
 #define MASK8(_k) ((unsigned char)((_k) & 0xFF))
 
-#ifndef _ws_common_current_req
-#error "_ws_common_current_req not defined!"
-#endif
 #ifndef _ws_common_writev
 #error "_ws_common_writev not defined!"
 #endif
@@ -208,20 +206,20 @@ static inline int ws_send(struct tcp_connection *con, int fd, int op,
 	 * we need this buffer to mask the message sent to the client
 	 * since we cannot modify the buffer - it might be readonly
 	 */
-	static char *body_buf = 0;
-	static unsigned char hdr_buf[WS_MAX_HDR_LEN];
-	static struct iovec v[2] = { {hdr_buf, 0}, {0, 0}};
+	static __thread char *body_buf = 0;
+	static __thread unsigned char hdr_buf[WS_MAX_HDR_LEN];
+	static __thread struct iovec v[2];
 	unsigned int mask = rand();
+
+	v[0].iov_base = hdr_buf;
+	v[0].iov_len = 0;
+	v[1].iov_base = 0;
+	v[1].iov_len = 0;
 
 	/* FIN + OPCODE */
 	hdr_buf[0] = WS_BIT_FIN | (op & WS_MASK_OPCODE);
 
-	if (len == 0) {
-		hdr_buf[1] = 0;
-		/* don't have any data, send only the heeader  */
-		v[0].iov_len = WS_MIN_HDR_LEN;
-		return _ws_common_writev(con, fd, v, 1, _ws_common_write_tout);
-	} else if (len < WS_EXT_LEN) {
+	if (len < WS_EXT_LEN) {
 		hdr_buf[1] = len;
 		v[0].iov_len = WS_MIN_HDR_LEN;
 	} else if (len < WS_MAX_ELEN) {
@@ -236,13 +234,21 @@ static inline int ws_send(struct tcp_connection *con, int fd, int op,
 	}
 
 	if (WS_TYPE(con) == WS_CLIENT) {
-		/* set the mask in the message */
+		/* a client must mask every frame, even an empty one
+		 * (RFC 6455, section 5.1), so always set the mask */
 		*(uint32_t *)(v[0].iov_base + v[0].iov_len) = mask;
 		v[0].iov_len += WS_MASK_SIZE;
 		/* also indicate that the message is masked */
 		hdr_buf[1] |= WS_BIT_MASK;
+	}
 
-		body_buf = body_buf ? pkg_realloc(body_buf, len) : pkg_malloc(len);
+	if (len == 0)
+		/* no payload, send only the header (and the mask, if any) */
+		return _ws_common_writev(con, fd, v, 1, _ws_common_write_tout);
+
+	if (WS_TYPE(con) == WS_CLIENT) {
+		body_buf = body_buf ? thread_realloc(body_buf, len) :
+			thread_malloc(len);
 		if (!body_buf) {
 			LM_ERR("oom for body buffer\n");
 			return -1;
@@ -262,8 +268,26 @@ static inline int ws_send(struct tcp_connection *con, int fd, int op,
 
 static inline int ws_send_pong(struct tcp_connection *con, struct ws_req *req)
 {
-	return ws_send(con, con->fd, WS_OP_PONG,
+	int ret;
+
+	lock_get(&con->write_lock);
+	ret = ws_send(con, con->fd, WS_OP_PONG,
 			req->tcp.body, req->tcp.content_len);
+	lock_release(&con->write_lock);
+
+	return ret;
+}
+
+static inline int ws_send_crlf_pong(struct tcp_connection *con)
+{
+	static char crlf[] = "\r\n";
+	int ret;
+
+	lock_get(&con->write_lock);
+	ret = ws_send(con, con->fd, WS_OP_TEXT, crlf, sizeof(crlf) - 1);
+	lock_release(&con->write_lock);
+
+	return ret;
 }
 
 static inline int ws_send_close(struct tcp_connection *con)
@@ -271,6 +295,7 @@ static inline int ws_send_close(struct tcp_connection *con)
 	uint16_t code;
 	int len;
 	char *buf;
+	int ret;
 
 	if (WS_CODE(con)) {
 		code = htons(WS_CODE(con));
@@ -280,7 +305,11 @@ static inline int ws_send_close(struct tcp_connection *con)
 	}
 
 	buf = (char *)&code;
-	return ws_send(con, con->fd, WS_OP_CLOSE, buf, len);
+	lock_get(&con->write_lock);
+	ret = ws_send(con, con->fd, WS_OP_CLOSE, buf, len);
+	lock_release(&con->write_lock);
+
+	return ret;
 }
 
 /* Public functions down here */
@@ -403,7 +432,6 @@ update_parsed:
 static int ws_process(struct tcp_connection *con)
 {
 	struct ws_req *req;
-	struct ws_req *newreq;
 	long size = 0;
 	enum ws_close_code ret_code = WS_ERR_NONE;
 	unsigned char bk;
@@ -411,13 +439,18 @@ static int ws_process(struct tcp_connection *con)
 	int msg_len;
 	struct receive_info local_rcv;
 
-	if (con->con_req) {
-		req=(struct ws_req *)con->con_req;
+	if (con->proto_req) {
+		req = (struct ws_req *)con->proto_req;
 		LM_DBG("Using the per connection buff \n");
 	} else {
-		LM_DBG("Using the global ( per process ) buff \n");
-		init_ws_req(&_ws_common_current_req, 0);
-		req=&_ws_common_current_req;
+		LM_DBG("Allocating per connection WS buffer\n");
+		req = thread_malloc(sizeof(*req));
+		if (req == NULL) {
+			LM_ERR("No more mem for dynamic con request buffer\n");
+			goto error;
+		}
+		init_ws_req(req, 0);
+		con->proto_req = (void *)req;
 	}
 
 again:
@@ -455,7 +488,7 @@ again:
 			goto error;
 		}
 
-		/* update the timeout - we successfully read the request */
+		/* refresh connection lifetime after successful read progress */
 		tcp_conn_set_lifetime(con, _ws_common_write_tout);
 		con->timeout=con->lifetime;
 
@@ -517,11 +550,6 @@ again:
 				 * the connection */
 				LM_DBG("We're releasing the connection in state %d \n",
 					con->state);
-				if (req != &_ws_common_current_req) {
-					/* we have the buffer in the connection tied buff -
-					 *	detach it , release the conn and free it afterwards */
-					con->con_req = NULL;
-				}
 				/* TODO - we could indicate to the TCP net layer to release
 				 * the connection -> other worker may read the next available
 				 * message on the pipe */
@@ -530,8 +558,18 @@ again:
 					"keeping connection \n");
 			}
 
-			if (receive_msg(msg_buf, msg_len, &local_rcv, NULL, 0) <0)
-					LM_ERR("receive_msg failed \n");
+			if (msg_len == 4 && msg_buf[0] == '\r' && msg_buf[1] == '\n' &&
+			    msg_buf[2] == '\r' && msg_buf[3] == '\n') {
+				if (ws_send_crlf_pong(con) < 0)
+					LM_ERR("cannot send CRLF pong\n");
+			} else if (msg_len == 2 && msg_buf[0] == '\r' &&
+			           msg_buf[1] == '\n') {
+				LM_DBG("Received CRLF pong\n");
+			} else {
+				if (tcp_dispatch_msg(msg_buf, msg_len,
+						&local_rcv, NULL, 0) < 0)
+					LM_ERR("failed to deliver WS message\n");
+			}
 
 			*req->tcp.parsed = bk;
 
@@ -552,12 +590,6 @@ again:
 		/* if we still have some unparsed bytes, try to  parse them too*/
 		if (size)
 			goto again;
-		/* cleanup the existing request */
-		if (req != &_ws_common_current_req) {
-			/* make sure we cleanup the request in the connection */
-			con->con_req = NULL;
-			shm_free(req);
-		}
 
 	} else {
 		/* request not complete - check the if the thresholds are exceeded */
@@ -567,53 +599,6 @@ again:
 			LM_ERR("Made %u read attempts but message is not complete yet - "
 				   "closing connection \n",con->msg_attempts);
 			goto error;
-		}
-
-		if (req == &_ws_common_current_req) {
-			/* let's duplicate this - most likely another conn will come in */
-
-			LM_DBG("We didn't manage to read a full request\n");
-			newreq = shm_malloc(sizeof(struct ws_req));
-			if (newreq == NULL) {
-				LM_ERR("No more mem for dynamic con request buffer\n");
-				goto error;
-			}
-
-			if (req->tcp.pos != req->tcp.buf) {
-				/* we have read some bytes */
-				memcpy(newreq->tcp.buf,req->tcp.buf,req->tcp.pos-req->tcp.buf);
-				newreq->tcp.pos = newreq->tcp.buf + (req->tcp.pos-req->tcp.buf);
-			} else {
-				newreq->tcp.pos = newreq->tcp.buf;
-			}
-
-			if (req->tcp.start != req->tcp.buf)
-				newreq->tcp.start = newreq->tcp.buf +(req->tcp.start-req->tcp.buf);
-			else
-				newreq->tcp.start = newreq->tcp.buf;
-
-			if (req->tcp.parsed != req->tcp.buf)
-				newreq->tcp.parsed =newreq->tcp.buf+(req->tcp.parsed-req->tcp.buf);
-			else
-				newreq->tcp.parsed = newreq->tcp.buf;
-
-			if (req->tcp.body != 0) {
-				newreq->tcp.body = newreq->tcp.buf + (req->tcp.body-req->tcp.buf);
-			} else
-				newreq->tcp.body = 0;
-
-			newreq->tcp.complete=req->tcp.complete;
-			newreq->tcp.has_content_len=req->tcp.has_content_len;
-			newreq->tcp.content_len=req->tcp.content_len;
-			newreq->tcp.bytes_to_go=req->tcp.bytes_to_go;
-			newreq->tcp.error = req->tcp.error;
-			newreq->tcp.state = req->tcp.state;
-
-			newreq->op = req->op;
-			newreq->mask = req->mask;
-			newreq->is_masked = req->is_masked;
-
-			con->con_req = (struct tcp_req *)newreq;
 		}
 	}
 
@@ -635,82 +620,38 @@ static void ws_close(struct tcp_connection *c)
 	ws_send_close(c);
 }
 
+static inline int ws_prepare_client_conn(struct tcp_connection *c)
+{
+	if (c->proto_data) {
+		WS_TYPE(c) = WS_CLIENT;
+	}
+
+	return 0;
+}
+
 static struct tcp_connection* ws_sync_connect(const struct socket_info* send_sock,
 		const union sockaddr_union* server, struct tcp_conn_profile *prof)
 {
-	int s;
-	union sockaddr_union my_name;
-	socklen_t my_name_len;
-	struct tcp_connection* con;
+	int fd = -1;
 
-	s=socket(AF2PF(server->s.sa_family), SOCK_STREAM, 0);
-	if (s==-1){
-		LM_ERR("socket: (%d) %s\n", errno, strerror(errno));
-		goto error;
-	}
-
-	if (tcp_init_sock_opt(s, prof, send_sock->flags, send_sock->tos)<0){
-		LM_ERR("tcp_init_sock_opt failed\n");
-		goto error;
-	}
-
-	my_name_len = sockaddru_len(send_sock->su);
-	memcpy( &my_name, &send_sock->su, my_name_len);
-	su_setport( &my_name, 0);
-	if (bind(s, &my_name.s, my_name_len )!=0) {
-		LM_ERR("bind failed (%d) %s\n", errno,strerror(errno));
-		goto error;
-	}
-
-	if (tcp_connect_blocking_timeout(s, &server->s, sockaddru_len(*server),
-	                      prof->connect_timeout)<0){
-		LM_ERR("tcp_blocking_connect failed\n");
-		goto error;
-	}
-	con=tcp_conn_create(s, server, send_sock, prof, S_CONN_OK, 0);
-	if (con==NULL){
-		LM_ERR("tcp_conn_create failed, closing the socket\n");
-		goto error;
-	}
-	/* it is safe to move this here and clear it after we complete the
-	 * handshake, just before sending the fd to main */
-	con->fd = s;
-	return con;
-error:
-	/* close the opened socket */
-	if (s!=-1) close(s);
-	return 0;
+	return tcp_sync_connect(send_sock, server, prof, &fd);
 }
 
 
 static struct tcp_connection* ws_connect(const struct socket_info* send_sock,
-		const union sockaddr_union* to, struct tcp_conn_profile *prof, int *fd)
+		const union sockaddr_union* to, struct tcp_conn_profile *prof,
+		struct sip_msg *msg)
 {
 	struct tcp_connection *c;
+
+	(void)msg;
 
 	if ((c=ws_sync_connect(send_sock, to, prof))==0) {
 		LM_ERR("connect failed\n");
 		return NULL;
 	}
-	/* the state of the connection should be NONE, otherwise something is
-	 * wrong */
-	if (WS_TYPE(c) != WS_NONE) {
-		LM_BUG("invalid type for connection %d\n", WS_TYPE(c));
-		goto error;
-	}
-	WS_TYPE(c) = WS_CLIENT;
-
-	if (ws_client_handshake(c) < 0) {
-		LM_ERR("cannot complete WebSocket handshake\n");
-		goto error;
-	}
-
-	*fd = c->fd;
-	/* clear the fd, just in case */
-	c->fd = -1;
-	/* handshake done - send the socket to main */
-	if (tcp_conn_send(c) < 0) {
-		LM_ERR("cannot send socket to main\n");
+	if (ws_prepare_client_conn(c) < 0) {
+		LM_ERR("cannot prepare WebSocket client connection\n");
 		goto error;
 	}
 

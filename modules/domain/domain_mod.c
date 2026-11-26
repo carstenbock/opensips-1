@@ -82,7 +82,7 @@ int db_mode = 0;			/* Database usage mode: 0 = no cache, 1 = cache */
 str domain_table = {DOMAIN_TABLE, DOMAIN_TABLE_LEN}; /* Name of domain table */
 str domain_col = {DOMAIN_COL, DOMAIN_COL_LEN};       /* Name of domain column */
 str domain_attrs_col = {DOMAIN_ATTRS_COL, DOMAIN_ATTRS_COL_LEN}; /* Name of attributes column */
-str domain_accept_subdomain_col = {DOMAIN_ACCEPT_SUBDOMAIN_COL, DOMAIN_ATTRS_COL_LEN}; /* Name of accept_subdomain column */
+str domain_accept_subdomain_col = {DOMAIN_ACCEPT_SUBDOMAIN_COL, DOMAIN_ACCEPT_SUBDOMAIN_COL_LEN}; /* Name of accept_subdomain column */
 
 /*
  * Other module variables
@@ -136,12 +136,10 @@ static const param_export_t params[] = {
 static const mi_export_t mi_cmds[] = {
 	{ MI_DOMAIN_RELOAD, 0, 0, mi_child_init, {
 		{mi_domain_reload, {0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{ MI_DOMAIN_DUMP, 0, 0, 0, {
 		{mi_domain_dump, {0}},
-		{EMPTY_MI_RECIPE}}
-	},
+		{EMPTY_MI_RECIPE}}, {0}},
 	{EMPTY_MI_EXPORT}
 };
 

@@ -31,6 +31,7 @@
 #include <string.h>
 
 #include "../../timer.h"
+#include "../../mem/shm_mem.h"
 #include "../../ut.h"
 #include "../../parser/parse_call_info.h"
 #include "../presence/event_list.h"
@@ -111,6 +112,9 @@ unsigned int get_appearance_index(struct sip_msg *msg)
 	struct to_param *top;
 	unsigned int idx;
 
+	if (!msg->call_info)
+		return 0;
+
 	top = get_call_info(msg)->call_info_body.param_lst;
 	for ( ; top ; top=top->next) {
 		if ( (top->name.len==CI_hdr_AI_param_len) &&
@@ -128,24 +132,6 @@ unsigned int get_appearance_index(struct sip_msg *msg)
 	LM_ERR("Call-INFO hdr <%.*s> does not contain 'appearance-index' parameter\n",
 		msg->call_info->body.len,msg->call_info->body.s);
 	return 0;
-}
-
-
-/*
- * Line must be locked, returned unlocked !
- */
-int terminate_line_sieze(struct sca_line *sca)
-{
-	/* do we have a valid seize on the line ? */
-	if (sca->seize_state==0 || sca->seize_expires<get_ticks() )
-		return 0;
-
-	sca->seize_state = 0;
-	sca->seize_expires = 0;
-
-	unlock_sca_line(sca);
-
-	return pres.terminate_watchers( &sca->line, seize_event);
 }
 
 
@@ -239,6 +225,8 @@ int lineseize_subs_handl(struct sip_msg* msg, struct subscription *subs, int *re
 {
 	str *line;
 	struct sca_line *sca;
+	struct sca_idx *scai, *owner;
+	char *identity;
 	unsigned int idx;
 	int is_initial;
 	int new_state;
@@ -254,7 +242,7 @@ int lineseize_subs_handl(struct sip_msg* msg, struct subscription *subs, int *re
 	is_initial = (subs->to_tag.len==0)?1:0;
 
 	idx = get_appearance_index(msg);
-	if (idx==0) {
+	if (!idx) {
 		LM_ERR("failed to extract index from Call-Info hdr\n");
 		*reply_code = 400;
 		reply_reason->s = "Bad request";
@@ -289,44 +277,96 @@ int lineseize_subs_handl(struct sip_msg* msg, struct subscription *subs, int *re
 		}
 	}
 
-	LM_DBG("SCA found (%p), seizing (%d,%d), subs expires %d\n",
-		sca, sca->seize_state,sca->seize_expires, subs->expires);
+	scai = find_sca_index(sca, idx);
+	/* A subscription cannot change appearances on refresh or release. */
+	for (owner = sca->indexes; owner; owner = owner->next)
+		if (str_strcmp(&owner->seize_callid, &subs->callid) == 0
+				&& str_strcmp(&owner->seize_from_tag, &subs->from_tag) == 0)
+			break;
 
 	new_state = 0;
 
 	/* SCA found, careful now, it is locked !! */
 	if (!is_initial) {
 
-		/* sequential FIXME - some double check here? */
+		if (!scai || owner != scai) {
+			*reply_code = 481;
+			reply_reason->s = "Subscription Does Not Exist";
+			reply_reason->len = sizeof("Subscription Does Not Exist")-1;
+			unlock_sca_line(sca);
+			return -1;
+		}
 		if (subs->expires==0) {
 			/* terminate the subscription */
 			LM_DBG("seizing terminated by un-subscribe\n");
-			sca->seize_state = 0;
-			sca->seize_expires = 0;
-			new_state = SCA_STATE_IDLE;
+			scai->seize_expires = 0;
+			/* Releasing a subscription must not hide a call on this index. */
+			if (scai->state == SCA_STATE_SEIZED)
+				new_state = SCA_STATE_IDLE;
 		} else {
 			LM_DBG("seizing changed by re-subscribe\n");
-			sca->seize_expires = get_ticks() + subs->expires;
+			scai->seize_expires = get_ticks() + subs->expires;
 		}
 
 	} else {
 
 		/* new SUBSCRIBE */
-		if (sca->seize_state!=0) {
+		if (!subs->expires) {
+			unlock_sca_line(sca);
+			return 0;
+		}
+		if (scai && scai->seize_expires) {
 			/* already in seizing from a different subscrine */
-			if (sca->seize_expires < get_ticks()) {
+			if (get_ticks() < scai->seize_expires) {
 				/* old seizing still valid -> reject it */
+				LM_SCA("old seizing still valid - reject new seize attempt\n");
+
 				*reply_code = 480;
 				reply_reason->s = "Temporarily Unavailable";
 				reply_reason->len = sizeof("Temporarily Unavailable")-1;
 				unlock_sca_line(sca);
 				return -1;
 			}
+
+			LM_SCA("old seizing found, but it expired -- overwrite it\n");
 		}
-		/* FIXME - check the seized idx is not already in a call */
-		/* do the seizing */
-		sca->seize_state = idx;
-		sca->seize_expires = get_ticks() + subs->expires;
+		/* the seized idx must not be already in a call */
+		switch (get_sca_index_state(sca, idx)) {
+			case SCA_STATE_PROGRESSING:
+			case SCA_STATE_ALERTING:
+			case SCA_STATE_ACTIVE:
+			case SCA_STATE_HELD:
+				LM_SCA("appearance %u already in a call - reject seize "
+					"attempt\n", idx);
+
+				*reply_code = 480;
+				reply_reason->s = "Temporarily Unavailable";
+				reply_reason->len = sizeof("Temporarily Unavailable")-1;
+				unlock_sca_line(sca);
+				return -1;
+		}
+
+		/* Save the owning subscription for refreshes and NOTIFY headers. */
+		identity = shm_malloc(subs->callid.len + subs->from_tag.len);
+		if (!identity) {
+			unlock_sca_line(sca);
+			return -1;
+		}
+		if (!scai)
+			scai = get_sca_index(sca, idx);
+		if (!scai) {
+			shm_free(identity);
+			unlock_sca_line(sca);
+			return -1;
+		}
+		memcpy(identity, subs->callid.s, subs->callid.len);
+		memcpy(identity + subs->callid.len, subs->from_tag.s, subs->from_tag.len);
+		shm_free(scai->seize_callid.s);
+		scai->seize_callid.s = identity;
+		scai->seize_callid.len = subs->callid.len;
+		scai->seize_from_tag.s = identity + subs->callid.len;
+		scai->seize_from_tag.len = subs->from_tag.len;
+		scai->seize_expires = get_ticks() + subs->expires;
 
 		new_state = SCA_STATE_SEIZED;
 
@@ -346,6 +386,7 @@ int lineseize_subs_handl(struct sip_msg* msg, struct subscription *subs, int *re
 
 	/* do publish for callinfo */
 	do_callinfo_publish( sca );
+	//unlock_sca_line(sca);
 
 	return 0;
 }
@@ -354,38 +395,41 @@ int lineseize_subs_handl(struct sip_msg* msg, struct subscription *subs, int *re
 /*
  * event specific extra headers builder - for empty notifications
  */
-str* build_lineseize_notify_hdrs(str* pres_uri, str* extra_hdrs)
+static int build_lineseize_notify_hdrs(struct subscription *subs, str* extra_hdrs)
 {
 	struct sca_line *sca;
+	struct sca_idx *scai;
+	str *pres_uri = &subs->pres_uri;
 	unsigned int idx;
 	int l;
 	char *p;
 	char *q;
-
-	if (extra_hdrs->s!= NULL)
-		return NULL;
 
 	/* search for the SCA */
 	sca = get_sca_line(pres_uri, 0);
 	if (sca==NULL) {
 		LM_CRIT("BUG? notify to line-seize but SCA (%.*s) not found\n",
 			pres_uri->len, pres_uri->s);
-		return NULL;
+		return 0;
 	}
 	/* watch it!!!! SCA is locked now */
-	idx = sca->seize_state;
+	for (scai = sca->indexes; scai; scai = scai->next)
+		if (str_strcmp(&scai->seize_callid, &subs->callid) == 0
+				&& str_strcmp(&scai->seize_from_tag, &subs->from_tag) == 0)
+			break;
+	idx = scai ? scai->idx : 0;
 	unlock_sca_line(sca);
 
 	if (idx==0)
-		return NULL;
+		return 0;
 
 	/* build the header */
 	extra_hdrs->s = (char*)pkg_malloc( CI_hdr_name_len + 1 /*<*/
 		+ pres_uri->len + 2 /*>;*/ + CI_hdr_AI_param_len + 1 /*=*/
-		+ 5 /*idx*/ + 2 /*CRLF*/);
+		+ 10 /*unsigned int idx*/ + 2 /*CRLF*/);
 	if (extra_hdrs->s == NULL) {
 		LM_ERR("no more pkg mem for the Call-Info hdr in Notify\n");
-		return NULL;
+		return -1;
 	}
 	p = extra_hdrs->s;
 	memcpy( p, CI_hdr_name_s "<", CI_hdr_name_len+1);
@@ -404,7 +448,7 @@ str* build_lineseize_notify_hdrs(str* pres_uri, str* extra_hdrs)
 	extra_hdrs->len = p - extra_hdrs->s;
 	LM_DBG("hdr is <%.*s>\n",extra_hdrs->len,extra_hdrs->s);
 
-	return NULL;
+	return 0;
 }
 
 
@@ -460,7 +504,7 @@ int callinfo_add_events(void)
 		/* with dialog, handle the subscribes */
 		event.evs_subs_handl = lineseize_subs_handl;
 		/* register the Call-Info builder for NOTIFIES */
-		event.build_empty_pres_info = build_lineseize_notify_hdrs;
+		event.build_notify_headers = build_lineseize_notify_hdrs;
 	}
 
 	if (pres.add_event(&event) < 0) {

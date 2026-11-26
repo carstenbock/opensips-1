@@ -68,6 +68,7 @@
 #include "ut.h"
 #include "t_reply.h"
 #include "t_fwd.h"
+#include "../../net/tcp_common.h"
 #include "t_lookup.h"
 #include "callid.h"
 #include "t_cancel.h"
@@ -139,6 +140,7 @@ static int child_init(int rank);
 
 /* exported functions */
 static int w_t_newtran(struct sip_msg* p_msg);
+static int w_t_no_auto_100(struct sip_msg* msg);
 static int w_t_reply(struct sip_msg* msg, unsigned int code, str* text);
 static int w_pv_t_reply(struct sip_msg *msg, unsigned int* code, str* text);
 static int w_t_relay( struct sip_msg  *p_msg , void *flags, struct proxy_l *proxy);
@@ -159,6 +161,7 @@ static int w_t_new_request(struct sip_msg* msg, str *method,
 static int t_wait_for_new_branches(struct sip_msg* msg,
 			unsigned int* br_to_wait);
 static int w_t_wait_no_more_branches(struct sip_msg* msg);
+static int api_t_wait_no_more_branches(void);
 static int t_reply_by_callid(struct sip_msg* msg,
 		unsigned int* code, str* text, str* callid, str* cseq);
 static int t_get_branch_idx_by_attr(struct sip_msg* msg,
@@ -244,6 +247,8 @@ static const dep_export_t deps = {
 
 static const cmd_export_t cmds[]={
 	{"t_newtran", (cmd_function)w_t_newtran, {{0,0,0}},
+		REQUEST_ROUTE},
+	{"t_no_auto_100", (cmd_function)w_t_no_auto_100, {{0,0,0}},
 		REQUEST_ROUTE},
 	{"t_reply", (cmd_function)w_pv_t_reply, {
 		{CMD_PARAM_INT, fixup_reply_code, 0},
@@ -480,9 +485,8 @@ static const pv_export_t mod_items[] = {
 		NULL, pv_parse_branch_index, NULL, 0},
 	{ {0, 0}, 0, 0, 0, 0, 0, 0, 0 }
 };
-
-
 static const mi_export_t mi_cmds [] = {
+
 	{ MI_TM_UAC, 0, MI_ASYNC_RPL_FLAG|MI_NAMED_PARAMS_ONLY, 0, {
 		{mi_tm_uac_dlg_1, {"method", "ruri", "headers", 0}},
 		{mi_tm_uac_dlg_2, {"method", "ruri", "headers", "next_hop", 0}},
@@ -493,15 +497,15 @@ static const mi_export_t mi_cmds [] = {
 		{mi_tm_uac_dlg_7, {"method", "ruri", "headers", "socket", "body", 0}},
 		{mi_tm_uac_dlg_8, {"method", "ruri", "headers", "next_hop", "socket",
 						   "body", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"t_uac_dlg", 0}
 	},
 	{ MI_TM_CANCEL, 0, 0, 0, {
 		{mi_tm_cancel, {"callid", "cseq", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"t_uac_cancel", 0}
 	},
 	{ MI_TM_HASH, 0, 0, 0, {
 		{mi_tm_hash, {0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"t_hash", 0}
 	},
 	{ MI_TM_REPLY, 0, MI_NAMED_PARAMS_ONLY, 0, {
 		{mi_tm_reply_1, {"code", "reason", "trans_id", "to_tag", 0}},
@@ -511,7 +515,7 @@ static const mi_export_t mi_cmds [] = {
 						   "body", 0}},
 		{mi_tm_reply_4, {"code", "reason", "trans_id", "to_tag",
 						   "new_headers", "body", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"t_reply", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };
@@ -809,6 +813,7 @@ int load_tm( struct tm_binds *tmb)
 	tmb->setlocalTholder = setlocalTholder;
 	tmb->get_branch_index = get_branch_index;
 	tmb->t_wait_for_new_branches = w_t_wait_for_new_branches;
+	tmb->t_wait_no_more_branches = api_t_wait_no_more_branches;
 	tmb->t_inject_ul_event_branch = t_inject_ul_event_branch;
 
 	/* tm context functions */
@@ -1304,6 +1309,19 @@ static int w_t_newtran( struct sip_msg* p_msg)
 }
 
 
+static int w_t_no_auto_100(struct sip_msg* msg)
+{
+	struct cell *t = get_t();
+
+	if (t && t!=T_UNDEFINED) {
+		LM_WARN("transaction already created, 100 Trying not suppressed\n");
+		return -1;
+	}
+	msg->msg_flags |= FL_NO_AUTO_100;
+	return 1;
+}
+
+
 static int w_t_on_negative( struct sip_msg* msg, void *go_to)
 {
 	t_on_negative( (struct script_route_ref*) go_to );
@@ -1449,7 +1467,7 @@ static int t_cancel_trans(struct cell *t, str *extra_hdrs)
 	}
 
 	LOCK_REPLIES(t);
-	which_cancel( t, &cancel_bitmap );
+	which_cancel( t, cancel_bitmap );
 	UNLOCK_REPLIES(t);
 
 	/* send cancels out */
@@ -1482,10 +1500,10 @@ static int w_t_cancel_branch(struct sip_msg *msg, void *sflags)
 		/* lock and get the branches to cancel */
 		if (!onreply_avp_mode) {
 			LOCK_REPLIES(t);
-			which_cancel( t, &cancel_bitmap );
+			which_cancel( t, cancel_bitmap );
 			UNLOCK_REPLIES(t);
 		} else {
-			which_cancel( t, &cancel_bitmap );
+			which_cancel( t, cancel_bitmap );
 		}
 		if (msg->first_line.u.reply.statuscode>=200)
 			/* do not cancel the current branch as we got
@@ -1495,10 +1513,10 @@ static int w_t_cancel_branch(struct sip_msg *msg, void *sflags)
 		/* lock and get the branches to cancel */
 		if (!onreply_avp_mode) {
 			LOCK_REPLIES(t);
-			which_cancel( t, &cancel_bitmap );
+			which_cancel( t, cancel_bitmap );
 			UNLOCK_REPLIES(t);
 		} else {
-			which_cancel( t, &cancel_bitmap );
+			which_cancel( t, cancel_bitmap );
 		}
 		/* ignore current branch */
 		BRANCH_BM_RST_IDX( cancel_bitmap, _tm_branch_index);
@@ -1706,9 +1724,9 @@ int w_t_inject_branches(struct sip_msg* msg, void *source, void *extra_flags)
 }
 
 
-int w_t_wait_for_new_branches(struct sip_msg* msg)
+int w_t_wait_for_new_branches(struct sip_msg* msg, unsigned int br_to_wait)
 {
-	return t_wait_for_new_branches(msg, 0);
+	return t_wait_for_new_branches(msg, &br_to_wait);
 }
 
 
@@ -1762,6 +1780,39 @@ static int w_t_wait_no_more_branches(struct sip_msg* msg)
 	return 1;
 }
 
+
+static int api_t_wait_no_more_branches(void)
+{
+	struct cell *t;
+	int is_local = 0, rc;
+
+	t = get_t();
+	if (t != T_NULL_CELL && t != T_UNDEFINED) {
+		is_local = 1;
+	} else {
+		if (remote_T == NULL)
+			return -1;
+
+		if (remote_T->hash == 0 && remote_T->label == 0) {
+			LM_BUG("invalid T ID (bad hexa %d,%d) found in remote_T\n",
+				remote_T->hash, remote_T->label);
+			return -1;
+		}
+
+		if (t_lookup_ident(&t, remote_T->hash, remote_T->label) < 0) {
+			LM_DBG("transaction %u:%u not found anymore\n",
+				remote_T->hash, remote_T->label);
+			return -1;
+		}
+	}
+
+	rc = t_wait_no_more_branches_timeout(t, 408) < 0 ? -1 : 1;
+
+	if (!is_local)
+		t_unref_cell(t);
+
+	return rc;
+}
 
 static int t_reply_by_callid(struct sip_msg* msg, unsigned int* code, str* text, str* callid, str* cseq_number)
 {
@@ -2640,7 +2691,7 @@ static inline int _pv_get_tm_branch_field(struct sip_msg *msg,
 			break;
 		case BR_TYPE_ID: /* return TYPE */
 			res->flags = PV_VAL_STR;
-			if (TM_BRANCH(t,idx).flags | T_UAC_IS_PHONY) {
+			if (TM_BRANCH(t,idx).flags & T_UAC_IS_PHONY) {
 				res->rs.s = "phony";
 				res->rs.len = 5;
 			} else {
@@ -2817,8 +2868,11 @@ static inline int _pv_set_tm_branch_field(struct sip_msg* msg,
 			old_list = set_avp_list( &TM_BRANCH(t,idx).battrs );
 			if ( (avp=search_first_avp( 0, attr_name, NULL, 0))!=NULL )
 				destroy_avp(avp);
-			if ( !(attr_flags&AVP_VAL_NULL) )
-				add_avp( attr_flags, attr_name, attr_val);
+			if (!(attr_flags & AVP_VAL_NULL) &&
+					add_avp(attr_flags, attr_name, attr_val) < 0) {
+				set_avp_list(old_list);
+				return -1;
+			}
 			set_avp_list( old_list );
 			break;
 		default:
@@ -2839,4 +2893,3 @@ static int pv_set_tm_branch_attr(struct sip_msg* msg, pv_param_t *param,
 {
 	return _pv_set_tm_branch_field( msg, param, op, val, BR_ATTR_ID);
 }
-

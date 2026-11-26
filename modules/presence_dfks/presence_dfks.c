@@ -121,12 +121,12 @@ static const param_export_t params[] = {
 };
 
 static const mi_export_t mi_cmds[] = {
-	{ "dfks_set_feature", 0, 0, 0, {
+	{ "set_feature", 0, 0, 0, {
 		{mi_dfks_set, {"presentity", "feature", "status", 0}},
 		{mi_dfks_set, {"presentity", "feature", "status", "values", 0}},
 		{mi_dfks_set, {"presentity", "feature", "status", "route_param", 0}},
 		{mi_dfks_set, {"presentity", "feature", "status", "route_param", "values", 0}},
-		{EMPTY_MI_RECIPE}}
+		{EMPTY_MI_RECIPE}}, {"dfks_set_feature", 0}
 	},
 	{EMPTY_MI_EXPORT}
 };

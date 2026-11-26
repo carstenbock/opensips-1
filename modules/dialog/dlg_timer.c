@@ -38,15 +38,16 @@ struct dlg_reinvite_ping_timer *reinvite_ping_timer=0;
 str options_str=str_init("OPTIONS");
 str invite_str=str_init("INVITE");
 
-extern int reinvite_ping_interval;
-extern int options_ping_interval;
-
 /* for the dlg timer, there are 3 possible states :
  * prev=next=0 -> dialog not in timer list
  * prev=0 -> dialog expired
  * otherwise - dialog still in timer list
  */
 #define FAKE_DIALOG_TL ((struct dlg_tl*)-1)
+
+#include "dlg_timer_wheel.h"
+
+static void _destroy_gen_dlg_timer(struct dlg_timer **timer);
 
 static int _init_gen_dlg_timer(struct dlg_timer **timer)
 {
@@ -82,13 +83,46 @@ error0:
 int init_dlg_timer(dlg_timer_handler hdl )
 {
 	timer_hdl = hdl;
-	return _init_gen_dlg_timer( &d_timer );
+	if (_init_gen_dlg_timer( &d_timer )<0)
+		return -1;
+
+	/* dialog lifetimes are set per dialog (script, replication, database):
+	 * kept on a wheel, where the place of a new one is not searched for */
+	d_timer->wheel = (struct dlg_tl*)shm_malloc(
+		DLG_WHEEL_SIZE*sizeof(struct dlg_tl));
+	if (d_timer->wheel==0) {
+		LM_ERR("no more shm mem for the dialog timer wheel\n");
+		_destroy_gen_dlg_timer( &d_timer );
+		return -1;
+	}
+	dlg_wheel_init( d_timer->wheel );
+	d_timer->wheel_done = get_ticks();
+
+	return 0;
 }
 
 int init_dlg_del_timer(dlg_timer_handler hdl )
 {
 	del_timer_hdl = hdl;
-	return _init_gen_dlg_timer( &ddel_timer );
+
+	if (_init_gen_dlg_timer( &ddel_timer )<0)
+		return -1;
+
+	/* dialog lifetimes are set per dialog (script, replication, database):
+	 * kept on a wheel, where the place of a new one is not searched for */
+	ddel_timer->wheel = (struct dlg_tl*)shm_malloc(
+		DLG_WHEEL_SIZE*sizeof(struct dlg_tl));
+	if (ddel_timer->wheel==0) {
+		LM_ERR("no more shm mem for the dialog timer wheel\n");
+		_destroy_gen_dlg_timer( &ddel_timer );
+		return -1;
+	}
+	dlg_wheel_init( ddel_timer->wheel );
+	ddel_timer->wheel_done = get_ticks();
+
+	return 0;
+
+
 }
 
 
@@ -194,7 +228,7 @@ error0:
 
 int init_dlg_reinvite_ping_timer(void)
 {
-	reinvite_ping_timer = (struct dlg_reinvite_ping_timer*)shm_malloc(sizeof(struct dlg_timer));
+	reinvite_ping_timer = shm_malloc(sizeof *reinvite_ping_timer);
 	if (reinvite_ping_timer==0) {
 		LM_ERR("no more shm mem\n");
 		return -1;
@@ -224,14 +258,21 @@ error0:
 
 void destroy_ping_timer(void)
 {
-	if (ping_timer ==0)
-		return;
+	if (reinvite_ping_timer) {
+		lock_destroy(reinvite_ping_timer->lock);
+		lock_dealloc(reinvite_ping_timer->lock);
 
-	lock_destroy(ping_timer->lock);
-	lock_dealloc(ping_timer->lock);
+		shm_free(reinvite_ping_timer);
+		reinvite_ping_timer = 0;
+	}
 
-	shm_free(ping_timer);
-	ping_timer=0;
+	if (ping_timer) {
+		lock_destroy(ping_timer->lock);
+		lock_dealloc(ping_timer->lock);
+
+		shm_free(ping_timer);
+		ping_timer = 0;
+	}
 }
 
 
@@ -243,6 +284,8 @@ static void _destroy_gen_dlg_timer(struct dlg_timer **timer)
 	lock_destroy((*timer)->lock);
 	lock_dealloc((*timer)->lock);
 
+	if ((*timer)->wheel)
+		shm_free((*timer)->wheel);
 	shm_free(*timer);
 	*timer = 0;
 }
@@ -261,6 +304,12 @@ void destroy_dlg_del_timer(void)
 static inline void insert_gen_timer_unsafe(struct dlg_timer *timer, struct dlg_tl *tl)
 {
 	struct dlg_tl* ptr;
+
+	if (timer->wheel) {
+		LM_DBG("inserting %p for %d\n", tl,tl->timeout);
+		dlg_wheel_insert( timer, tl );
+		return;
+	}
 
 #ifdef EXTRA_DEBUG
 	debug_gen_timer_list( timer );
@@ -357,6 +406,10 @@ void unsafe_insert_ping_timer(struct dlg_ping_list *node,int new_timeout)
 				node->prev = ping_timer->last;
 				ping_timer->last->next = node;
 				ping_timer->last = node;
+			} else if (it == ping_timer->first) {
+				node->next = it;
+				it->prev = node;
+				ping_timer->first = node;
 			} else {
 				it->prev->next=node;
 				node->prev = it->prev;
@@ -384,7 +437,7 @@ int insert_ping_timer(struct dlg_cell* dlg)
 
 	lock_get( ping_timer->lock );
 
-	unsafe_insert_ping_timer(node,options_ping_interval);
+	unsafe_insert_ping_timer(node,dlg->options_ping_interval);
 	dlg->pl = node;
 
 	dlg->legs[DLG_CALLER_LEG].reply_received = DLG_PING_SUCCESS;
@@ -426,6 +479,10 @@ void unsafe_insert_reinvite_ping_timer(struct dlg_ping_list *node,int new_timeou
 				node->prev = reinvite_ping_timer->last;
 				reinvite_ping_timer->last->next = node;
 				reinvite_ping_timer->last = node;
+			} else if (it == reinvite_ping_timer->first) {
+				node->next = it;
+				it->prev = node;
+				reinvite_ping_timer->first = node;
 			} else {
 				it->prev->next=node;
 				node->prev = it->prev;
@@ -452,7 +509,7 @@ int insert_reinvite_ping_timer(struct dlg_cell* dlg)
 
 	lock_get( reinvite_ping_timer->lock );
 
-	unsafe_insert_reinvite_ping_timer(node,reinvite_ping_interval);
+	unsafe_insert_reinvite_ping_timer(node,dlg->reinvite_ping_interval);
 	dlg->reinvite_pl = node;
 
 	dlg->legs[DLG_CALLER_LEG].reinvite_confirmed = DLG_PING_SUCCESS;
@@ -579,11 +636,55 @@ int update_dlg_timer( struct dlg_tl *tl, int timeout )
 	return ret;
 }
 
+/* Sets the tick at which the lifetime of a dialog ends, for a caller that
+ * holds the end itself and not an interval from now (the DB sync). With
+ * <only_later>, only if it is later than the end the dialog has.
+ * A dialog that waits in the timer is moved to the place of its new end,
+ * keeping the reference the timer holds on it. For a dialog that is not in
+ * the timer the value is only stored. A dialog that expired or was removed
+ * from the timer is left with the marks of that.
+ * returns :
+ *     0 - dialog is in the timer, with the new end if it was to be changed
+ *     1 - dialog is not in the timer, the value was stored
+ *    -1 - dialog expired or was removed from the timer, nothing was changed */
+int update_dlg_timer_deadline( struct dlg_tl *tl, unsigned int deadline,
+		int only_later )
+{
+	lock_get( d_timer->lock);
+
+	if ( tl->prev == NULL ) {
+		if ( tl->next ) {
+			/* handed to the timer routine, or removed from the timer */
+			lock_release( d_timer->lock);
+			return -1;
+		}
+		if ( !only_later || DLG_TICK_AFTER(deadline, tl->timeout) )
+			tl->timeout = deadline;
+		lock_release( d_timer->lock);
+		return 1;
+	}
+
+	if ( !only_later || DLG_TICK_AFTER(deadline, tl->timeout) ) {
+		remove_dlg_timer_unsafe(tl);
+		tl->timeout = deadline;
+		insert_gen_timer_unsafe( d_timer, tl );
+	}
+
+	lock_release( d_timer->lock);
+	return 0;
+}
+
 static inline struct dlg_tl* _get_gen_expired_dlgs(struct dlg_timer *timer, unsigned int time)
 {
 	struct dlg_tl *tl , *end, *ret;
 
 	lock_get( timer->lock);
+
+	if (timer->wheel) {
+		ret = dlg_wheel_expired( timer, time );
+		lock_release( timer->lock);
+		return ret;
+	}
 
 	if (timer->first.next==&(timer->first)
 	|| timer->first.next->timeout > time ) {
@@ -648,9 +749,6 @@ void dlg_timer_routine(unsigned int ticks , void * attr)
 		LM_DBG("tl=%p next=%p\n", ctl, tl);
 		timer_hdl( ctl );
 	}
-
-	if (dlg_del_delay==0)
-		return;
 
 	tl = _get_gen_expired_dlgs( ddel_timer, ticks );
 
@@ -983,7 +1081,7 @@ void dlg_options_routine(unsigned int ticks , void * attr)
 
 			/* we've pinged, now update the timeout & move the entry further down the list */
 			detach_ping_node_unsafe(it,0);
-			unsafe_insert_ping_timer(it,options_ping_interval);
+			unsafe_insert_ping_timer(it,dlg->options_ping_interval);
 		}
 		it = next;
 	}
@@ -1117,11 +1215,39 @@ void dlg_reinvite_routine(unsigned int ticks , void * attr)
 
 			/* we've pinged, now update the timeout & move the entry further down the list */
 			detach_ping_node_unsafe(it,1);
-			unsafe_insert_reinvite_ping_timer(it,reinvite_ping_interval);
+			unsafe_insert_reinvite_ping_timer(it,dlg->reinvite_ping_interval);
 		}
 		it = next;
 	}
 
 	lock_release(reinvite_ping_timer->lock);
 	tcp_no_new_conn = 0;
+}
+
+void update_dlg_ping_timer( struct dlg_ping_list *node, int timeout, int reinvite )
+{
+	if (!node) {
+		LM_BUG("cannot update dialog ping timer: missing timer node\n");
+		return;
+	}
+
+	if (reinvite)
+		lock_get(reinvite_ping_timer->lock);
+	else
+		lock_get(ping_timer->lock);
+
+
+	/* remove dialog */
+	detach_ping_node_unsafe(node, reinvite);
+
+	if (reinvite)
+		unsafe_insert_reinvite_ping_timer(node,timeout);
+	else
+		unsafe_insert_ping_timer(node,timeout);
+
+
+	if (reinvite)
+		lock_release(reinvite_ping_timer->lock);
+	else
+		lock_release(ping_timer->lock);
 }

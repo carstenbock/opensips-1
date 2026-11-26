@@ -492,7 +492,7 @@ query:
 	return &global_he;
 }
 
-inline struct hostent* resolvehost(char* name, int no_ip_test)
+inline struct hostent* resolvehost_af(char* name, int no_ip_test, int af)
 {
 	static struct hostent *he = NULL;
 #ifdef HAVE_GETIPNODEBYNAME
@@ -508,15 +508,15 @@ inline struct hostent* resolvehost(char* name, int no_ip_test)
 		s.len = strlen(name);
 
 		/* check if it's an ip address */
-		if ((ip = str2ip(&s)) || (ip = str2ip6(&s))) {
-			/* we are lucky, this is an ip address */
+		if (af != AF_INET6 && (ip = str2ip(&s)))
 			return ip_addr2he(&s, ip);
-		}
+		if (af != AF_INET && (ip = str2ip6(&s)))
+			return ip_addr2he(&s, ip);
 	}
 
 	start_expire_timer(start, execdnsthreshold);
 
-	if (dns_try_ipv6) {
+	if (af == AF_INET6 || (af == 0 && dns_try_ipv6)) {
 		/* try ipv6 */
 	#ifdef HAVE_GETHOSTBYNAME2
 		if (dnscache_fetch_func)
@@ -538,15 +538,22 @@ inline struct hostent* resolvehost(char* name, int no_ip_test)
 			goto out;
 	}
 
-	if (dnscache_fetch_func)
-		he = own_gethostbyname2(name,AF_INET);
-	else
-		he = gethostbyname(name);
+	if (af != AF_INET6) {
+		if (dnscache_fetch_func)
+			he = own_gethostbyname2(name,AF_INET);
+		else
+			he = gethostbyname(name);
+	}
 
 out:
 	_stop_expire_timer(start, execdnsthreshold, "dns",
 	            name, strlen(name), 0, dns_slow_queries, dns_total_queries);
 	return he;
+}
+
+inline struct hostent* resolvehost(char* name, int no_ip_test)
+{
+	return resolvehost_af(name, no_ip_test, 0);
 }
 
 struct hostent * own_gethostbyaddr(void *addr, socklen_t len, int af)
@@ -1798,6 +1805,11 @@ struct hostent* sip_resolvehost( str* name, unsigned short* port,
 	struct hostent* he;
 	unsigned short local_proto=PROTO_NONE;
 
+	if (!name || !name->s || name->len < 0) {
+		LM_ERR("invalid domain name\n");
+		return 0;
+	}
+
 	if (dn)
 		*dn = 0;
 
@@ -1881,7 +1893,7 @@ struct hostent* sip_resolvehost( str* name, unsigned short* port,
 	*proto = (is_sips)?PROTO_TLS:PROTO_UDP;
 
 do_srv:
-	if ((name->len+SRV_MAX_PREFIX_LEN+1)>MAX_DNS_NAME) {
+	if (name->len > MAX_DNS_NAME - SRV_MAX_PREFIX_LEN - 1) {
 		LM_WARN("domain name too long (%d),"
 			" unable to perform SRV lookup\n", name->len);
 		/* set defaults */

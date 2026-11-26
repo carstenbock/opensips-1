@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <string.h>
+#include <limits.h>
 
 
 /* set to 0 for alloc debugging, e.g. through valgrind */
@@ -114,11 +115,10 @@ static struct __bencode_buffer_piece *__bencode_piece_new(unsigned int size) {
 }
 
 int bencode_buffer_init(bencode_buffer_t *buf) {
+	memset(buf, 0, sizeof(*buf));
 	buf->pieces = __bencode_piece_new(0);
 	if (!buf->pieces)
 		return -1;
-	buf->free_list = NULL;
-	buf->error = 0;
 	return 0;
 }
 
@@ -281,6 +281,8 @@ bencode_item_t *bencode_integer(bencode_buffer_t *buf, long long int i) {
 		rlen = snprintf(ret->__buf, alen, "i%llde", i);
 		if (rlen < alen)
 			break;
+		if (alen > INT_MAX / 2)
+			return NULL;
 		alen <<= 1;
 	}
 

@@ -69,6 +69,7 @@
 #define DLG_FLAG_RACE_CONDITION_OCCURRED	(1<<17)
 #define DLG_FLAG_SELF_EXTENDED_TIMEOUT		(1<<18)
 #define DLG_FLAG_SYNCED                     (1<<19)
+#define DLG_FLAG_AUTOPRACK			(1<<20)
 
 #define dlg_has_options_pinging(dlg) \
 	(dlg->flags & DLG_FLAG_PING_CALLER || \
@@ -92,6 +93,7 @@ struct dlg_leg_cseq_map {
 
 struct dlg_leg {
 	int id;
+	int branch_id;
 	str tag;
 	str r_cseq;		/* last cseq received targeting this leg */
 	str prev_cseq;	/* prev cseq received targeting this leg */
@@ -143,6 +145,10 @@ struct dlg_cell
 	unsigned short       lifetime_dirty; /* 1 if lifetime timer should
 	                                      * be updated */
 
+	unsigned int         options_ping_interval; /* holds the OPTIONS
+                                         * ping interval */
+	unsigned int         reinvite_ping_interval; /* holds the reINVITE
+                                         * ping interval */
 	/* holds the ID of the process holding the dialog bucket lock (or 0)
 	 * when either working with .profile_links list or running dlg callbacks */
 	unsigned short       locked_by;
@@ -250,6 +256,11 @@ static inline int ensure_leg_array(int needed_legs, struct dlg_cell *dlg)
 {
 	struct dlg_leg *new_legs;
 
+	if (needed_legs > 254) {
+		LM_ERR("too many dialog legs: %d\n", needed_legs);
+		return -1;
+	}
+
 	while (((int)dlg->legs_no[DLG_LEGS_ALLOCED] - needed_legs) < 0) {
 		new_legs = shm_realloc(dlg->legs,
 			(dlg->legs_no[DLG_LEGS_ALLOCED] + 2) * sizeof *new_legs);
@@ -301,11 +312,11 @@ void destroy_dlg(struct dlg_cell *dlg);
 
 #ifdef DBG_DIALOG
 #define DBG_REF(dlg, cnt) \
-	sh_log((dlg)->hist, DLG_REF, "h=%d, ref %d with +%d", \
-	       (dlg)->h_entry, (dlg)->ref, (cnt));
+	sh_log((dlg)->hist, DLG_REF, "h=%d, state=%d, flags=0x%x, ref %d with +%d", \
+	       (dlg)->h_entry, (dlg)->state, (dlg)->flags, (dlg)->ref, (cnt));
 #define DBG_UNREF(dlg, cnt) \
-	sh_log((dlg)->hist, DLG_UNREF, "h=%d, unref %d with -%d", \
-	       (dlg)->h_entry, (dlg)->ref, (cnt));
+	sh_log((dlg)->hist, DLG_UNREF, "h=%d, state=%d, flags=0x%x, unref %d with -%d", \
+	       (dlg)->h_entry, (dlg)->state, (dlg)->flags, (dlg)->ref, (cnt));
 #define DBG_FLUSH(dlg) sh_flush((dlg)->hist)
 #else
 #define DBG_REF(dlg, cnt)
@@ -347,50 +358,6 @@ void destroy_dlg(struct dlg_cell *dlg);
 				(_dlg)->del_delay?(_dlg)->del_delay:dlg_del_delay); \
 		}\
 	}while(0)
-
-/*
- * @input - str
- * @return - integer flag bitmask
- */
-#define parse_create_dlg_flags(input) \
-	({ \
-		char *___p; \
-		int ___flags = 0; \
-		for (___p=(input)->s; ___p < (input)->s + (input)->len; ___p++) \
-		{ \
-			switch (*___p) \
-			{ \
-				case 'P': \
-					___flags |= DLG_FLAG_PING_CALLER; \
-					LM_DBG("will ping caller\n"); \
-					break; \
-				case 'p': \
-					___flags |= DLG_FLAG_PING_CALLEE; \
-					LM_DBG("will ping callee\n"); \
-					break; \
-				case 'B': \
-					___flags |= DLG_FLAG_BYEONTIMEOUT; \
-					LM_DBG("bye on timeout activated\n"); \
-					break; \
-				case 'R': \
-					___flags |= DLG_FLAG_REINVITE_PING_CALLER; \
-					LM_DBG("re-invite ping caller activated\n"); \
-					break; \
-				case 'r': \
-					___flags |= DLG_FLAG_REINVITE_PING_CALLEE; \
-					LM_DBG("re-invite ping callee activated\n"); \
-					break; \
-				case 'E': \
-					___flags |= DLG_FLAG_END_ON_RACE_CONDITION; \
-					LM_DBG("ending call on 200OK race conditions \n"); \
-					break; \
-				default: \
-					LM_DBG("unknown create_dialog flag : [%c] ." \
-						   "Skipping\n", *___p); \
-			} \
-		} \
-		___flags; \
-	})
 
 int dialog_cleanup( struct sip_msg *msg, void *param );
 

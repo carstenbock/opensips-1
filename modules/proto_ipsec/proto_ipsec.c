@@ -103,7 +103,7 @@ static int proto_ipsec_init_listener(struct socket_info *si);
 static int proto_ipsec_bind_listener(struct socket_info *si);
 static int proto_ipsec_send(const struct socket_info* source,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id);
+		unsigned int id, struct sip_msg *msg);
 static int ipsec_pre_script_handler( struct sip_msg *msg, void *param);
 static void ipsec_usrloc_handler(void *binding, ul_cb_type type, ul_cb_extra *_);
 
@@ -472,7 +472,7 @@ static int proto_ipsec_add_listeners(void)
 		/* socket_info2id() drops the flags; "frag" has to reach the UDP
 		 * socket, which sends for the IPSec listener (helm KI-291) */
 		si->flags |= SI_INTERNAL | (it->socket_info.flags & SI_FRAG);
-		udp = new_sock_info(si);
+		udp = new_sock_info(si, NULL);
 		if (!udp) {
 			LM_ERR("could not add UDP listening sucket for %s:%d\n",
 					si->name, si->port);
@@ -482,7 +482,7 @@ static int proto_ipsec_add_listeners(void)
 		si->proto = PROTO_TCP;
 		si->workers = 0;
 		si->flags |= SI_REUSEPORT;
-		tcp = new_sock_info(si);
+		tcp = new_sock_info(si, NULL);
 		if (!tcp) {
 			LM_ERR("could not add TCP listening sucket for %s:%d\n",
 					si->name, si->port);
@@ -527,6 +527,9 @@ static int proto_ipsec_init(struct proto_info *pi)
 
 static int proto_ipsec_init_listener(struct socket_info *si)
 {
+	/* the UDP and TCP listeners added by proto_ipsec_add_listeners() do
+	 * the work; initializing this one as well would overwrite extra_data,
+	 * which holds their socket_info_pair (see proto_ipsec_send()) */
 	return 0;
 	int ret;
 	/* force reuse port for all connections */
@@ -570,7 +573,7 @@ static int ipsec_t_from_ue(struct cell *t)
 
 static int proto_ipsec_send(const struct socket_info* source,
 		char* buf, unsigned int len, const union sockaddr_union* to,
-		unsigned int id)
+		unsigned int id, struct sip_msg *msg)
 {
 	struct ip_addr ip;
 	unsigned short port, lookup_port;
@@ -600,8 +603,9 @@ static int proto_ipsec_send(const struct socket_info* source,
 	if (fl.type == SIP_REQUEST || source->proto == PROTO_UDP) {
 		/* we need to send from the client port */
 		t = tm_ipsec.t_gett();
-		if (t && t != T_UNDEFINED)
+		if (t && t != T_UNDEFINED) {
 			ctx = IPSEC_CTX_TM_GET(t);
+		}
 		if (ctx) {
 			LM_DBG("Got context %p (state = %d) from transaction\n",
 					ctx, ctx->state);
@@ -666,7 +670,7 @@ static int proto_ipsec_send(const struct socket_info* source,
 			(fl.type == SIP_REQUEST?"request":"reply"), proto2a(source->proto),
 			source->address_str.len, source->address_str.s, source->port_no,
 			ip_addr2a(&ip), port);
-	ret = protos[source->proto].tran.send(source, buf, len, to, id);
+	ret = protos[source->proto].tran.send(source, buf, len, to, id, msg);
 	if (ret >= 0)
 		return ret;
 	if (fl.type == SIP_REQUEST && source->proto == PROTO_TCP) {
@@ -701,7 +705,7 @@ static int proto_ipsec_send(const struct socket_info* source,
 			(fl.type == SIP_REQUEST?"request":"reply"), proto2a(source->proto),
 			source->address_str.len, source->address_str.s, source->port_no,
 			ip_addr2a(&ip), port);
-	return protos[source->proto].tran.send(source, buf, len, to, id);
+	return protos[source->proto].tran.send(source, buf, len, to, id, msg);
 }
 
 static int ipsec_aka_auth_match_f(const struct authenticate_body *auth,
@@ -1500,13 +1504,13 @@ NOTE 13: According to clause 7.4 on SA handling, at most six SAs per direction p
 a P-CSCF for one IMPI at any one time.
 */
 
-	/* pushing in global context, together with the reference of the lookup */
+	/* pushing in global context, with the reference of the lookup */
 	ipsec_ctx_push(ctx);
 	lock_release(&ctx->lock);
-	ipsec_release_user(user);
 
 	if (extend_tmp)
 		ipsec_ctx_extend_tmp(ctx);
+	ipsec_release_user(user);
 
 	/* we need to add the integrity-protected - search for Authorization header */
 	if (!is_secure) {

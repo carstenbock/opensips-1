@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <sched.h>
 #include <stdio.h>
+#include <stdint.h>
 
 #include "lib/dbg/profiling.h"
 #include "mem/shm_mem.h"
@@ -40,6 +41,13 @@
 /* array with children pids, 0= main proc,
  * alloc'ed in shared mem if possible */
 struct process_table *pt = NULL;
+static void *pt_storage;
+
+void free_process_table(void)
+{
+	shm_free(pt_storage);
+	pt_storage = NULL;
+}
 
 /* The maximum number of processes that will ever exist in OpenSIPS. This is
  * actually the size of the process table
@@ -96,6 +104,8 @@ static unsigned long count_running_processes(void *x)
 
 int init_multi_proc_support(void)
 {
+	const size_t alignment = __alignof__(struct process_table);
+	size_t table_size;
 	int i;
 	/* at this point we know exactly the possible number of processes, since
 	 * all the other modules already adjusted their extra numbers */
@@ -109,16 +119,19 @@ int init_multi_proc_support(void)
 	/* allocate the PID table to accomodate the maximum possible number of
 	 * process we may have during runtime (covering extra procs created 
 	 * due auto-scaling) */
-	pt = shm_malloc(sizeof(struct process_table)*counted_max_processes);
-	if (pt==0){
+	table_size = sizeof(*pt) * counted_max_processes;
+	/* The shared-memory allocator may only provide pointer alignment. */
+	pt_storage = shm_malloc(table_size + alignment - 1);
+	if (!pt_storage) {
 		LM_ERR("out of memory\n");
 		return -1;
 	}
-	memset(pt, 0, sizeof(struct process_table)*counted_max_processes);
+	pt = (struct process_table *)(((uintptr_t)pt_storage + alignment - 1) &
+			~(uintptr_t)(alignment - 1));
+	memset(pt, 0, table_size);
 
 	for( i=0 ; i<counted_max_processes ; i++ ) {
 		/* reset fds to prevent bogus ops */
-		pt[i].unix_sock = -1;
 		pt[i].pid = -1;
 		pt[i].ipc_pipe[0] = pt[i].ipc_pipe[1] = -1;
 		pt[i].ipc_sync_pipe[0] = pt[i].ipc_sync_pipe[1] = -1;
@@ -134,12 +147,6 @@ int init_multi_proc_support(void)
 	/* create the IPC pipes for all possible procs */
 	if (create_ipc_pipes( counted_max_processes )<0) {
 		LM_ERR("failed to create IPC pipes, aborting\n");
-		return -1;
-	}
-
-	/* create the IPC pipes for all possible procs */
-	if (tcp_create_comm_proc_socks( counted_max_processes )<0) {
-		LM_ERR("failed to create TCP layer communication, aborting\n");
 		return -1;
 	}
 
@@ -238,9 +245,9 @@ void reset_process_slot( int p_id )
 
 	pt[p_id].ipc_pipe[0] = pt[p_id].ipc_pipe[1] = -1;
 	pt[p_id].ipc_sync_pipe[0] = pt[p_id].ipc_sync_pipe[1] = -1;
-	pt[p_id].unix_sock = -1;
 
 	pt[p_id].log_level = pt[p_id].default_log_level = 0; /*not really needed*/
+	pt[p_id].profiling_proc_level = LEVEL_OFF;
 
 	/* purge all load-related data */
 	memset( &pt[p_id].load, 0, sizeof(struct proc_load_info));
@@ -270,8 +277,6 @@ static __attribute__((__noreturn__)) void child_startup_failed(void)
 static int internal_fork_child_setup(const struct internal_fork_params *ifpp)
 {
 	init_log_level();
-
-	tcp_connect_proc_to_tcp_main(process_no, 1);
 
 	/* free the script if not needed */
 	if (!(ifpp->flags & OSS_PROC_NEEDS_SCRIPT) && sroutes) {
@@ -307,13 +312,6 @@ int internal_fork(const struct internal_fork_params *ifpp)
 	seed = rand();
 
 	LM_DBG("forking new process \"%s\" on slot %d\n", ifpp->proc_desc, new_idx);
-
-	/* set TCP communication */
-	if (tcp_activate_comm_proc_socks(new_idx)<0){
-		LM_ERR("failed to connect future proc %d to TCP main\n",
-			process_no);
-		return -1;
-	}
 
 	/* set the IPC pipes */
 	if ( (ifpp->flags & OSS_PROC_NO_IPC) ) {
@@ -406,7 +404,6 @@ int internal_fork(const struct internal_fork_params *ifpp)
 			goto child_is_down;
 		}
 		pt[new_idx].flags |= OSS_PROC_IS_RUNNING;
-		tcp_connect_proc_to_tcp_main( new_idx, 0);
 		return new_idx;
 child_is_down:
 		LM_CRIT("failed to initialize child process %d\n", new_idx);

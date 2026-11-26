@@ -530,8 +530,9 @@ inline static int pathmax(void)
 	static int pathmax=0;
 #endif
 	if (pathmax==0) { /* init */
-		pathmax=pathconf("/", _PC_PATH_MAX);
-		pathmax=(pathmax<=0)?PATH_MAX_GUESS:pathmax+1;
+		long max_path = pathconf("/", _PC_PATH_MAX);
+		pathmax=(max_path<=0 || max_path >= INT_MAX) ?
+			PATH_MAX_GUESS : (int)max_path+1;
 	}
 	return pathmax;
 }
@@ -1654,12 +1655,23 @@ int _base32decode(unsigned char *out, unsigned char *in, int len,
 #define howmany(x, y) (sizeof(x) / sizeof(y))
 
 /* waits for maximum _timeout microseconds for the _cond condition to be
- * satisfied, sleeping every _inc microseconds */
+ * satisfied, sleeping every _inc microseconds.  The deadline is measured,
+ * not derived from the number of sleeps: a usleep() lasts longer than
+ * asked, so counting _timeout/_inc of them waited several times longer */
 #define busy_wait_for(_cond, _timeout, _inc) \
 	do { \
-		unsigned _retries = (_timeout)/(_inc);\
-		while (!(_cond) && --_retries > 0) \
+		struct timespec __bw_ts; \
+		unsigned long long __bw_end; \
+		clock_gettime(CLOCK_MONOTONIC, &__bw_ts); \
+		__bw_end = __bw_ts.tv_sec * 1000000ULL + __bw_ts.tv_nsec / 1000 + \
+			(_timeout); \
+		while (!(_cond)) { \
+			clock_gettime(CLOCK_MONOTONIC, &__bw_ts); \
+			if (__bw_ts.tv_sec * 1000000ULL + __bw_ts.tv_nsec / 1000 >= \
+			        __bw_end) \
+				break; \
 			usleep(_inc); \
+		} \
 	} while (0)
 
 #endif
