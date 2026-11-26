@@ -287,6 +287,7 @@ MCAST_TTL			"mcast_ttl"
 TOS					"tos"
 DISABLE_DNS_FAILOVER  "disable_dns_failover"
 DISABLE_DNS_BLACKLIST "disable_dns_blacklist"
+DNS_BLACKLIST_EXPIRE "dns_blacklist_expire"
 DST_BLACKLIST		"dst_blacklist"
 MAX_WHILE_LOOPS "max_while_loops"
 DISABLE_STATELESS_FWD	"disable_stateless_fwd"
@@ -541,6 +542,8 @@ SPACE		[ ]
 									return DISABLE_DNS_FAILOVER; }
 <INITIAL>{DISABLE_DNS_BLACKLIST}	{	count(); yylval.strval=yytext;
 									return DISABLE_DNS_BLACKLIST; }
+<INITIAL>{DNS_BLACKLIST_EXPIRE}	{	count(); yylval.strval=yytext;
+									return DNS_BLACKLIST_EXPIRE; }
 <INITIAL>{DST_BLACKLIST}	{	count(); yylval.strval=yytext;
 									return DST_BLACKLIST; }
 <INITIAL>{DISABLE_STATELESS_FWD}	{	count(); yylval.strval=yytext;

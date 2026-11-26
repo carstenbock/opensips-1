@@ -402,6 +402,7 @@ extern int cfg_parse_only_routes;
 %token TOS
 %token DISABLE_DNS_FAILOVER
 %token DISABLE_DNS_BLACKLIST
+%token DNS_BLACKLIST_EXPIRE
 %token DST_BLACKLIST
 %token DISABLE_STATELESS_FWD
 %token DB_VERSION_TABLE
@@ -1635,6 +1636,14 @@ assign_stm: LOGLEVEL EQUAL snumber { IFOR();
 										disable_dns_blacklist=$3;
 									}
 		| DISABLE_DNS_BLACKLIST error { yyerror("boolean value expected"); }
+		| DNS_BLACKLIST_EXPIRE EQUAL NUMBER { IFOR();
+										if ($3 < 1) {
+											yyerror("dns_blacklist_expire: seconds, at least 1");
+										} else {
+											dns_blacklist_expire=$3;
+										}
+									}
+		| DNS_BLACKLIST_EXPIRE error { yyerror("number expected"); }
 		| DST_BLACKLIST EQUAL ID SLASH blst_flags blst_def { IFOR();
 				s_tmp.s = $3;
 				s_tmp.len = strlen($3);

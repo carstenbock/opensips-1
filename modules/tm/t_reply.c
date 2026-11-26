@@ -1571,6 +1571,26 @@ error:
 	return RPS_ERROR;
 }
 
+/* A script that cancels the branch of a provisional reply and drops that
+ * reply (t_cancel_branch(); drop;) got no CANCEL out: for the first
+ * provisional of a branch t_cancel_branch() only marks the branch, because
+ * nothing has been received on it yet, and the CANCEL is sent when the reply
+ * is processed - which a dropped reply never is. The UAS was left with its
+ * INVITE until its own timers ran out (helm KI-312). The dropped reply is a
+ * provisional received on the branch all the same (RFC 3261 9.1), so the
+ * pending CANCEL goes out here. */
+static void cancel_dropped_provisional(struct cell *t, int branch, int lock)
+{
+	if (!(TM_BRANCH(t,branch).flags & T_UAC_TO_CANCEL_FLAG))
+		return;
+	if (lock)
+		LOCK_REPLIES( t );
+	TM_BRANCH(t,branch).flags &= ~(T_UAC_TO_CANCEL_FLAG);
+	cancel_branch(t, branch);
+	if (lock)
+		UNLOCK_REPLIES( t );
+}
+
 void process_reply_and_timer(struct cell *t,int branch,int msg_status, 
 	struct sip_msg *p_msg,int last_uac_status, struct ua_client *uac)
 {
@@ -1755,6 +1775,7 @@ int reply_received( struct sip_msg  *p_msg )
 		(run_top_route(sroutes->onreply[uac->on_reply->idx],p_msg)
 		&ACT_FL_DROP) && (msg_status<200) ) {
 			set_route_type(old_route_type);
+			cancel_dropped_provisional(t, branch, !onreply_avp_mode);
 			if (onreply_avp_mode) {
 				UNLOCK_REPLIES( t );
 				set_avp_list( backup_list );
@@ -1769,6 +1790,7 @@ int reply_received( struct sip_msg  *p_msg )
 		(run_top_route(sroutes->onreply[t->on_reply->idx],p_msg)
 		&ACT_FL_DROP) && (msg_status<200) ) {
 			set_route_type(old_route_type);
+			cancel_dropped_provisional(t, branch, !onreply_avp_mode);
 			if (onreply_avp_mode) {
 				UNLOCK_REPLIES( t );
 				set_avp_list( backup_list );
