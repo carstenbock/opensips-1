@@ -769,6 +769,38 @@ void dlg_setup_reinvite_callbacks(struct cell *t, struct sip_msg *req,
 	_dlg_setup_reinvite_callbacks(t, req, dlg);
 }
 
+/* The callee leg of an early dialog is stored when the provisional reply is
+ * forwarded (TMCB_RESPONSE_FWDED), which is after the script has handled that
+ * reply. A script that answers a reliable 183 itself (dlg_send_sequential()
+ * with PRACK from the reply route, as the P-CSCF does for RFC 3312
+ * preconditions) found no leg for the first 183 and could only send the PRACK
+ * when the UE retransmitted it, after T1 (0.5 s, 2 s with an iPhone; helm
+ * KI-167). This stores the leg from the reply the script is handling; the
+ * callback finds the tag known and only refreshes the routing info.
+ * Returns 0 if the callee leg is known afterwards. */
+int dlg_learn_early_callee_leg(struct sip_msg *rpl, struct dlg_cell *dlg)
+{
+	struct cell *t;
+	str mangled_from = {0,0};
+	str mangled_to = {0,0};
+	long leg_idx = -1;
+
+	if (rpl==NULL || rpl==FAKED_REPLY || rpl->first_line.type!=SIP_REPLY ||
+	rpl->REPLY_STATUS<=100 || rpl->REPLY_STATUS>=200)
+		return -1;
+	t = d_tmb.t_gett();
+	if (t==NULL || t==T_UNDEFINED || t->uas.request==NULL)
+		return -1;
+	/* the mangled From/To of uac_replace_*() are only known once the reply
+	 * is forwarded: leave such a dialog to the callback */
+	if (t->uas.request->msg_flags & (FL_USE_UAC_FROM | FL_USE_UAC_TO))
+		return -1;
+
+	push_reply_in_dialog(t->uas.request, rpl, t, dlg, &mangled_from,
+		&mangled_to, &leg_idx);
+	return leg_idx>=0 ? 0 : -1;
+}
+
 static void dlg_onreply(struct cell* t, int type, struct tmcb_params *param)
 {
 	struct sip_msg *rpl,*req;

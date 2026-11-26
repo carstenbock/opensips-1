@@ -2726,6 +2726,13 @@ static int dlg_send_sequential(struct sip_msg* msg, str *method, int leg,
 	if (body && !ct)
 		LM_WARN("body without content type! This request might be rejected by uac!\n");
 
+	/* called from the reply route for the provisional reply that creates
+	 * the callee leg: the leg is not stored yet (helm KI-167) */
+	if (leg != DLG_CALLER_LEG && msg->first_line.type == SIP_REPLY &&
+	dlg->state <= DLG_STATE_EARLY &&
+	!leg_is_answered(&dlg->legs[callee_idx(dlg)]))
+		dlg_learn_early_callee_leg(msg, dlg);
+
 	if (reply_route) {
 		p = shm_malloc(sizeof *p);
 		if (!p) {

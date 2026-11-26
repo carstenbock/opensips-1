@@ -7,6 +7,8 @@ with a reliable 183 that adds two entries of an IPsec gateway above the proxy
 KI-86 MT test of 2026-11-09, leaves out one of the identical S-CSCF entries.
 The proxy's PRACK toward the callee must go to the network-facing entry
 (5196). OpenSIPS 0.1.46 counted the INVITE's entries and sent it to 5195.
+It must also follow the first 183, without waiting for a retransmission
+(helm KI-167).
 """
 import re
 import socket
@@ -32,7 +34,6 @@ def main():
               "Call-ID: early-route-test-1\r\nCSeq: 7 INVITE\r\nMax-Forwards: 70\r\n"
               "Contact: <sip:a@127.0.0.1:5197>\r\nSupported: 100rel\r\nContent-Length: 0\r\n\r\n")
     deadline, sent_at, answered, result = time.time() + 30, 0.0, False, None
-    retransmit = None
     while time.time() < deadline and result is None:
         if not answered and time.time() - sent_at > 1.0:
             uac.sendto(invite.encode(), PROXY)  # resent until the proxy is up
@@ -58,14 +59,13 @@ def main():
                          "Contact: <sip:ue@127.0.0.1:5198>\r\nRequire: 100rel\r\nRSeq: 1\r\n"
                          "Content-Length: 0\r\n\r\n")
                 uas.sendto(reply.encode(), peer)
-                # The proxy's script sees the first 183 before the dialog
-                # module stores the callee leg; the UE retransmits it (RFC 3262).
-                retransmit = (reply.encode(), peer, time.time() + 0.5)
+                # The PRACK must follow the first 183: the 183 is not
+                # retransmitted here. Before 0.1.63 the script saw the 183
+                # before the dialog module had stored the callee leg and could
+                # only PRACK its retransmission, T1 later (helm KI-167).
+                deadline = time.time() + 3
         except socket.timeout:
             pass
-        if retransmit and time.time() > retransmit[2]:
-            uas.sendto(retransmit[0], retransmit[1])
-            retransmit = (retransmit[0], retransmit[1], time.time() + 0.5)
         for name, s in (("UE-facing 5195 (wrong)", gw_ue), ("network-facing 5196", gw_net)):
             try:
                 data, _ = s.recvfrom(65535)

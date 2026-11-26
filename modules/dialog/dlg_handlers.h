@@ -120,6 +120,8 @@ int dlg_create_dialog(struct cell* t, struct sip_msg *req,unsigned int flags);
 
 void dlg_onreq(struct cell* t, int type, struct tmcb_params *param);
 
+int dlg_learn_early_callee_leg(struct sip_msg *rpl, struct dlg_cell *dlg);
+
 void dlg_onroute(struct sip_msg* req, str *rr_param, void *param);
 
 void dlg_ontimeout( struct dlg_tl *tl);
