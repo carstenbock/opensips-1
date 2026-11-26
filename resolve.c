@@ -74,11 +74,12 @@ int dns_retr_no=-1;
 int dns_servers_no=-1;
 int dns_search_list=-1;
 int disable_dns_blacklist=1;
+/* how long a destination that failed stays on the "dns" blacklist [s] */
+int dns_blacklist_expire=4*60;
 
 static struct bl_head *failover_bl=0;
 #define DNS_REVOLVER_BL_ID    17
 #define DNS_REVOLVER_BL_NAME  "dns"
-#define DNS_BL_EXPIRE         4*60
 
 #define MAX_BUFF_SIZE	8192
 #define MAXALIASES	36
@@ -2062,7 +2063,7 @@ int get_next_su(struct proxy_l *p, union sockaddr_union* su, int add_to_bl)
 		if (n!=0) {
 			LM_ERR("failed to build bl rule\n");
 		} else {
-			add_list_to_head( failover_bl, list, list, 0, DNS_BL_EXPIRE);
+			add_list_to_head( failover_bl, list, list, 0, dns_blacklist_expire);
 		}
 	}
 

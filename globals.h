@@ -103,6 +103,7 @@ extern int tos;
 
 extern int disable_dns_failover;
 extern int disable_dns_blacklist;
+extern int dns_blacklist_expire;
 
 extern int cfg_errors;
 
