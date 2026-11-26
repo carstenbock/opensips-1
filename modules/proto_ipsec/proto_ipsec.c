@@ -1149,6 +1149,9 @@ static int w_ipsec_create(struct sip_msg *msg, int *_port_ps, int *_port_pc,
 	 */
 	ipsec_ctx_challenge_user(user, prot, sa->ts3gpp.port_c, sa->ts3gpp.port_s,
 			ss->port_no, sc->port_no);
+	/* ... and a set of another user that still holds them (helm KI-248) */
+	ipsec_sa_take_over(&req->rcv.src_ip, &sc->address, sa->ts3gpp.port_c,
+			sa->ts3gpp.port_s, ss->port_no, sc->port_no);
 
 	ret = -5;
 	ctx = ipsec_ctx_new(sa, &req->rcv.src_ip, ss, sc, &auth->ck, &auth->ik, 0, 0,
