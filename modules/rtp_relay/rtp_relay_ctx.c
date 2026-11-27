@@ -832,6 +832,24 @@ static void rtp_relay_b2b_tm_req(struct cell* t, int type, struct tmcb_params *p
 			}
 		}
 	}
+	if (ctx->established && peer_leg == leg) {
+		/* A sequential request is sent to `leg` (found through its To-tag).
+		 * The entity lookup above gives the leg of the caller for every
+		 * request of the tuple, also for one that the callee sends (a
+		 * re-INVITE from the called side, e.g. a phone that puts a call on
+		 * hold). Sender and destination are then the same leg, and the
+		 * request was treated as an offer of the caller: RTPEngine got the
+		 * callee's SDP with the caller's tags and applied it to the wrong
+		 * side. The sender is the other leg of the established session. */
+		if (ctx->established->legs[RTP_RELAY_CALLER] == leg)
+			peer_leg = ctx->established->legs[RTP_RELAY_CALLEE];
+		else if (ctx->established->legs[RTP_RELAY_CALLEE] == leg)
+			peer_leg = ctx->established->legs[RTP_RELAY_CALLER];
+		if (!peer_leg) {
+			LM_ERR("no peer leg for a sequential request in the established session\n");
+			return;
+		}
+	}
 	if (ctx->established) {
 		sess = ctx->established;
 		if (sess->legs[RTP_RELAY_CALLER] == peer_leg && sess->legs[RTP_RELAY_CALLEE] == leg) {
