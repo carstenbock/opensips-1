@@ -152,6 +152,9 @@ struct dlg_cell
 	/* holds the ID of the process holding the dialog bucket lock (or 0)
 	 * when either working with .profile_links list or running dlg callbacks */
 	unsigned short       locked_by;
+	/* volte.io: set by the first dlg_end_dlg() that sends the BYEs of this
+	 * dialog; local to this instance (not replicated, not stored) */
+	volatile int         end_started;
 
 	unsigned int         start_ts;    /* start time  (absolute UNIX ts)*/
 	unsigned int         flags;

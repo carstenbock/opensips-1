@@ -853,8 +853,20 @@ int dlg_end_dlg(struct dlg_cell *dlg, str *extra_hdrs, int send_byes)
 		return 0;
 	}
 
+	/* volte.io: a confirmed dialog stays in that state until its BYEs are
+	 * answered or time out, seconds when the UE is gone. Two releases in that
+	 * time (e.g. an Rx ASR and the loss of the registration, or MI) each sent
+	 * their own BYEs with the same CSeq (KI-322). The BYEs of a dialog are
+	 * sent once. */
+	if (__sync_lock_test_and_set(&dlg->end_started, 1)) {
+		LM_DBG("dialog %.*s is being ended already, not sending BYEs again\n",
+			dlg->callid.len, dlg->callid.s);
+		return 0;
+	}
+
 	if (build_extra_hdr(dlg, extra_hdrs, &str_hdr) != 0) {
 		LM_ERR("failed to create extra headers\n");
+		dlg->end_started = 0;
 		return -1;
 	}
 
@@ -862,6 +874,7 @@ int dlg_end_dlg(struct dlg_cell *dlg, str *extra_hdrs, int send_byes)
 		params = shm_malloc(sizeof(struct dlg_end_params) + str_hdr.len);
 		if (!params) {
 			LM_ERR("could not create dlg end params!\n");
+			dlg->end_started = 0;
 			goto end;
 		}
 		params->hdrs.s = (char *)(params + 1);
@@ -872,6 +885,7 @@ int dlg_end_dlg(struct dlg_cell *dlg, str *extra_hdrs, int send_byes)
 
 		if (ipc_dispatch_rpc(dlg_end_rpc, params) < 0) {
 			LM_ERR("could not dispatch dlg end job!\n");
+			dlg->end_started = 0;
 			goto end;
 		}
 		res = 0;
