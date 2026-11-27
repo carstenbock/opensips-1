@@ -237,6 +237,21 @@ def main():
         print("FAIL: the callee's re-INVITE does not carry the callee's flags: %r %r"
               % (second[4], second[5]))
         ok = False
+    # An answer carries the flags of the side that answers. RTPEngine takes the
+    # first interface for the sender of the SDP, so the pair of an answer must
+    # not be reversed: reversed, both legs move to the other side's interface
+    # and the media is gone.
+    want = {(first[1], first[2]): ("internal/external", "from-callee"),
+            (second[1], second[2]): ("external/internal", "from-caller")}
+    for a in answers:
+        exp = want.get((a[1], a[2]))
+        if exp and (a[4], a[5]) != exp:
+            print("FAIL: answer with from-tag %s carries %r %r, expected %r %r"
+                  % (a[1], a[4], a[5], exp[0], exp[1]))
+            ok = False
+    if len(answers) < 2:
+        print("FAIL: the answer of the re-INVITE did not reach RTPEngine")
+        ok = False
     if not ok:
         sys.exit(1)
     print("PASS")

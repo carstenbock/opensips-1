@@ -297,6 +297,13 @@ static int rtpengine_publish_f(struct sip_msg *msg, str *flags, pv_spec_t *spvar
 		pv_spec_t *bpvar);
 static void rtpengine_notify_process(int rank);
 
+/* Set while an answer of the rtp_relay API is built. rtp_relay hands over the
+ * flags and interfaces of the leg that sends the answer, so an interface pair
+ * in them already is in rtpengine's order (sender of this SDP first). The
+ * reversal for an answer that reuses the flags of its offer must not be
+ * applied to it: it put both legs on the interface of the other side. */
+static int rtpe_answer_own_flags;
+
 static int rtpengine_api_offer(struct rtp_relay_session *sess,
 		struct rtp_relay_server *server, str *body,
 		str *ip, str *type, str *in_iface, str *out_iface,
@@ -2563,7 +2570,7 @@ static int parse_flags(struct ng_flags_parse *ng_flags, struct sip_msg *msg,
 			 * otherwise the offerer leg (e.g. the UE) is re-anchored onto the
 			 * far-side interface and handed the advertised/public address. */
 			str *dir_first = &iniface, *dir_second = &outiface;
-			if (op && *op == OP_ANSWER) {
+			if (op && *op == OP_ANSWER && !rtpe_answer_own_flags) {
 				dir_first = &outiface;
 				dir_second = &iniface;
 			}
@@ -5462,8 +5469,10 @@ static int rtpengine_api_answer(struct rtp_relay_session *sess,
 			global_flags, flags, extra_flags);
 	if (!newflags)
 		return -1;
+	rtpe_answer_own_flags = 1;
 	ret = rtpengine_offer_answer_body(sess->msg, newflags, &server->node,
 			NULL, sess->body, body, rset, OP_ANSWER);
+	rtpe_answer_own_flags = 0;
 	pkg_free(newflags->s);
 	return ret;
 }
